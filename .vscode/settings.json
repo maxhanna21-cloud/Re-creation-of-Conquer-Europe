@@ -1,0 +1,5 @@
+{
+    "luau-lsp.plugin.enabled": true,
+    "luau-lsp.sourcemap.rojoPath": "default.project.json",
+    "luau-lsp.sourcemap.generatorCommand": "default.project.json"
+}

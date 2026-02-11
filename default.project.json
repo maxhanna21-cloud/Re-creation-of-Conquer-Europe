@@ -1,0 +1,58 @@
+{
+  "name": "Re-creation of Conquer Europe",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "$ignoreUnknownInstances": true,
+      "DiplomacyManager": { "$path": "src/shared/DiplomacyManager.luau" },
+      "NPCCombatSystem": { "$path": "src/shared/NPCCombatSystem.luau" },
+      "NPCMovementSystem": { "$path": "src/shared/NPCMovementSystem.luau" },
+      "ServerState": { "$path": "src/shared/ServerState.luau" },
+      "TileAdjacencyManager": { "$path": "src/shared/TileAdjacencyManager.luau" },
+      "TileKeyUtils": { "$path": "src/shared/TileKeyUtils.luau" },
+      "TileManager": { "$path": "src/shared/TileManager.luau" },
+      "TileOwnershipManager": { "$path": "src/shared/TileOwnershipManager.luau" },
+      "UnitManager": { "$path": "src/shared/UnitManager.luau" },
+      "Auto-Fix": { "$path": "src/server/Auto-Fix.server.luau" },
+      "CollisionSetup": { "$path": "src/server/CollisionSetup.server.luau" },
+      "CountryManager": { "$path": "src/server/CountryManager.server.luau" },
+      "Diagnostics": { "$path": "src/server/Diagnostics.server.luau" },
+      "DiplomacyServer": { "$path": "src/server/DiplomacyServer.server.luau" },
+      "Leaderstats": { "$path": "src/server/Leaderstats.server.luau" },
+      "NPCPurchaseHandler": { "$path": "src/server/NPCPurchaseHandler.server.luau" },
+      "NPCTargetingHandler": { "$path": "src/server/NPCTargetingHandler.server.luau" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$ignoreUnknownInstances": true,
+        "$path": "src/playerscripts"
+      }
+    },
+    "StarterGui": {
+      "$className": "StarterGui",
+      "$ignoreUnknownInstances": true,
+      "BuyNPCGui": {
+        "$className": "ScreenGui",
+        "$ignoreUnknownInstances": true,
+        "BuyNPCGui": { "$path": "src/client/BuyNPCGui.client.luau" }
+      },
+      "CountrySelectionScreen": {
+        "$className": "ScreenGui",
+        "$ignoreUnknownInstances": true,
+        "CountrySelectionScreen": { "$path": "src/client/CountrySelectionScreen.client.luau" }
+      },
+      "DiplomacyGui": {
+        "$className": "ScreenGui",
+        "$ignoreUnknownInstances": true,
+        "DiplomacyGui": { "$path": "src/client/DiplomacyGui.client.luau" }
+      },
+      "NotificationGui": {
+        "$className": "ScreenGui",
+        "$ignoreUnknownInstances": true,
+        "NotificationGui": { "$path": "src/client/NotificationGui.client.luau" }
+      }
+    }
+  }
+}
