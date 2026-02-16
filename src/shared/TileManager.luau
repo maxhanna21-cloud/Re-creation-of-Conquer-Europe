@@ -47,6 +47,10 @@ local CountryTileStats = {}
 -- { [Player] = countryName }
 local PlayerCountryCache = {}
 
+-- FIX: Capital tile registry (keyed by country Model instance for immutability)
+-- { [countryModel] = capitalTilePart }
+local CapitalTilesByModel = {}
+
 ---------------------------------------------------
 -- FIX: Use centralized getTileKey function
 ---------------------------------------------------
@@ -88,6 +92,8 @@ local function scanCountryTiles(countryModel)
 			if part.Name == "Capital" then
 				-- Store capital position separately
 				capitalPos = spawnPos
+				-- FIX: Register this tile as the country's capital (keyed by Model instance)
+				CapitalTilesByModel[countryModel] = part
 			else
 				table.insert(ValidTiles[countryName], spawnPos)
 			end
@@ -389,6 +395,22 @@ function TileManager.getAvailableCountries()
 		end
 	end
 	return list
+end
+
+---------------------------------------------------
+-- FIX: Capital Tile Registry API
+---------------------------------------------------
+
+-- Get the capital tile for a country by its Model instance (primary API)
+function TileManager.getCountryCapitalByModel(countryModel)
+	return CapitalTilesByModel[countryModel]
+end
+
+-- Get the capital tile for a country by name (convenience wrapper)
+function TileManager.getCountryCapital(countryName)
+	local countryModel = EUROPE_MAP:FindFirstChild(countryName)
+	if not countryModel then return nil end
+	return CapitalTilesByModel[countryModel]
 end
 
 ---------------------------------------------------

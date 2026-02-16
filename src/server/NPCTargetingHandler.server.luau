@@ -266,6 +266,9 @@ local function handleTileClick(player, tilePart)
 
 	-- Check adjacency - must be directly adjacent (one tile away)
 	if not isAdjacent then
+		-- FIX v12.2: Full diagnostic when adjacency fails
+		TileAdjacencyManager.diagnoseAdjacency(currentTilePart, tilePart)
+
 		print("Movement failed: Target tile (" .. tilePart.Name .. ") is not adjacent to current tile (" .. currentTilePart.Name .. ")")
 		clearSelection(player)
 		return

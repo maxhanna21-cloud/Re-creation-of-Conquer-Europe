@@ -1,9 +1,8 @@
--- TileCursor LocalScript (StarterPlayerScripts) - FIXED v5
--- FIX #3: Proper cleanup of RenderStepped connection to prevent memory leaks
--- FIX #4: Only highlight actual country tiles (parts inside EuropeMap)
--- FIX #5: Exclude parts directly under EuropeMap (not inside country models)
--- FIX #6: Added caching for country model lookups to improve performance
--- FIX #7: Improved cache eviction - uses LRU-like approach, clears oldest half instead of all
+-- TileCursor LocalScript - Merged v1
+-- Combines:
+--  - LRU caching & eviction (from v5)
+--  - Strict disabling of Highlight/SelectionBox when not in use (from v12)
+--  - Name/size filters, safe clone of cursor, robust cleanup
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13,70 +12,127 @@ local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 local Mouse = Player:GetMouse()
 
-local Cursor = ReplicatedStorage:WaitForChild("TileCursor", 10)
-Cursor.Parent = workspace
-
--- Get reference to the EuropeMap
-local EuropeMap = Workspace:WaitForChild("EuropeMap", 10)
-
--- Store the connection so we can disconnect it later
-local renderConnection = nil
-
--- FIX #7: Improved cache structure with access tracking for LRU eviction
--- Each entry: { countryModel = Model or false, lastAccess = tick() }
-local countryModelCache = {}
-
--- FIX #7: Use ordered list to track access order for LRU eviction
-local cacheAccessOrder = {} -- Array of BasePart references in order of access
-
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
+local DEBUG_HOVER = true
+local MAX_TILE_SIZE = 300
 local CACHE_MAX_SIZE = 500
-local CACHE_EVICT_COUNT = 250 -- Evict half when full
+local CACHE_EVICT_COUNT = 250 -- how many oldest entries to evict when full
+local MAX_HIERARCHY_DEPTH = 20
 
--- FIX #7: Update access order for LRU tracking
+local IGNORE_NAMES = {
+	["ocean"] = true, ["water"] = true, ["sea"] = true,
+	["background"] = true, ["baseplate"] = true, ["base"] = true,
+	["hitbox"] = true, ["bounds"] = true, ["map"] = true,
+	["visuals"] = true, ["meshes"] = true, ["terrain"] = true,
+	["folder"] = true, ["countries"] = true, ["oceanfront"] = true
+}
+
+--------------------------------------------------------------------------------
+-- ASSETS
+--------------------------------------------------------------------------------
+local OriginalCursor = ReplicatedStorage:WaitForChild("TileCursor", 10)
+if not OriginalCursor then
+	warn("[TileCursor] CRITICAL: TileCursor not found in ReplicatedStorage")
+	return
+end
+
+-- Make a local clone so we can safely toggle/Destroy it without affecting other clients
+local Cursor = OriginalCursor:Clone()
+Cursor.Name = "LocalTileCursor_merged_v1"
+Cursor.Parent = Workspace
+
+-- Ensure cursor starts OFF (prevents highlight parent fallback)
+if Cursor:IsA("Highlight") then
+	Cursor.Enabled = false
+elseif Cursor:IsA("SelectionBox") then
+	Cursor.Visible = false
+end
+
+local EuropeMap = Workspace:WaitForChild("EuropeMap", 10)
+if not EuropeMap then
+	warn("[TileCursor] EuropeMap not found in Workspace")
+	-- keep script alive, but nothing to highlight
+end
+
+--------------------------------------------------------------------------------
+-- CACHE (LRU)
+--------------------------------------------------------------------------------
+-- countryModelCache[part] = { countryModel = Model or false, lastAccess = number }
+local countryModelCache = {}
+local cacheAccessOrder = {} -- array of parts, oldest at index 1
+
 local function touchCacheEntry(part)
-	-- Remove from current position if exists
-	for i, cachedPart in ipairs(cacheAccessOrder) do
-		if cachedPart == part then
+	-- remove existing occurrence
+	for i = #cacheAccessOrder, 1, -1 do
+		if cacheAccessOrder[i] == part then
 			table.remove(cacheAccessOrder, i)
 			break
 		end
 	end
-	-- Add to end (most recently accessed)
-	table.insert(cacheAccessOrder, part)
+	table.insert(cacheAccessOrder, part) -- newest on the end
 end
 
--- FIX #7: Evict oldest entries when cache is full
 local function evictOldestEntries()
-	if #cacheAccessOrder <= CACHE_MAX_SIZE then
-		return
-	end
-
-	-- Remove the oldest CACHE_EVICT_COUNT entries
-	local toRemove = math.min(CACHE_EVICT_COUNT, #cacheAccessOrder - CACHE_MAX_SIZE + CACHE_EVICT_COUNT)
-
-	for i = 1, toRemove do
-		local oldPart = cacheAccessOrder[1]
-		if oldPart then
-			countryModelCache[oldPart] = nil
-			table.remove(cacheAccessOrder, 1)
+	while #cacheAccessOrder > CACHE_MAX_SIZE do
+		-- remove CACHE_EVICT_COUNT or until under limit
+		local removed = 0
+		for i = 1, CACHE_EVICT_COUNT do
+			if #cacheAccessOrder == 0 then break end
+			local oldPart = table.remove(cacheAccessOrder, 1)
+			if oldPart then
+				countryModelCache[oldPart] = nil
+			end
+			removed = removed + 1
 		end
+		-- safety: if nothing removed, break to avoid infinite loop
+		if removed == 0 then break end
 	end
 end
 
--- Helper function to get the country model a part belongs to
--- Returns nil if the part is not inside a valid country model
--- FIX #7: Now uses improved caching with LRU eviction
+--------------------------------------------------------------------------------
+-- UTIL
+--------------------------------------------------------------------------------
+local function isIgnored(name)
+	if not name then return false end
+	return IGNORE_NAMES[string.lower(name)] == true
+end
+
+local function validatePartCandidate(part)
+	if not part or not part:IsA("BasePart") then return false end
+	if isIgnored(part.Name) then return false end
+	-- size check: ignore huge parts that are likely background/baseplates
+	-- use absolute magnitudes of X and Z
+	if part.Size and (part.Size.X > MAX_TILE_SIZE or part.Size.Z > MAX_TILE_SIZE) then
+		return false
+	end
+	-- ignore fully transparent parts
+	if part.Transparency and part.Transparency >= 1 then
+		return false
+	end
+	return true
+end
+
+--------------------------------------------------------------------------------
+-- getCountryModel: walk up to find a model whose parent is EuropeMap
+-- Returns Model or nil. Uses cache (LRU).
+--------------------------------------------------------------------------------
 local function getCountryModel(part)
-	-- Check cache first
+	if not part or not validatePartCandidate(part) then
+		return nil
+	end
+
+	-- cache check
 	local cached = countryModelCache[part]
 	if cached ~= nil then
-		-- Update access order for LRU
+		-- update LRU order
 		touchCacheEntry(part)
-		-- cached.countryModel can be false (not a country tile) or a Model
+		cached.lastAccess = tick()
 		return cached.countryModel or nil
 	end
 
-	-- FIX #5: If part is directly under EuropeMap, it's not a country tile
+	-- if the part is directly a child of EuropeMap, treat as non-country tile
 	if part.Parent == EuropeMap then
 		countryModelCache[part] = { countryModel = false, lastAccess = tick() }
 		touchCacheEntry(part)
@@ -84,96 +140,165 @@ local function getCountryModel(part)
 		return nil
 	end
 
-	-- Walk up the hierarchy to find the country model
+	-- walk up
 	local current = part.Parent
-	while current and current ~= EuropeMap and current ~= Workspace do
+	local depth = 0
+	while current and current ~= EuropeMap and current ~= Workspace and depth < MAX_HIERARCHY_DEPTH do
+		-- if we found a direct child of EuropeMap
 		if current.Parent == EuropeMap then
-			-- Found the country model (direct child of EuropeMap)
+			-- validate name
+			if isIgnored(current.Name) then
+				countryModelCache[part] = { countryModel = false, lastAccess = tick() }
+				touchCacheEntry(part)
+				evictOldestEntries()
+				return nil
+			end
+			-- accept as country model
 			countryModelCache[part] = { countryModel = current, lastAccess = tick() }
 			touchCacheEntry(part)
 			evictOldestEntries()
 			return current
 		end
 		current = current.Parent
+		depth = depth + 1
 	end
 
-	-- Not a country tile
+	-- nothing found — cache negative result
 	countryModelCache[part] = { countryModel = false, lastAccess = tick() }
 	touchCacheEntry(part)
 	evictOldestEntries()
 	return nil
 end
 
--- FIX #7: Invalidate cache when parts are added/removed from EuropeMap
+--------------------------------------------------------------------------------
+-- Cache invalidation: remove entries when parts are removed from EuropeMap
+--------------------------------------------------------------------------------
+local descRemovingConn
 local function setupCacheInvalidation()
-	-- Clear specific entries when descendants are removed
-	EuropeMap.DescendantRemoving:Connect(function(descendant)
-		if descendant:IsA("BasePart") then
-			if countryModelCache[descendant] ~= nil then
-				countryModelCache[descendant] = nil
-				-- Also remove from access order
-				for i, part in ipairs(cacheAccessOrder) do
-					if part == descendant then
-						table.remove(cacheAccessOrder, i)
-						break
-					end
+	if not EuropeMap then return end
+	descRemovingConn = EuropeMap.DescendantRemoving:Connect(function(desc)
+		if desc and desc:IsA("BasePart") then
+			if countryModelCache[desc] ~= nil then
+				countryModelCache[desc] = nil
+			end
+			-- remove from access order
+			for i = #cacheAccessOrder, 1, -1 do
+				if cacheAccessOrder[i] == desc then
+					table.remove(cacheAccessOrder, i)
+					break
 				end
 			end
 		end
 	end)
-
-	-- Note: We don't need to handle DescendantAdded because
-	-- new parts will just get cached on first access
 end
+
+--------------------------------------------------------------------------------
+-- Visual control helpers (handles both Highlight and SelectionBox)
+--------------------------------------------------------------------------------
+local function disableCursorVisuals()
+	if not Cursor then return end
+	if Cursor:IsA("Highlight") then
+		-- Ensure parent highlight does not silently highlight parent when adornee is nil
+		Cursor.Adornee = nil
+		Cursor.Enabled = false
+	elseif Cursor:IsA("SelectionBox") then
+		Cursor.Adornee = nil
+		Cursor.Visible = false
+	else
+		-- fallback: try to nil adornee
+		pcall(function() Cursor.Adornee = nil end)
+	end
+end
+
+local function enableCursorVisuals(targetPart)
+	if not Cursor then return end
+	Cursor.Adornee = targetPart
+	if Cursor:IsA("Highlight") then
+		Cursor.Enabled = true
+	elseif Cursor:IsA("SelectionBox") then
+		Cursor.Visible = true
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Main render loop
+--------------------------------------------------------------------------------
+local renderConn
+local lastTarget = nil
+local lastResult = nil -- for debug printing reduction
 
 local function onRenderStepped()
 	local target = Mouse.Target
 
-	-- 1. Check if the mouse is hovering over a BasePart
+	-- fast path: unchanged
+	if target == lastTarget then return end
+	lastTarget = target
+
 	if target and target:IsA("BasePart") then
-		-- 2. Try to get the country model this part belongs to (cached)
 		local countryModel = getCountryModel(target)
 
-		-- 3. Only highlight if we found a valid country model
 		if countryModel then
-			Cursor.Adornee = target
+			-- enable visuals on the exact hovered part (avoids whole-model highlight)
+			enableCursorVisuals(target)
+
+			if DEBUG_HOVER and lastResult ~= countryModel then
+				print("✅ HIT:", countryModel.Name, "part:", target.Name)
+				lastResult = countryModel
+			end
 		else
-			Cursor.Adornee = nil
+			-- nothing relevant, turn off visuals
+			disableCursorVisuals()
+			if DEBUG_HOVER and lastResult ~= "void" then
+				-- optional debug: print("❌ IGNORED: " .. (target and target.Name or "nil"))
+				lastResult = "void"
+			end
 		end
 	else
-		Cursor.Adornee = nil
+		-- sky / no target
+		disableCursorVisuals()
+		lastResult = "nil"
 	end
 end
 
--- Setup cache invalidation
-setupCacheInvalidation()
-
--- Start the render connection
-renderConnection = RunService.RenderStepped:Connect(onRenderStepped)
-
--- Clean up when the script is destroyed
-script.Destroying:Connect(function()
-	if renderConnection then
-		renderConnection:Disconnect()
-		renderConnection = nil
+--------------------------------------------------------------------------------
+-- Cleanup: disconnect everything & destroy the cloned cursor
+--------------------------------------------------------------------------------
+local function cleanup()
+	-- Disconnect render
+	if renderConn then
+		renderConn:Disconnect()
+		renderConn = nil
 	end
-	if Cursor then
-		Cursor.Adornee = nil
+	-- DescendantRemoving
+	if descRemovingConn then
+		descRemovingConn:Disconnect()
+		descRemovingConn = nil
 	end
-	-- Clear cache
+	-- Clear cache tables
 	countryModelCache = {}
 	cacheAccessOrder = {}
-end)
 
--- Also clean up when player is removed
-Player.AncestryChanged:Connect(function(_, parent)
-	if not parent then
-		if renderConnection then
-			renderConnection:Disconnect()
-			renderConnection = nil
-		end
-		-- Clear cache
-		countryModelCache = {}
-		cacheAccessOrder = {}
+	-- Destroy cursor clone safely
+	if Cursor and Cursor.Parent then
+		pcall(function() Cursor:Destroy() end)
+	end
+	Cursor = nil
+end
+
+--------------------------------------------------------------------------------
+-- Setup connections & start
+--------------------------------------------------------------------------------
+script.Destroying:Connect(cleanup)
+-- If the player is removed (server-side), also cleanup locally
+local playerRemConn
+playerRemConn = Players.PlayerRemoving:Connect(function(removedPlayer)
+	if removedPlayer == Player then
+		cleanup()
+		if playerRemConn then playerRemConn:Disconnect() end
 	end
 end)
+
+setupCacheInvalidation()
+renderConn = RunService.RenderStepped:Connect(onRenderStepped)
+
+print("[TileCursor merged v1] Initialized. DEBUG_HOVER =", DEBUG_HOVER)

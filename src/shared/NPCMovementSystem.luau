@@ -47,7 +47,7 @@ end
 local DEBUG = true
 local ARRIVAL_THRESHOLD = 3      -- How close NPC must be to destination (XZ)
 local GROUND_CHECK_INTERVAL = 0.1 -- How often to check if NPC is on valid ground (faster = catches falls sooner)
-local MAP_MIN_Y = -50            -- If NPC falls below this, teleport back
+local MAP_MIN_Y = -500 -- INCREASED: Ensure this is lower than your lowest province
 local FALL_Y_THRESHOLD = -5      -- If NPC's Y velocity is below this, they are falling
 local IDLE_DRIFT_THRESHOLD = 2   -- FIX v6: Max studs an idle NPC can drift from tile center before being snapped back
 
@@ -57,7 +57,7 @@ local STUCK_CHECK_TIME = 1.0        -- seconds sampling window for stuck detecti
 local STUCK_DISTANCE_THRESHOLD = 0.8 -- studs moved within STUCK_CHECK_TIME considered stuck
 local MAX_MOVE_RETRIES = 3
 local MOVE_RETRY_BACKOFF = 0.25     -- seconds * attemptNumber
-local SAFE_CENTER_GROUND_TOLERANCE = 12 -- vertical tolerance for safe center raycasts
+local SAFE_CENTER_GROUND_TOLERANCE = 100 -- INCREASED: Allows NPCs to "see" the floor of deep cliffs
 -- local MOVEMENT_EDGE_CHECK_DISTANCE = 3   -- studs ahead to check for ground during movement
 local MOVEMENT_PATH_DRIFT_MAX = 5        -- max studs NPC can drift from origin-to-target line before correction
 local EDGE_ARRIVAL_THRESHOLD = 2         -- tighter arrival threshold for edge-crossing waypoints (studs)
@@ -127,35 +127,32 @@ local function isOnValidGround(npcModel)
 	local root = getRootPart(npcModel)
 	if not root then return false end
 
-	-- Fallen below map - definitely invalid
+	-- DAILY DRIVER FIX: Ensure NPC hasn't hit the absolute map floor
 	if root.Position.Y < MAP_MIN_Y then
 		if DEBUG then
-			print("[NPCMovement:GroundCheck] " .. npcModel.Name .. " FELL below MAP_MIN_Y (" .. MAP_MIN_Y .. "), position Y = " .. root.Position.Y)
+			warn("[NPCMovement:GroundCheck] " .. npcModel.Name .. " FELL below MAP_MIN_Y (" .. MAP_MIN_Y .. ")")
 		end
 		return false
 	end
 
-	-- Check if NPC is actually falling (has significant downward velocity)
+	-- Check if NPC is actually falling (significant downward velocity)
 	local velocity = root.AssemblyLinearVelocity
 	local isFalling = velocity and velocity.Y < FALL_Y_THRESHOLD
 
-	-- If not falling, assume they're fine (walking over gaps is expected for tile-to-tile movement)
+	-- If not falling (stationary or moving horizontally), assume they are safe
 	if not isFalling then
 		return true
 	end
 
 	-- NPC is falling - check if there's ground below to catch them
 	local europeMap = Workspace:FindFirstChild("EuropeMap")
-	if not europeMap then
-		if DEBUG then
-			print("[NPCMovement:GroundCheck] WARNING: Cannot find EuropeMap for raycast validation")
-		end
-		return false -- Can't check, assume bad
-	end
+	if not europeMap then return false end
 
-	-- Raycast down to check for EuropeMap tile presence
+	-- DAILY DRIVER FIX: Use a dynamic ray length based on the distance to the map floor.
+	-- This prevents NPCs from "dying" mid-air while falling down a legal cliff.
 	local rayOrigin = root.Position + Vector3.new(0, 2, 0)
-	local rayDirection = Vector3.new(0, -SAFE_CENTER_GROUND_TOLERANCE * 3, 0) -- Check further down
+	local distanceToFloor = math.abs(root.Position.Y - MAP_MIN_Y)
+	local rayDirection = Vector3.new(0, -distanceToFloor, 0)
 
 	local params = RaycastParams.new()
 	params.FilterDescendantsInstances = {europeMap}
@@ -165,18 +162,28 @@ local function isOnValidGround(npcModel)
 	local result = Workspace:Raycast(rayOrigin, rayDirection, params)
 
 	if result then
-		-- There's a tile below - NPC will land on it, they're fine
-		if DEBUG then
-			print("[NPCMovement:GroundCheck] " .. npcModel.Name .. " is falling but has ground below at " .. tostring(result.Instance.Name))
-		end
+		-- There's a tile below - the NPC is falling safely toward a destination
 		return true
 	end
 
-	-- NPC is falling AND there's no tile below to catch them - this is a real fall
-	if DEBUG then
-		print("[NPCMovement:GroundCheck] EMERGENCY: " .. npcModel.Name .. " is falling with NO GROUND BELOW! Position: " .. tostring(root.Position) .. ", Velocity: " .. tostring(velocity))
+	-- NPC is falling AND there's no tile below (checked all the way to MAP_MIN_Y)
+	-- BUT check for gap-crossing waypoints before declaring emergency
+	local mState = movementStates[npcModel]
+	local movement = activeMovements[npcModel]
+	if mState and mState.state == "Moving" and movement and movement.enrichedWaypoints then
+		local wpIdx = movement.currentWaypoint or 1
+		for checkIdx = math.max(1, wpIdx - 1), math.min(#movement.enrichedWaypoints, wpIdx + 1) do
+			local wp = movement.enrichedWaypoints[checkIdx]
+			if wp and wp.type == "edge" then
+				local distToEdge = ((root.Position - wp.position) * Vector3.new(1, 0, 1)).Magnitude
+				if distToEdge < 5 then
+					return true -- Near edge waypoint, trust the system to catch them
+				end
+			end
+		end
 	end
-	return false
+
+	return false -- True fall into the void
 end
 
 -- Check if there's valid ground AHEAD of the NPC in their movement direction
@@ -588,11 +595,35 @@ local function buildEnrichedWaypoints(tilePath)
 			end
 		end
 
+
+	-- FIX v17: Validate the path between corrected edge points using TileAdjacencyManager's robust walkability check
+	-- This reuses the battle-tested 85% ground ratio, consecutive barrier detection, and adaptive tolerance logic
+	if pointA and pointB then
+		local isWalkable = TileAdjacencyManager.isPathWalkable(prevTile, currTile, pointA, pointB)
+		if not isWalkable then
+			if DEBUG then
+				warn(string.format("[NPCMovement:Waypoints] Path not walkable after correction: %s -> %s (using center-to-center fallback)",
+					prevTile.Name, currTile.Name))
+			end
+			pointA = nil
+			pointB = nil
+		end
+	end
+
 		if DEBUG then
 			print(string.format("[NPCMovement:Waypoints] Edge check: %s -> %s, edgeDist=%.3f, pointA=%s, pointB=%s",
 				prevTile.Name, currTile.Name, edgeDist or -1,
 				pointA and string.format("(%.1f,%.1f,%.1f)", pointA.X, pointA.Y, pointA.Z) or "nil",
 				pointB and string.format("(%.1f,%.1f,%.1f)", pointB.X, pointB.Y, pointB.Z) or "nil"))
+		end
+
+		-- FIX v15: Safety check - if edge points are nil, skip gap crossing entirely
+		if not pointA or not pointB then
+			if DEBUG then
+				warn(string.format("[NPCMovement:Waypoints] Edge points are nil for %s -> %s, skipping gap crossing (will use center-to-center)",
+					prevTile.Name, currTile.Name))
+			end
+			-- Fall through to tile center waypoint addition (line ~850)
 		end
 
 		-- Gap crossing: edge distance > 0.1 studs (epsilon to ignore floating-point noise on touching tiles)
@@ -604,11 +635,13 @@ local function buildEnrichedWaypoints(tilePath)
 
 		if isGapCrossing and isSmallGap then
 			-- Simple approach for small gaps: just add edge points (tile center added below)
+			-- FIX v15: Use corrected Y from surface validation (pointA/pointB already corrected above at lines 556-565)
+			-- This preserves actual ground height instead of generic safeCenterA.Y
 			local safeCenterA = getTileSpawnPosition(prevTile)
 			local safeCenterB = getTileSpawnPosition(currTile)
 
-			local edgePointA = Vector3.new(pointA.X, safeCenterA.Y, pointA.Z)
-			local edgePointB = Vector3.new(pointB.X, safeCenterB.Y, pointB.Z)
+			local edgePointA = pointA
+			local edgePointB = pointB
 
 			if DEBUG then
 				print(string.format("[NPCMovement:Waypoints] Small gap (%.1f studs): using direct edge crossing %s -> %s",
@@ -632,12 +665,13 @@ local function buildEnrichedWaypoints(tilePath)
 			-- Note: tile center waypoint is added below (line ~779)
 
 		elseif isGapCrossing then
-			-- Use safe center Y (walking height) for edge waypoints, not raw tile surface Y
+			-- FIX v15: Use corrected Y from surface validation (pointA/pointB already corrected above at lines 556-565)
+			-- This preserves actual ground height instead of generic safeCenterA.Y
 			local safeCenterA = getTileSpawnPosition(prevTile)
 			local safeCenterB = getTileSpawnPosition(currTile)
 
-			local edgePointA = Vector3.new(pointA.X, safeCenterA.Y, pointA.Z)
-			local edgePointB = Vector3.new(pointB.X, safeCenterB.Y, pointB.Z)
+			local edgePointA = pointA
+			local edgePointB = pointB
 
 			-- Strategy: Use PathfindingService to find a walkable route from the previous
 			-- position to the departure edge point. This handles narrow/curved tiles where
@@ -654,7 +688,7 @@ local function buildEnrichedWaypoints(tilePath)
 				for _, pfPos in ipairs(pfIntermediates) do
 					table.insert(waypoints, {
 						type = "pathfind",
-						position = Vector3.new(pfPos.X, safeCenterA.Y, pfPos.Z),
+						position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
 						tile = prevTile
 					})
 				end
@@ -686,7 +720,7 @@ local function buildEnrichedWaypoints(tilePath)
 					for _, pfPos in ipairs(pfCrossing) do
 						table.insert(waypoints, {
 							type = "pathfind",
-							position = Vector3.new(pfPos.X, safeCenterA.Y, pfPos.Z),
+							position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
 							tile = prevTile
 						})
 					end
@@ -709,7 +743,7 @@ local function buildEnrichedWaypoints(tilePath)
 						for _, pfPos in ipairs(pfDirect) do
 							table.insert(waypoints, {
 								type = "pathfind",
-								position = Vector3.new(pfPos.X, safeCenterA.Y, pfPos.Z),
+								position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
 								tile = nil
 							})
 						end
@@ -726,7 +760,7 @@ local function buildEnrichedWaypoints(tilePath)
 							for _, cellPos in ipairs(cellPath) do
 								table.insert(waypoints, {
 									type = "pathfind",
-									position = Vector3.new(cellPos.X, safeCenterA.Y, cellPos.Z),
+									position = cellPos,  -- FIX v15: Preserve cell path Y (from tile surface raycast)
 									tile = prevTile
 								})
 							end
@@ -756,7 +790,7 @@ local function buildEnrichedWaypoints(tilePath)
 								for _, cellPos in ipairs(cellPathB) do
 									table.insert(waypoints, {
 										type = "pathfind",
-										position = Vector3.new(cellPos.X, safeCenterA.Y, cellPos.Z),
+										position = cellPos,  -- FIX v15: Preserve cell path Y (from tile surface raycast)
 										tile = prevTile
 									})
 								end
@@ -1176,12 +1210,64 @@ local function monitorMovement(npcModel, isRetreat)
 			currentWaypoint = currentWaypoint + 1
 			movement.currentWaypoint = currentWaypoint
 			local nextWP = enrichedWaypoints[currentWaypoint]
-			local nextWaypointPosition = nextWP.position
 
 			if DEBUG then
 				print("[NPCMovement:Waypoint] Reached waypoint " .. (currentWaypoint - 1) .. " (" .. currentWP.type .. "), moving to waypoint " .. currentWaypoint .. " (" .. nextWP.type .. ")")
 			end
 
+			-- GAP CROSSING FIX: When the NPC is at the departure edge and the next
+			-- waypoint is the arrival edge on a different tile, skip the arrival edge
+			-- and teleport to the first interior waypoint. This prevents the humanoid
+			-- from failing to climb large height differences at tile edges (e.g. edge
+			-- at Y=4.6 but tile interior at Y=7.6).
+			if currentWP.type == "edge" and nextWP.type == "edge"
+				and currentWP.tile ~= nextWP.tile then
+				-- This is a gap crossing: currentWP = departure edge, nextWP = arrival edge
+				-- Find the first non-edge waypoint after the arrival edge
+				local landingIdx = currentWaypoint + 1
+				if landingIdx <= #enrichedWaypoints then
+					local landingWP = enrichedWaypoints[landingIdx]
+					if DEBUG then
+						print(string.format("[NPCMovement:GapCross] Teleporting %s past arrival edge to %s waypoint at (%.1f, %.1f, %.1f)",
+							npcModel.Name, landingWP.type, landingWP.position.X, landingWP.position.Y, landingWP.position.Z))
+					end
+					-- Teleport NPC to the landing waypoint (first safe interior point)
+					npcModel:PivotTo(CFrame.new(landingWP.position))
+					local snapRoot = getRootPart(npcModel)
+					if snapRoot then
+						snapRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					end
+					-- Advance past the arrival edge to the landing point
+					currentWaypoint = landingIdx
+					movement.currentWaypoint = currentWaypoint
+					-- Now issue MoveTo for the NEXT waypoint after landing
+					if currentWaypoint < #enrichedWaypoints then
+						local afterLanding = enrichedWaypoints[currentWaypoint + 1]
+						if humanoid and afterLanding then
+							humanoid:MoveTo(afterLanding.position)
+						end
+					end
+					-- Next monitorMovement iteration will handle arrival at landing or further progression
+					return
+				else
+					-- No interior waypoint after arrival edge — teleport to arrival edge
+					-- with Y adjusted to tile center height to avoid low-edge climb problem
+					local safeCenter = getTileSpawnPosition(nextWP.tile)
+					local adjustedY = safeCenter and safeCenter.Y or nextWP.position.Y
+					local adjustedPos = Vector3.new(nextWP.position.X, adjustedY, nextWP.position.Z)
+					if DEBUG then
+						print(string.format("[NPCMovement:GapCross] Teleporting %s to adjusted arrival edge at (%.1f, %.1f, %.1f)",
+							npcModel.Name, adjustedPos.X, adjustedPos.Y, adjustedPos.Z))
+					end
+					npcModel:PivotTo(CFrame.new(adjustedPos))
+					local snapRoot = getRootPart(npcModel)
+					if snapRoot then
+						snapRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					end
+				end
+			end
+
+			local nextWaypointPosition = enrichedWaypoints[currentWaypoint].position
 			if humanoid and nextWaypointPosition then
 				humanoid:MoveTo(nextWaypointPosition)
 			end
@@ -1217,8 +1303,29 @@ local function monitorMovement(npcModel, isRetreat)
 
 			if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
 				TileOwnershipManager.captureTile(targetTilePart, owner)
-				if targetTilePart.Name == "Capital" then
-					safeCapitalCapture(tileCountry, owner)
+
+				-- FIX: Check if this tile is the ACTUAL capital of the country being invaded
+				-- tileCountry = geographic region name (e.g., "Germany"), never changes even after conquest
+				local actualCapital = TileManager.getCountryCapital(tileCountry)
+
+				if actualCapital and targetTilePart == actualCapital then
+					-- CRITICAL GUARD: Only trigger capital conquest if the region is still "alive"
+					-- (owned by a Player, not already conquered)
+					-- FIX: Use ServerState.resolveCountryOwner() to handle conquest chains
+					-- Example: France → Conquered_Germany → Conquered_Poland → PlayerPolish
+					local currentOwner = ServerState.resolveCountryOwner(tileCountry)
+
+					-- Check if the chain resolves to an active Player
+					if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
+						-- This is the region's capital AND the region is ultimately owned by a live player
+						safeCapitalCapture(tileCountry, owner)
+					else
+						-- Region is conquered (chain resolves to nil or non-Player) - treat as normal tile capture
+						if DEBUG then
+							print(string.format("[NPCMovement] Captured %s's capital, but %s is already conquered (resolved owner: %s)",
+								tileCountry, tileCountry, tostring(currentOwner or "nil")))
+						end
+					end
 				end
 			elseif tileCountry and tileCountry == playerCountry then
 				if TileOwnershipManager.isOccupied(targetTilePart) and not TileOwnershipManager.isOccupiedBy(targetTilePart, owner) then

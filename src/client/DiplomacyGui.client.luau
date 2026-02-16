@@ -18,9 +18,21 @@ JoinSuccess.Event:Connect(function()
 end)
 
 -- 2. GET REMOTES
-local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 10)
+-- FIX v3: Wait longer for server-created RemoteEvents
+local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 30)
+local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 30)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
 local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent", 10)
+
+if not DiplomacyRequest then
+	warn("[DiplomacyGui] DiplomacyRequest RemoteEvent not found!")
+	return
+end
+
+if not DiplomacyResponse then
+	warn("[DiplomacyGui] DiplomacyResponse RemoteEvent not found!")
+	return
+end
 
 -- 3. UI REFERENCES
 local warPanel = gui:WaitForChild("WarPanel", 10)
@@ -107,10 +119,12 @@ peaceBtn.MouseButton1Click:Connect(function()
 end)
 
 ---------------------------------------------------------
--- PART 2: POPUP LISTENER (Your Request Logic)
+-- PART 2: POPUP LISTENER (Your Request Logic) - FIXED v2
 ---------------------------------------------------------
 
-DiplomacyRequest.OnClientInvoke = function(senderName, requestType)
+-- FIX v2: Changed from OnClientInvoke to OnClientEvent + DiplomacyResponse
+-- This prevents the "OnFireClient can only be used on the server" error
+DiplomacyRequest.OnClientEvent:Connect(function(senderName, requestType, requestId)
 	-- Update the UI text
 	if requestType == "Alliance" then
 		messageLabel.Text = senderName .. " wants to form an ALLIANCE!"
@@ -140,5 +154,6 @@ DiplomacyRequest.OnClientInvoke = function(senderName, requestType)
 	conn2:Disconnect()
 	popup.Visible = false
 
-	return choice -- Sends answer back to server
-end
+	-- FIX v2: Send response back to server via DiplomacyResponse RemoteEvent
+	DiplomacyResponse:FireServer(requestId, choice)
+end)

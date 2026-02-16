@@ -1,4 +1,4 @@
--- TileAdjacencyManager (ModuleScript in ServerScriptService) - v12.1 AABB RESCUE FIX
+-- TileAdjacencyManager (ModuleScript in ServerScriptService) - v12.2 INTERVENING TILE COUNT FIX
 -- FIX v9.2: Less aggressive adjacency validation (trust rasterization)
 -- FIX v9.3: Stricter water detection for extended adjacencies
 --   - Increased ground ratio from 60% to 85%
@@ -15,6 +15,15 @@ local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 local TileAdjacencyManager = {}
 
 local TileKeyUtils = require(game:GetService("ServerScriptService"):WaitForChild("TileKeyUtils", 10))
+
+-- Lazy-load dependencies to avoid circular requires
+local TileManager = nil
+local function getTileManager()
+	if not TileManager then
+		TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileManager", 10))
+	end
+	return TileManager
+end
 
 -- Configuration
 local RASTER_CELL_SIZE = 2          -- Grid cell size in studs (smaller = more precise, slower init)
@@ -270,11 +279,26 @@ local function findClosestEdgePoints(tileA, tileB)
 		return findClosestEdgePointsBBox(tileA, tileB)
 	end
 
+	-- FIX v15: Check if tiles are ACTUALLY far apart despite close boundary cells
+	-- (overlapping boundary cells but distant tile centers = false adjacency)
+	local rawCellDist = math.sqrt(bestDistSq)
+	local tileDelta = tileB.Position - tileA.Position
+	local actualTileDistance = math.sqrt(tileDelta.X * tileDelta.X + tileDelta.Z * tileDelta.Z)
+
+	if rawCellDist < 0.5 and actualTileDistance > 10 then
+		-- Boundary cells overlap/touch, but tiles are far apart - use AABB instead
+		if DEBUG_EXTENDED_ADJACENCY then
+			warn(string.format("[TileAdjacencyManager] Boundary cell overlap detected for distant tiles %s <-> %s (tile distance: %.1f studs, cell distance: %.1f), using AABB fallback",
+				tileA.Name, tileB.Name, actualTileDistance, rawCellDist))
+		end
+		return findClosestEdgePointsBBox(tileA, tileB)
+	end
+
 	-- Use tile Y positions for the edge points
 	local pointA = Vector3.new(bestCellA.x, tileA.Position.Y + tileA.Size.Y / 2, bestCellA.z)
 	local pointB = Vector3.new(bestCellB.x, tileB.Position.Y + tileB.Size.Y / 2, bestCellB.z)
 
-	return pointA, pointB, math.sqrt(bestDistSq)
+	return pointA, pointB, rawCellDist
 end
 
 -- FIX v9.3: Stricter walkability check for EXTENDED adjacencies
@@ -300,12 +324,22 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		return true
 	end
 
-	-- FIX v12: For AABB rescue path, if raster edge distance is too large but AABB says
-	-- tiles are close, fall back to AABB bounding box edge samples for the walkability raycast
-	if edgeDist > 6 and aabbOverride then
+	-- FIX v12.2: For AABB rescue path, if raster edge distance exceeds the walkability bypass
+	-- threshold, fall back to AABB edge points for raycasting. Raster boundary cell centers can
+	-- be far apart (crossing water) even when tiles physically touch (AABB overlap).
+	-- Previously this only triggered at edgeDist > 6, missing cases like 4.47 studs where
+	-- raster points cross water but AABB distance is 0 (tiles overlap).
+	if aabbOverride and edgeDist > EXTENDED_ADJACENCY_THRESHOLD then
 		local rasterDist = edgeDist
 		local bboxA, bboxB, bboxDist = findClosestEdgePointsBBox(tileA, tileB)
-		if bboxDist <= 6 then
+		if bboxDist <= EXTENDED_ADJACENCY_THRESHOLD then
+			-- AABB says tiles are close enough to bypass walkability entirely
+			if DEBUG_EXTENDED_ADJACENCY then
+				print(string.format("[TileAdjacencyManager] AABB override bypass: %s <-> %s (bbox: %.1f <= threshold, raster was: %.1f)",
+					tileA.Name, tileB.Name, bboxDist, rasterDist))
+			end
+			return true
+		elseif bboxDist <= 6 then
 			closestA = bboxA
 			closestB = bboxB
 			edgeDist = bboxDist
@@ -326,6 +360,11 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 	end
 
 	local rayHeight = math.max(closestA.Y, closestB.Y) + 20
+	
+	-- DAILY DRIVER FIX: Dynamically calculate ray length to account for cliffs.
+	-- A fixed -50 ray will mid-air miss if the cliff is taller than 30 studs.
+	local heightDiff = math.abs(closestA.Y - closestB.Y)
+	local rayLength = math.max(100, heightDiff + 50) 
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterDescendantsInstances = {EUROPE_MAP}
@@ -347,7 +386,8 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		local checkZ = closestA.Z + (closestB.Z - closestA.Z) * fraction
 		local origin = Vector3.new(checkX, rayHeight, checkZ)
 
-		local result = Workspace:Raycast(origin, Vector3.new(0, -50, 0), rayParams)
+		-- DAILY DRIVER FIX: Apply the dynamic rayLength here
+		local result = Workspace:Raycast(origin, Vector3.new(0, -rayLength, 0), rayParams)
 
 		if result then
 			groundCount = groundCount + 1
@@ -540,7 +580,7 @@ local function hasStrongInterveningTileBetweenBBox(tileA, tileB, cellToTilesLook
 	-- Count how many sample points find intervening tiles
 	local interveningCount = 0
 	local totalSamples = 0
-	
+
 	-- Denser sampling: 7 fractions along edge-to-edge path
 	for _, frac in ipairs({0.15, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85}) do
 		local sampleX = ptA.X + (ptB.X - ptA.X) * frac
@@ -550,30 +590,40 @@ local function hasStrongInterveningTileBetweenBBox(tileA, tileB, cellToTilesLook
 		local sKey = cellKey(sCx, sCz)
 		local tilesAtSample = cellToTilesLookup[sKey]
 		totalSamples = totalSamples + 1
-		
+
+		-- FIX v12.2: Each sample point contributes at most 1 to interveningCount
+		local foundIntervening = false
+
 		if tilesAtSample then
 			for _, sTile in ipairs(tilesAtSample) do
 				if sTile ~= tileA and sTile ~= tileB then
-					interveningCount = interveningCount + 1
-					break -- Count each sample point only once
+					foundIntervening = true
+					break
 				end
 			end
 		end
 		-- Also check neighboring cells (in case sample is on a cell boundary)
-		for _, off in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
-			local nKey = cellKey(sCx + off[1], sCz + off[2])
-			local nTiles = cellToTilesLookup[nKey]
-			if nTiles then
-				for _, sTile in ipairs(nTiles) do
-					if sTile ~= tileA and sTile ~= tileB then
-						interveningCount = interveningCount + 1
-						break
+		if not foundIntervening then
+			for _, off in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
+				if foundIntervening then break end
+				local nKey = cellKey(sCx + off[1], sCz + off[2])
+				local nTiles = cellToTilesLookup[nKey]
+				if nTiles then
+					for _, sTile in ipairs(nTiles) do
+						if sTile ~= tileA and sTile ~= tileB then
+							foundIntervening = true
+							break
+						end
 					end
 				end
 			end
 		end
+
+		if foundIntervening then
+			interveningCount = interveningCount + 1
+		end
 	end
-	
+
 	-- Only reject if overwhelming majority (75%+) of samples find intervening tiles
 	return interveningCount > (totalSamples * 0.75)
 end
@@ -629,7 +679,7 @@ local function hasInterveningTileBetweenBBox(tileA, tileB, cellToTilesLookup)
 	-- Count how many sample points find intervening tiles
 	local interveningCount = 0
 	local totalSamples = 0
-	
+
 	-- Denser sampling: 7 fractions along edge-to-edge path
 	for _, frac in ipairs({0.15, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85}) do
 		local sampleX = ptA.X + (ptB.X - ptA.X) * frac
@@ -639,30 +689,40 @@ local function hasInterveningTileBetweenBBox(tileA, tileB, cellToTilesLookup)
 		local sKey = cellKey(sCx, sCz)
 		local tilesAtSample = cellToTilesLookup[sKey]
 		totalSamples = totalSamples + 1
-		
+
+		-- FIX v12.2: Each sample point contributes at most 1 to interveningCount
+		local foundIntervening = false
+
 		if tilesAtSample then
 			for _, sTile in ipairs(tilesAtSample) do
 				if sTile ~= tileA and sTile ~= tileB then
-					interveningCount = interveningCount + 1
-					break -- Count each sample point only once
+					foundIntervening = true
+					break
 				end
 			end
 		end
 		-- Also check neighboring cells (in case sample is on a cell boundary)
-		for _, off in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
-			local nKey = cellKey(sCx + off[1], sCz + off[2])
-			local nTiles = cellToTilesLookup[nKey]
-			if nTiles then
-				for _, sTile in ipairs(nTiles) do
-					if sTile ~= tileA and sTile ~= tileB then
-						interveningCount = interveningCount + 1
-						break
+		if not foundIntervening then
+			for _, off in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
+				if foundIntervening then break end
+				local nKey = cellKey(sCx + off[1], sCz + off[2])
+				local nTiles = cellToTilesLookup[nKey]
+				if nTiles then
+					for _, sTile in ipairs(nTiles) do
+						if sTile ~= tileA and sTile ~= tileB then
+							foundIntervening = true
+							break
+						end
 					end
 				end
 			end
 		end
+
+		if foundIntervening then
+			interveningCount = interveningCount + 1
+		end
 	end
-	
+
 	-- Only reject if majority of samples find intervening tiles (more than 50%)
 	return interveningCount > (totalSamples / 2)
 end
@@ -813,11 +873,14 @@ local function calculateExtendedAdjacencies()
 
 			local shouldConnect = false
 
-			-- FIX v12.2: Special handling for Capital tiles
-			-- Capital tiles often have different geometry and need relaxed criteria
-			local isCapitalA = tileA.Name == "Capital"
-			local isCapitalB = tileB.Name == "Capital"
-			
+			-- FIX v12.2: Diagnostic logging for specific tile pairs (remove after verification)
+			local DEBUG_PAIR = (tileA.Name == "Vordingborg Kommune" and tileB.Name == "Næstved Kommune")
+				or (tileA.Name == "Næstved Kommune" and tileB.Name == "Vordingborg Kommune")
+			if DEBUG_PAIR then
+				warn(string.format("[DEBUG PAIR] %s <-> %s | rasterEdgeDist: %.2f | aabbEdgeDist: %.2f | centerDist: %.2f",
+					tileA.Name, tileB.Name, rasterEdgeDistance, aabbEdgeDistance, centerDistXZ))
+			end
+
 			-- Path A: Original gap-bridging logic (raster-based distance)
 			if rasterEdgeDistance > 0 and rasterEdgeDistance <= EXTENDED_ADJACENCY_THRESHOLD then
 				if isPathWalkable(tileA, tileB) then
@@ -834,30 +897,14 @@ local function calculateExtendedAdjacencies()
 				-- Step 1: Check for intervening tiles (another tile sits between them)
 				-- Use BBOX version since raster edge points may be inaccurate for short-border tiles
 				local hasIntervening = hasInterveningTileBetweenBBox(tileA, tileB, CellToTilesMap)
+				if DEBUG_PAIR then
+					warn(string.format("[DEBUG PAIR]   Path B: BBox intervening = %s", tostring(hasIntervening)))
+				end
 				-- Also check raster-based version as a second opinion
 				if not hasIntervening then
 					hasIntervening = hasInterveningTileBetween(tileA, tileB, CellToTilesMap)
-				end
-
-				-- FIX v12.2: Relax intervening tile check for Capital tiles
-				-- Capital tiles need to connect to their logical neighbors
-				if hasIntervening and (isCapitalA or isCapitalB) then
-					-- For Capital tiles, only reject if overwhelming evidence (75%+ samples)
-					local hasStrongIntervening = hasStrongInterveningTileBetweenBBox(tileA, tileB, CellToTilesMap)
-					if hasStrongIntervening then
-						local hasStrongInterveningRaster = hasInterveningTileBetween(tileA, tileB, CellToTilesMap)
-						-- Allow Capital adjacency unless both methods agree there's strong intervention
-						if hasStrongInterveningRaster then
-							rejectedCount = rejectedCount + 1
-							if DEBUG_REJECTED_ADJACENCY then
-								print(string.format("[TileAdjacencyManager] Capital adjacency rejected (strong intervention): %s <-> %s (AABB: %.1f, raster: %.1f)",
-										tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
-							end
-						else
-							hasIntervening = false -- Allow the connection
-						end
-					else
-						hasIntervening = false -- Allow the connection
+					if DEBUG_PAIR then
+						warn(string.format("[DEBUG PAIR]   Path B: raster intervening (2nd opinion) = %s", tostring(hasIntervening)))
 					end
 				end
 
@@ -881,6 +928,10 @@ local function calculateExtendedAdjacencies()
 								tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
 					end
 				end
+			end
+
+			if DEBUG_PAIR then
+				warn(string.format("[DEBUG PAIR]   Final result: shouldConnect = %s", tostring(shouldConnect)))
 			end
 
 			if shouldConnect then
@@ -1234,6 +1285,126 @@ function TileAdjacencyManager.areTilesAdjacent(tilePartA, tilePartB)
 	return neighbors and table.find(neighbors, tilePartB) ~= nil
 end
 
+-- FIX v12.2: Runtime diagnostic for adjacency failures - re-runs all checks and reports results
+function TileAdjacencyManager.diagnoseAdjacency(tileA, tileB)
+	if not tileA or not tileB then
+		warn("[ADJACENCY DIAG] One or both tiles are nil")
+		return
+	end
+
+	warn("=== ADJACENCY DIAGNOSTIC: " .. tileA.Name .. " <-> " .. tileB.Name .. " ===")
+
+	-- Check if tile parts are in the tile data
+	local footprintA = TileFootprint[tileA]
+	local footprintB = TileFootprint[tileB]
+	local cellCountA = 0
+	local cellCountB = 0
+	if footprintA then for _ in pairs(footprintA) do cellCountA = cellCountA + 1 end end
+	if footprintB then for _ in pairs(footprintB) do cellCountB = cellCountB + 1 end end
+	warn(string.format("  Raster footprint: %s has %d cells, %s has %d cells", tileA.Name, cellCountA, tileB.Name, cellCountB))
+
+	if cellCountA == 0 or cellCountB == 0 then
+		warn("  ❌ PROBLEM: One or both tiles have no raster footprint! Tile may not be registered.")
+		-- Check if tile is in AllTilesList
+		local foundA, foundB = false, false
+		for _, t in ipairs(AllTilesList) do
+			if t == tileA then foundA = true end
+			if t == tileB then foundB = true end
+		end
+		warn(string.format("  In AllTilesList: %s=%s, %s=%s", tileA.Name, tostring(foundA), tileB.Name, tostring(foundB)))
+		return
+	end
+
+	-- Check distances
+	local centerDistXZ = ((tileA.Position - tileB.Position) * Vector3.new(1, 0, 1)).Magnitude
+	local _, _, rasterEdgeDist = findClosestEdgePoints(tileA, tileB)
+	local aabbEdgeDist = calculateEdgeDistance(tileA, tileB)
+	warn(string.format("  Center-to-center (XZ): %.2f studs", centerDistXZ))
+	warn(string.format("  Raster edge distance: %.2f studs", rasterEdgeDist))
+	warn(string.format("  AABB edge distance: %.2f studs", aabbEdgeDist))
+	warn(string.format("  Tile A size: (%.1f, %.1f, %.1f) | Tile B size: (%.1f, %.1f, %.1f)",
+		tileA.Size.X, tileA.Size.Y, tileA.Size.Z, tileB.Size.X, tileB.Size.Y, tileB.Size.Z))
+	warn(string.format("  Tile A pos: (%.1f, %.1f, %.1f) | Tile B pos: (%.1f, %.1f, %.1f)",
+		tileA.Position.X, tileA.Position.Y, tileA.Position.Z, tileB.Position.X, tileB.Position.Y, tileB.Position.Z))
+
+	-- Check raster adjacency: do they share grid neighbors?
+	local shareGridNeighbor = false
+	if footprintA and footprintB then
+		for key, _ in pairs(footprintA) do
+			local cx, cz = parseCellKey(key)
+			if cx then
+				for _, offset in ipairs(NEIGHBOR_OFFSETS) do
+					local nKey = cellKey(cx + offset[1], cz + offset[2])
+					if footprintB[nKey] then
+						shareGridNeighbor = true
+						break
+					end
+				end
+			end
+			if shareGridNeighbor then break end
+		end
+	end
+	warn(string.format("  Share grid neighbor cells: %s", tostring(shareGridNeighbor)))
+
+	if shareGridNeighbor then
+		-- They should have been caught by raster adjacency
+		-- Check if intervening tile blocked them
+		local hasIntervening = hasInterveningTileBetween(tileA, tileB, CellToTilesMap)
+		warn(string.format("  Raster stage intervening tile check: %s", tostring(hasIntervening)))
+		if hasIntervening then
+			warn("  ❌ BLOCKED at raster stage by intervening tile check")
+		elseif rasterEdgeDist > MAX_RASTER_ADJACENCY_DISTANCE then
+			warn(string.format("  ❌ BLOCKED at raster stage: edge distance %.2f > MAX_RASTER_ADJACENCY_DISTANCE %d", rasterEdgeDist, MAX_RASTER_ADJACENCY_DISTANCE))
+		else
+			warn("  ⚠️ Unknown reason for raster stage rejection despite sharing grid neighbors")
+		end
+	else
+		warn("  → No shared grid neighbors, would need extended adjacency")
+	end
+
+	-- Check extended adjacency Path A
+	local pathACondition = rasterEdgeDist > 0 and rasterEdgeDist <= EXTENDED_ADJACENCY_THRESHOLD
+	warn(string.format("  Path A condition (rasterEdgeDist > 0 AND <= %d): %s (rasterEdgeDist=%.2f)",
+		EXTENDED_ADJACENCY_THRESHOLD, tostring(pathACondition), rasterEdgeDist))
+	if pathACondition then
+		local walkable = isPathWalkable(tileA, tileB)
+		warn(string.format("  Path A walkability: %s", tostring(walkable)))
+		if not walkable then
+			warn("  ❌ BLOCKED at Path A: walkability check failed")
+		end
+	end
+
+	-- Check extended adjacency Path B
+	local pathBCondition = aabbEdgeDist <= AABB_ADJACENCY_RESCUE_THRESHOLD
+	warn(string.format("  Path B condition (aabbEdgeDist <= %d): %s (aabbEdgeDist=%.2f)",
+		AABB_ADJACENCY_RESCUE_THRESHOLD, tostring(pathBCondition), aabbEdgeDist))
+	if pathBCondition and not pathACondition then
+		local hasBBoxIntervening = hasInterveningTileBetweenBBox(tileA, tileB, CellToTilesMap)
+		warn(string.format("  Path B BBox intervening: %s", tostring(hasBBoxIntervening)))
+		if not hasBBoxIntervening then
+			local hasRasterIntervening = hasInterveningTileBetween(tileA, tileB, CellToTilesMap)
+			warn(string.format("  Path B raster intervening (2nd opinion): %s", tostring(hasRasterIntervening)))
+			if not hasRasterIntervening then
+				local walkable = isPathWalkable(tileA, tileB, true)
+				warn(string.format("  Path B walkability (aabbOverride): %s", tostring(walkable)))
+				if not walkable then
+					warn("  ❌ BLOCKED at Path B: walkability check failed")
+				else
+					warn("  ✅ Path B should have connected these tiles!")
+				end
+			else
+				warn("  ❌ BLOCKED at Path B: raster intervening tile (2nd opinion)")
+			end
+		else
+			warn("  ❌ BLOCKED at Path B: BBox intervening tile check")
+		end
+	elseif not pathBCondition then
+		warn(string.format("  ❌ Path B not entered: aabbEdgeDist %.2f > threshold %d", aabbEdgeDist, AABB_ADJACENCY_RESCUE_THRESHOLD))
+	end
+
+	warn("=== END DIAGNOSTIC ===")
+end
+
 function TileAdjacencyManager.getTileCountry(tilePart)
 	if not tilePart then return nil end
 	local current = tilePart.Parent
@@ -1557,6 +1728,89 @@ function TileAdjacencyManager.recalculate()
 	calculateAdjacenciesFromFootprints()
 	calculateExtendedAdjacencies()
 	calculateSafeCenters()
+end
+
+-- FIX v17: Export isPathWalkable for use in NPCMovementSystem after edge point correction
+-- Now accepts optional pre-computed edge points to avoid redundant findClosestEdgePoints() calls
+function TileAdjacencyManager.isPathWalkable(tileA, tileB, pointA, pointB)
+	if pointA and pointB then
+		-- Use provided edge points, validate walkability directly
+		local closestA, closestB = pointA, pointB
+		local edgeDist = math.sqrt((pointA.X - pointB.X)^2 + (pointA.Z - pointB.Z)^2)
+
+		-- FIX v9.4: Close tiles bypass water checks
+		if edgeDist <= EXTENDED_ADJACENCY_THRESHOLD then
+			return true
+		end
+
+		-- If edges are too far apart, not walkable
+		if edgeDist > 6 then
+			return false
+		end
+
+		local rayHeight = math.max(closestA.Y, closestB.Y) + 20
+
+		local rayParams = RaycastParams.new()
+		rayParams.FilterDescendantsInstances = {EUROPE_MAP}
+		rayParams.FilterType = Enum.RaycastFilterType.Include
+		rayParams.IgnoreWater = true
+
+		-- Dense sampling: every 0.4 studs along the edge path
+		local numChecks = math.max(5, math.ceil(edgeDist / 0.4))
+		local groundCount = 0
+		local totalChecks = numChecks + 1
+		local consecutiveMisses = 0
+		local maxConsecutiveMisses = 0
+		local groundResults = {}
+
+		for i = 0, numChecks do
+			local fraction = i / numChecks
+			local checkX = closestA.X + (closestB.X - closestA.X) * fraction
+			local checkZ = closestA.Z + (closestB.Z - closestA.Z) * fraction
+			local origin = Vector3.new(checkX, rayHeight, checkZ)
+
+			local result = Workspace:Raycast(origin, Vector3.new(0, -50, 0), rayParams)
+
+			if result then
+				groundCount = groundCount + 1
+				consecutiveMisses = 0
+				table.insert(groundResults, true)
+			else
+				consecutiveMisses = consecutiveMisses + 1
+				maxConsecutiveMisses = math.max(maxConsecutiveMisses, consecutiveMisses)
+				table.insert(groundResults, false)
+			end
+		end
+
+		-- Check for consecutive misses (water crossing detection)
+		if maxConsecutiveMisses > MAX_CONSECUTIVE_MISSES then
+			return false
+		end
+
+		-- Explicit midpoint check
+		local midIndex = math.floor(#groundResults / 2) + 1
+		if #groundResults >= 3 then
+			local midStart = math.max(1, midIndex - 1)
+			local midEnd = math.min(#groundResults, midIndex + 1)
+			local midGroundCount = 0
+			for idx = midStart, midEnd do
+				if groundResults[idx] then
+					midGroundCount = midGroundCount + 1
+				end
+			end
+			-- Require at least 2 of 3 middle points to have ground
+			if midGroundCount < 2 then
+				return false
+			end
+		end
+
+		-- 85% ground ratio threshold
+		local groundRatio = groundCount / totalChecks
+		return groundRatio >= GROUND_RATIO_THRESHOLD
+	else
+		-- No pre-computed points - call local isPathWalkable normally
+		return isPathWalkable(tileA, tileB, false)
+	end
 end
 
 ---------------------------------------------------

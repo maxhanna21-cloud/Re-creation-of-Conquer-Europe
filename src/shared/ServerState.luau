@@ -22,6 +22,44 @@ function ServerState.getCountryOwners()
 	return ServerState.CountryOwners
 end
 
+-- FIX: Resolve the actual controlling player for a country, following conquest chains
+-- Example: France → Conquered_Germany → Conquered_Poland → PlayerPolish
+-- Returns: Player instance if chain resolves to a player, nil otherwise
+-- CRITICAL for multi-conquest scenarios (Bug 1 + Bug 2 fixes)
+function ServerState.resolveCountryOwner(countryName)
+	local seen = {} -- Cycle detection
+
+	while true do
+		local owner = ServerState.CountryOwners[countryName]
+
+		-- If we found a Player, return it
+		if typeof(owner) == "Instance" and owner:IsA("Player") then
+			return owner
+		end
+
+		-- If it's not a string, we can't resolve further
+		if type(owner) ~= "string" then
+			return nil  -- Unowned or invalid
+		end
+
+		-- Try to extract the conquering country from "Conquered_X" format
+		local conquerorCountry = owner:match("^Conquered_(.+)$")
+		if not conquerorCountry then
+			return nil  -- Not a conquest string
+		end
+
+		-- Cycle detection (shouldn't happen, but defensive)
+		if seen[conquerorCountry] then
+			warn("[ServerState] Cycle detected in conquest chain: " .. countryName)
+			return nil
+		end
+		seen[conquerorCountry] = true
+
+		-- Follow the chain to the conquering country
+		countryName = conquerorCountry
+	end
+end
+
 ---------------------------------------------------
 -- Country Coins
 ---------------------------------------------------

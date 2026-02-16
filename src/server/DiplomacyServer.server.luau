@@ -13,14 +13,10 @@ local TileOwnershipManager = require(ServerScriptService:WaitForChild("TileOwner
 
 -- 2. REQUIREMENTS (Remotes)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
-local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest")
 local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent")
 local GlobalNotificationEvent = ReplicatedStorage:WaitForChild("GlobalNotificationEvent", 10)
-
--- FIX: Create a new RemoteEvent for responses to avoid InvokeClient hangs
-local DiplomacyResponse = Instance.new("RemoteEvent")
-DiplomacyResponse.Name = "DiplomacyResponse"
-DiplomacyResponse.Parent = ReplicatedStorage
+local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 10)
+local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 10)
 
 -- HELPER: Find which country a player currently owns
 local function getPlayerCountry(player)
@@ -217,10 +213,20 @@ DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
 			GlobalNotificationEvent:FireAllClients("🤝 ALLIANCE: " .. senderCountry .. " and " .. targetCountryName .. " are now allies!", Color3.fromRGB(100, 255, 100))
 		elseif requestType == "Peace" then
 			DiplomacyManager.makePeace(senderCountry, targetCountryName)
-			-- Release occupied tiles for both sides on peace
-			TileOwnershipManager.releaseCountryOccupiedTiles(senderCountry)
-			TileOwnershipManager.releaseCountryOccupiedTiles(targetCountryName)
-			GlobalNotificationEvent:FireAllClients("🕊️ PEACE: " .. senderCountry .. " and " .. targetCountryName .. " have signed a treaty.", Color3.fromRGB(100, 200, 255))
+			-- FIX: Annex occupied tiles instead of releasing them
+			-- Each country keeps whatever territory they occupied during the war
+			local senderAnnexed = TileOwnershipManager.annexOccupiedTiles(senderCountry)
+			local targetAnnexed = TileOwnershipManager.annexOccupiedTiles(targetCountryName)
+
+			local annexMsg = ""
+			if senderAnnexed > 0 then
+				annexMsg = annexMsg .. senderCountry .. " annexed " .. senderAnnexed .. " tiles. "
+			end
+			if targetAnnexed > 0 then
+				annexMsg = annexMsg .. targetCountryName .. " annexed " .. targetAnnexed .. " tiles. "
+			end
+
+			GlobalNotificationEvent:FireAllClients("🕊️ PEACE: " .. senderCountry .. " and " .. targetCountryName .. " have signed a treaty. " .. annexMsg, Color3.fromRGB(100, 200, 255))
 		end
 	else
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ " .. targetCountryName .. " rejected your " .. requestType .. " request.", Color3.fromRGB(255, 200, 0))
