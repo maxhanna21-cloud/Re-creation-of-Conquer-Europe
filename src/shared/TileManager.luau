@@ -188,9 +188,9 @@ function TileManager.getSpawnPosition(player)
 
 	local occupied = OccupiedTiles[countryName]
 
-	-- Helper: resolve a tile key to a safe spawn position (rasterization centroid)
 	local TOM = getTileOwnershipManager()
 	local TAM = getTileAdjacencyManager()
+
 	local function getSafeSpawnPos(tileKey, fallbackPos)
 		local tilePart = TAM.getTileFromKey(tileKey)
 		if tilePart then
@@ -200,64 +200,51 @@ function TileManager.getSpawnPosition(player)
 		return fallbackPos
 	end
 
-	-- Helper: check if a home tile is enemy-occupied (captured by another country)
 	local function isEnemyOccupied(tileKey)
 		local tilePart = TAM.getTileFromKey(tileKey)
 		if not tilePart then return false end
-		-- Check if tile is occupied AND not by our own country
 		if TOM.isOccupied(tilePart) and not TOM.isOccupiedByCountry(tilePart, countryName) then
 			return true
 		end
 		return false
 	end
 
-	-- Check Capital first (index 1)
-	local capitalKey = getTileKey(tiles[1])
-	if not occupied[capitalKey] and not isEnemyOccupied(capitalKey) then
-		return getSafeSpawnPos(capitalKey, tiles[1]), capitalKey
-	end
+	-- Build unified pool of all available tiles (home + conquered)
+	local allCandidates = {}
 
-	-- Shuffle remaining tiles (skip index 1)
-	local remaining = {}
-	for i = 2, #tiles do
-		table.insert(remaining, tiles[i])
-	end
-
-	for i = #remaining, 2, -1 do
-		local j = math.random(1, i)
-		remaining[i], remaining[j] = remaining[j], remaining[i]
-	end
-
-	for _, tilePos in ipairs(remaining) do
+	-- Add home tiles
+	for _, tilePos in ipairs(tiles) do
 		local key = getTileKey(tilePos)
 		if not occupied[key] and not isEnemyOccupied(key) then
-			return getSafeSpawnPos(key, tilePos), key
+			table.insert(allCandidates, { key = key, pos = tilePos })
 		end
 	end
 
-	-- Also check occupied territory tiles (tiles captured from other countries)
-	local occupiedTiles = TOM.getCountryOccupiedTiles(countryName)
-	if #occupiedTiles > 0 then
-		-- Shuffle for random placement
-		for i = #occupiedTiles, 2, -1 do
-			local j = math.random(1, i)
-			occupiedTiles[i], occupiedTiles[j] = occupiedTiles[j], occupiedTiles[i]
-		end
-
-		for _, tilePart in ipairs(occupiedTiles) do
-			if tilePart and tilePart.Parent then
-				local spawnPos = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
-				local key = getTileKey(spawnPos)
-				if not GlobalOccupiedTiles[key] then
-					local safeCenter = TAM.getSafeCenter(tilePart)
-					return safeCenter or spawnPos, key
-				end
+	-- Add conquered/occupied territory tiles
+	local conqueredTiles = TOM.getCountryOccupiedTiles(countryName)
+	for _, tilePart in ipairs(conqueredTiles) do
+		if tilePart and tilePart.Parent then
+			local spawnPos = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
+			local key = getTileKey(spawnPos)
+			if not GlobalOccupiedTiles[key] then
+				table.insert(allCandidates, { key = key, pos = spawnPos })
 			end
 		end
 	end
 
-	warn("[TileManager] " .. countryName .. " is full!")
-	return nil
+	if #allCandidates == 0 then
+		warn("[TileManager] " .. countryName .. " is full!")
+		return nil
+	end
+
+	-- Shuffle all candidates uniformly
+	for i = #allCandidates, 2, -1 do
+		local j = math.random(1, i)
+		allCandidates[i], allCandidates[j] = allCandidates[j], allCandidates[i]
+	end
+
+	local chosen = allCandidates[1]
+	return getSafeSpawnPos(chosen.key, chosen.pos), chosen.key
 end
 
 -- Occupy a tile within a country

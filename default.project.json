@@ -20,7 +20,9 @@
       "Diagnostics": { "$path": "src/server/Diagnostics.server.luau" },
       "DiplomacyServer": { "$path": "src/server/DiplomacyServer.server.luau" },
       "Leaderstats": { "$path": "src/server/Leaderstats.server.luau" },
+      "CountryNPCRegistry": { "$path": "src/server/CountryNPCRegistry.luau" },
       "NPCPurchaseHandler": { "$path": "src/server/NPCPurchaseHandler.server.luau" },
+      "NPCSpawner": { "$path": "src/server/NPCSpawner.luau" },
       "NPCTargetingHandler": { "$path": "src/server/NPCTargetingHandler.server.luau" }
     },
     "StarterPlayer": {

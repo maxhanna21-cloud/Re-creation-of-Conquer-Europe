@@ -1,6 +1,7 @@
--- DiplomacyServer - FIXED v2
+-- DiplomacyServer - FIXED v3
 -- FIX #1: Prevents duplicate war declarations
 -- FIX #2: Better validation and error messages
+-- FIX #3: Full conquest-chain resolution via ServerState.resolveTarget()
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -10,10 +11,12 @@ local Players = game:GetService("Players")
 local DiplomacyManager = require(ServerScriptService:WaitForChild("DiplomacyManager", 10))
 local ServerState = require(ServerScriptService:WaitForChild("ServerState", 10))
 local TileOwnershipManager = require(ServerScriptService:WaitForChild("TileOwnershipManager", 10))
+local CountryNPCRegistry = require(ServerScriptService:WaitForChild("CountryNPCRegistry", 10))
 
 -- 2. REQUIREMENTS (Remotes)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
 local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent")
+local BreakAllianceEvent = ReplicatedStorage:WaitForChild("BreakAllianceEvent", 10)
 local GlobalNotificationEvent = ReplicatedStorage:WaitForChild("GlobalNotificationEvent", 10)
 local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 10)
 local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 10)
@@ -29,7 +32,9 @@ local function getPlayerCountry(player)
 	return nil
 end
 
--- HELPER: Find the player who owns a specific country
+-- HELPER: Raw single-level lookup (used ONLY for pre-resolution early-exit checks,
+-- e.g. "does this country exist?", "is it unowned with no NPCs?").
+-- Do NOT use this to determine the controlling player — use ServerState.resolveTarget() instead.
 local function getCountryOwner(countryName)
 	local countryOwners = ServerState.getCountryOwners()
 	return countryOwners[countryName]
@@ -42,50 +47,66 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 	local playerCountry = getPlayerCountry(player)
 
 	-- Validation Checks
-	if not playerCountry then 
+	if not playerCountry then
 		GlobalNotificationEvent:FireClient(player, "❌ You must own a country to declare war.", Color3.fromRGB(255, 100, 100))
-		return 
+		return
 	end
 
-	if playerCountry == targetCountryName then 
+	if playerCountry == targetCountryName then
 		GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
-		return 
+		return
 	end
 
-	local targetOwner = getCountryOwner(targetCountryName)
+	-- Raw pre-resolution checks (before chain-walking)
+	local rawOwner = getCountryOwner(targetCountryName)
 
 	-- Check if target country exists
-	if targetOwner == nil then
+	if rawOwner == nil then
 		GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
 		return
 	end
 
-	-- Check if target is unowned
-	if targetOwner == "Unowned" then
-		GlobalNotificationEvent:FireClient(player, "❌ Cannot declare war on an unowned country. Wait for someone to claim it.", Color3.fromRGB(255, 200, 0))
-		return
+	-- Check if target is unowned (with no NPCs)
+	if rawOwner == "Unowned" then
+		if not CountryNPCRegistry.hasNPCs(targetCountryName) then
+			GlobalNotificationEvent:FireClient(player, "❌ Cannot declare war on an unowned country. Wait for someone to claim it.", Color3.fromRGB(255, 200, 0))
+			return
+		end
+		-- Has NPCs — fall through and allow war declaration
 	end
 
-	-- If target is conquered, resolve to the conqueror country instead
-	if type(targetOwner) == "string" and targetOwner:find("Conquered_") then
-		local conquerorCountry = targetOwner:gsub("Conquered_", "")
-		-- Redirect war declaration to the conqueror
-		targetCountryName = conquerorCountry
-		targetOwner = getCountryOwner(conquerorCountry)
+	-- If target is conquered, resolve the full chain to the actual controlling country/player.
+	-- ALL conquest-chain resolution goes through ServerState.resolveTarget() — no exceptions.
+	if type(rawOwner) == "string" and rawOwner:find("Conquered_") then
+		local canonicalName, controllingPlayer = ServerState.resolveTarget(targetCountryName)
+		if not canonicalName then
+			GlobalNotificationEvent:FireClient(player, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
+			return
+		end
+
+		-- Redirect war declaration to the canonical controlling country
+		targetCountryName = canonicalName
 
 		-- Re-validate after redirect
-		if not targetOwner then
+		local resolvedOwner = getCountryOwner(canonicalName)
+		if not resolvedOwner then
 			GlobalNotificationEvent:FireClient(player, "❌ The conquering country no longer exists.", Color3.fromRGB(255, 100, 100))
 			return
 		end
-		if targetOwner == "Unowned" then
-			GlobalNotificationEvent:FireClient(player, "❌ " .. conquerorCountry .. " is currently unowned.", Color3.fromRGB(255, 200, 0))
+		if resolvedOwner == "Unowned" then
+			GlobalNotificationEvent:FireClient(player, "❌ " .. canonicalName .. " is currently unowned.", Color3.fromRGB(255, 200, 0))
 			return
 		end
 		if targetCountryName == playerCountry then
 			GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
 			return
 		end
+	end
+
+	-- Check if allied with target (must break alliance first)
+	if DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
+		GlobalNotificationEvent:FireClient(player, "You are allied with " .. targetCountryName .. "! Break the alliance first.", Color3.fromRGB(255, 200, 0))
+		return
 	end
 
 	-- FIX #1: Use the return value from declareWar to check for duplicates
@@ -107,29 +128,78 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 end)
 
 ---------------------------------------------------------
+-- PART 1.5: BREAK ALLIANCE LOGIC (Instant Action)
+---------------------------------------------------------
+BreakAllianceEvent.OnServerEvent:Connect(function(player, targetCountryName)
+	local playerCountry = getPlayerCountry(player)
+
+	-- Validation Checks
+	if not playerCountry then
+		GlobalNotificationEvent:FireClient(player, "❌ You must own a country to break an alliance.", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	if playerCountry == targetCountryName then
+		GlobalNotificationEvent:FireClient(player, "❌ You cannot break an alliance with yourself.", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	local targetOwner = getCountryOwner(targetCountryName)
+
+	-- Check if target country exists
+	if targetOwner == nil then
+		GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
+		return
+	end
+
+	-- Check if allied with target
+	if not DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
+		GlobalNotificationEvent:FireClient(player, "❌ You are not allied with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
+		return
+	end
+
+	-- Break the alliance
+	DiplomacyManager.breakAlliance(playerCountry, targetCountryName)
+
+	-- Notify everyone
+	print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName)
+	local msg = "💔 " .. playerCountry .. " has broken their alliance with " .. targetCountryName .. "!"
+	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 100, 100))
+end)
+
+---------------------------------------------------------
 -- PART 2: PEACE & ALLIANCE LOGIC (Request System)
 ---------------------------------------------------------
 local function processRequest(senderPlayer, targetCountryName, requestType)
 	local senderCountry = getPlayerCountry(senderPlayer)
-	local receiverPlayer = getCountryOwner(targetCountryName)
+
+	-- Resolve the full conquest chain to get canonical country name + controlling player.
+	-- This is the single authoritative resolution path — no chain-walking anywhere else.
+	local canonicalName, receiverPlayer = ServerState.resolveTarget(targetCountryName)
+	if not canonicalName then
+		GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
+		return
+	end
+	targetCountryName = canonicalName
 
 	-- Validation
-	if not senderCountry then 
+	if not senderCountry then
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ You must own a country first.", Color3.fromRGB(255, 100, 100))
-		return 
+		return
 	end
 
-	if not receiverPlayer then 
+	if not receiverPlayer then
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country has no owner.", Color3.fromRGB(255, 100, 100))
-		return 
+		return
 	end
 
-	if senderPlayer == receiverPlayer then 
+	if senderPlayer == receiverPlayer then
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ You cannot send requests to yourself.", Color3.fromRGB(255, 100, 100))
-		return 
+		return
 	end
 
-	-- Check if receiver is actually a player
+	-- receiverPlayer is guaranteed to be a Player instance by resolveTarget(),
+	-- but keep the safety check so any unexpected value surfaces clearly.
 	if typeof(receiverPlayer) ~= "Instance" or not receiverPlayer:IsA("Player") then
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ Cannot send requests to AI/unowned countries.", Color3.fromRGB(255, 200, 0))
 		return
@@ -145,6 +215,14 @@ local function processRequest(senderPlayer, targetCountryName, requestType)
 	if requestType == "Peace" then
 		if not DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
 			GlobalNotificationEvent:FireClient(senderPlayer, "⚠️ You are not at war with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
+			return
+		end
+	end
+
+	-- Additional validation for alliance requests
+	if requestType == "Alliance" then
+		if DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
+			GlobalNotificationEvent:FireClient(senderPlayer, "You are at war with " .. targetCountryName .. "! Sign peace first.", Color3.fromRGB(255, 200, 0))
 			return
 		end
 	end

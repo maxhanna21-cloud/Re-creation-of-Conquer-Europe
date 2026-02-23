@@ -186,127 +186,36 @@ local function isOnValidGround(npcModel)
 	return false -- True fall into the void
 end
 
--- Check if there's valid ground AHEAD of the NPC in their movement direction
--- Uses whitelist raycast to only detect actual EuropeMap tiles, not water/void
--- Only checks when NPC has moved significantly from origin (to avoid false positives at tile boundaries)
---[[
-local function hasGroundAhead(npcModel, targetPos, originPos)
+-- NEW: Proactive look-ahead to stop NPCs *before* they fall off the mesh
+local function hasGroundAhead(npcModel, humanoid, distance)
 	getDependencies()
-
 	local root = getRootPart(npcModel)
-	if not root then return true end -- assume safe if we can't check
+	if not root or not humanoid then return true end
 
-	local currentPos = root.Position
+	-- Only check if the NPC is actively moving
+	if humanoid.MoveDirection.Magnitude < 0.1 then return true end
 
-	-- FIX: Reduced detection dead zones - was 5 studs from origin, now 2 studs
-	-- This was causing NPCs to have 5 full studs of unguarded movement at the start
-	if originPos then
-		local distFromOrigin = ((currentPos - originPos) * Vector3.new(1, 0, 1)).Magnitude
-		if distFromOrigin < 2 then
-			return true -- Still very close to origin, don't trigger edge detection yet
-		end
-	end
-
-	-- FIX: Reduced near-target dead zone from 3 studs to 1 stud
-	-- Allows approach movement but catches NPCs that lose ground mid-approach
-	local distToTarget = ((currentPos - targetPos) * Vector3.new(1, 0, 1)).Magnitude
-	if distToTarget < 1 then
-		return true -- Very close to target, let arrival logic handle final step
-	end
-
-	local directionXZ = (targetPos - currentPos) * Vector3.new(1, 0, 1)
-	if directionXZ.Magnitude < 0.1 then return true end -- close enough, don't check
-
-	-- Get EuropeMap for whitelist raycast
 	local europeMap = Workspace:FindFirstChild("EuropeMap")
-	if not europeMap then return true end -- can't check without map reference
+	if not europeMap then return true end
+
+	-- Project a ray ahead of the movement vector
+	local rayOrigin = root.Position + (humanoid.MoveDirection.Unit * distance) + Vector3.new(0, 2, 0)
+	local rayDir = Vector3.new(0, -10, 0) -- Check up to 8 studs below NPC's feet
 
 	local params = RaycastParams.new()
 	params.FilterDescendantsInstances = {europeMap}
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.IgnoreWater = true
 
-	-- Only check at current position (are we still on a tile?)
-	-- This is more reliable than checking ahead which can hit gaps between tiles
-	local rayOrigin = Vector3.new(currentPos.X, currentPos.Y + 10, currentPos.Z)
-	local rayDirection = Vector3.new(0, -25, 0)
-
-	local result = Workspace:Raycast(rayOrigin, rayDirection, params)
-
-	if not result then
-		-- Not currently over any EuropeMap tile
-		if DEBUG then
-			print("[NPCMovement] NPC " .. npcModel.Name .. " is not over any tile!")
-		end
+	local result = Workspace:Raycast(rayOrigin, rayDir, params)
+	
+	-- If no ground, or the drop is deeper than 5 studs, throw the brake
+	if not result or (root.Position.Y - result.Position.Y) > 5 then
 		return false
 	end
-
-	-- Verify we're on top of a tile, not on its side
-	if result.Normal.Y < 0.3 then
-		if DEBUG then
-			print("[NPCMovement] NPC " .. npcModel.Name .. " is on tile side, not stable")
-		end
-		return false
-	end
-
+	
 	return true
 end
-]]
-
--- FIX: Smart path validation - only blocks truly impassable paths
--- Checks origin, target, and midpoint. Allows humanoid controller to handle minor gaps
---[[
-local function isPathTraversable(originPos, targetPos)
-	getDependencies()
-
-	local europeMap = Workspace:FindFirstChild("EuropeMap")
-	if not europeMap then return true end -- Can't validate, assume OK
-
-	local params = RaycastParams.new()
-	params.FilterDescendantsInstances = {europeMap}
-	params.FilterType = Enum.RaycastFilterType.Include
-	params.IgnoreWater = true
-
-	local pathDirection = targetPos - originPos
-	local pathDistance = pathDirection.Magnitude
-
-	if pathDistance < 0.1 then return true end -- Same position, OK
-
-	-- Only check 3 critical points: start, middle, end
-	-- This avoids blocking legitimate movement while catching major gaps
-	local checkPositions = {
-		originPos,           -- Start point
-		originPos:Lerp(targetPos, 0.5),  -- Midpoint
-		targetPos            -- End point
-	}
-
-	local groundCount = 0
-	for _, checkPos in ipairs(checkPositions) do
-		-- Raycast down from this point
-		local rayOrigin = checkPos + Vector3.new(0, 5, 0)
-		local rayDir = Vector3.new(0, -20, 0)
-
-		local result = Workspace:Raycast(rayOrigin, rayDir, params)
-
-		if result then
-			-- Found ground at this point
-			groundCount = groundCount + 1
-		end
-	end
-
-	-- Require at least 2 of 3 points to have ground
-	-- This allows the humanoid controller to handle single gaps
-	-- But blocks paths where most/all points lack ground
-	if groundCount < 2 then
-		if DEBUG then
-			print("[NPCMovement:PathValidation] Path validation FAILED - only " .. groundCount .. "/3 points have ground")
-		end
-		return false
-	end
-
-	return true -- Path is traversable
-end
-]]
 
 -- FIX v8: Helper function to check if NPC can PASS THROUGH a tile (not capture, just traverse)
 -- This is more lenient than canMoveToTile since we allow passage through allied territory
@@ -382,7 +291,10 @@ local function canPassThroughTile(owner, role, tilePart, playerCountry)
 			end
 			return true
 		elseif tileOwner == "Unowned" then
-			-- Cannot pass through neutral territory
+			-- Allow passage through unowned country territory if at war with it
+			if DiplomacyManager.areCountriesAtWar(playerCountry, tileCountry) then
+				return true
+			end
 			return false
 		end
 	end
@@ -394,11 +306,12 @@ end
 -- Finds a safe route from source to destination using the adjacency graph
 -- Returns: list of tile parts to visit in order (shortest path)
 -- Now validates each intermediate tile for diplomacy and occupation
-local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner, role, playerCountry)
+local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner, role, playerCountry, excludedEdges)
 	if not sourceTilePart or not destinationTilePart then return nil end
 	if sourceTilePart == destinationTilePart then return {sourceTilePart} end
 
 	getDependencies()
+	excludedEdges = excludedEdges or {}
 
 	maxDepth = maxDepth or 20  -- Prevent infinite loops on large maps
 
@@ -422,6 +335,28 @@ local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner
 			if neighbors and #neighbors > 0 then
 				for _, neighbor in ipairs(neighbors) do
 					if not visited[neighbor] then
+						-- FIX v18: Check if this edge is excluded (failed walkability this move)
+						local keyA = TileKeyUtils.getTileKeyFromPart(current)
+						local keyB = TileKeyUtils.getTileKeyFromPart(neighbor)
+						local isExcluded = false
+						if keyA and keyB then
+							local edgeParts = {keyA, keyB}
+							table.sort(edgeParts)
+							local edgeKey = edgeParts[1] .. "->" .. edgeParts[2]
+
+							if excludedEdges[edgeKey] then
+								isExcluded = true
+								if DEBUG then
+									print(string.format("[NPCMovement:BFS] Skipping excluded edge: %s", edgeKey))
+								end
+							end
+						end
+
+						-- Skip if edge is excluded
+						if isExcluded then
+							continue
+						end
+
 						-- FIX v8: Validate if we can pass through this tile
 						-- For intermediate tiles, check passage rules
 						-- For the final destination, we use the stricter canMoveToTile check later
@@ -556,9 +491,11 @@ end
 
 -- Build enriched waypoints that inject edge-crossing points for gap-connected tiles.
 -- For narrow/curved tiles, uses PathfindingService to navigate from safe center to edge.
-local function buildEnrichedWaypoints(tilePath)
+local function buildEnrichedWaypoints(tilePath, excludedEdges)
 	getDependencies()
-	if not tilePath or #tilePath < 2 then return nil end
+	excludedEdges = excludedEdges or {}  -- Set of "tileKeyA->tileKeyB" that failed walkability this move
+	local directEdgeFailed = false  -- Track if the direct adjacency edge (first pair) failed
+	if not tilePath or #tilePath < 2 then return nil, false end
 
 	local waypoints = {}
 
@@ -573,42 +510,83 @@ local function buildEnrichedWaypoints(tilePath)
 		local prevTile = tilePath[i - 1]
 		local currTile = tilePath[i]
 
-		-- Check if this pair has a gap between edges
-		local pointA, pointB, edgeDist = TileAdjacencyManager.findClosestEdgePoints(prevTile, currTile)
+		-- FIX v18: Validate the path using adjacency proof points (if available)
+		-- This ensures runtime validation uses THE SAME points and mode that created the adjacency
+		local proof = TileAdjacencyManager.getAdjacencyProof(prevTile, currTile)
+		local walkabilityFailed = false
+		local pointA, pointB, edgeDist
 
-		-- FIX v10: Validate edge points have walkable surface on their respective tiles
-		-- Bounding box edge sampling can return points off-tile for irregular/rotated tiles
-		if pointA and pointB then
-			local correctedA = TileAdjacencyManager.findNearestSurfacePoint(prevTile, pointA)
-			local correctedB = TileAdjacencyManager.findNearestSurfacePoint(currTile, pointB)
-			if correctedA then
-				pointA = correctedA
+		if proof then
+			-- Use the exact proof points and mode from adjacency creation
+			-- NO surface correction here — proof points are the canonical validation segment
+			local isWalkable = TileAdjacencyManager.isPathWalkable(prevTile, currTile, {
+				mode = proof.mode,
+				pointA = proof.pointA,
+				pointB = proof.pointB,
+				distance = proof.distance  -- Pass stored distance (atomic with points)
+			})
+
+			if isWalkable then
+				-- Proof validated successfully, use proof points directly
+				pointA = proof.pointA
+				pointB = proof.pointB
+				edgeDist = proof.distance
+			else
+				-- Proof failed at runtime — try finding a different walkable crossing live
+				-- Preserve the proof's mode (raster vs aabb) for correct candidate generation
+				local liveCrossing = TileAdjacencyManager.getBestWalkableBorderCrossing(prevTile, currTile, nil, proof.mode)
+				if liveCrossing then
+					pointA = liveCrossing.pointA
+					pointB = liveCrossing.pointB
+					edgeDist = liveCrossing.distance
+					-- No surface correction needed — getBestWalkableBorderCrossing already
+					-- surface-corrects and revalidates inside its loop
+				else
+					walkabilityFailed = true
+					if DEBUG then
+						warn(string.format("[NPCMovement:Waypoints] Proof + live crossing both failed (mode: %s): %s -> %s",
+							proof.mode, prevTile.Name, currTile.Name))
+					end
+					pointA = nil
+					pointB = nil
+				end
 			end
-			if correctedB then
-				pointB = correctedB
-			end
-			-- Recalculate edge distance after correction
-			if correctedA or correctedB then
-				local dx = pointA.X - pointB.X
-				local dz = pointA.Z - pointB.Z
-				edgeDist = math.sqrt(dx * dx + dz * dz)
+		else
+			-- No proof — try top-k walkable border crossing (defaults to raster mode)
+			local crossing = TileAdjacencyManager.getBestWalkableBorderCrossing(prevTile, currTile)
+			if crossing then
+				pointA = crossing.pointA
+				pointB = crossing.pointB
+				edgeDist = crossing.distance
+				-- No surface correction needed — already done inside getBestWalkableBorderCrossing
+			else
+				walkabilityFailed = true
 			end
 		end
 
+		-- Add failed edge to this move's exclusion set (using stable TileKeys)
+		if walkabilityFailed then
+			local keyA = TileKeyUtils.getTileKeyFromPart(prevTile)
+			local keyB = TileKeyUtils.getTileKeyFromPart(currTile)
+			if keyA and keyB then
+				-- Create stable edge ID (sorted lexicographically)
+				local edgeParts = {keyA, keyB}
+				table.sort(edgeParts)
+				local edgeKey = edgeParts[1] .. "->" .. edgeParts[2]
+				excludedEdges[edgeKey] = true
 
-	-- FIX v17: Validate the path between corrected edge points using TileAdjacencyManager's robust walkability check
-	-- This reuses the battle-tested 85% ground ratio, consecutive barrier detection, and adaptive tolerance logic
-	if pointA and pointB then
-		local isWalkable = TileAdjacencyManager.isPathWalkable(prevTile, currTile, pointA, pointB)
-		if not isWalkable then
-			if DEBUG then
-				warn(string.format("[NPCMovement:Waypoints] Path not walkable after correction: %s -> %s (using center-to-center fallback)",
-					prevTile.Name, currTile.Name))
+				-- Track if this is the direct adjacency edge (first pair in 2-tile path)
+				local isDirectAdjacencyEdge = (prevTile == tilePath[1] and currTile == tilePath[2])
+				if isDirectAdjacencyEdge then
+					directEdgeFailed = true
+				end
+
+				if DEBUG then
+					warn(string.format("[NPCMovement:Exclusion] Edge %s excluded for this move%s",
+						edgeKey, isDirectAdjacencyEdge and " (DIRECT EDGE)" or ""))
+				end
 			end
-			pointA = nil
-			pointB = nil
 		end
-	end
 
 		if DEBUG then
 			print(string.format("[NPCMovement:Waypoints] Edge check: %s -> %s, edgeDist=%.3f, pointA=%s, pointB=%s",
@@ -806,10 +784,20 @@ local function buildEnrichedWaypoints(tilePath)
 									tile = currTile
 								})
 							else
-								-- All pathfinding failed. Skip edge waypoints, fall back to direct
-								-- center-to-center movement (old behavior). Log a warning.
+								-- All pathfinding failed. Still emit edge waypoints so the
+								-- gap-crossing teleport at monitor lines 1196-1246 triggers safely.
+								table.insert(waypoints, {
+									type = "edge",
+									position = edgePointA,
+									tile = prevTile
+								})
+								table.insert(waypoints, {
+									type = "edge",
+									position = edgePointB,
+									tile = currTile
+								})
 								if DEBUG then
-									print(string.format("[NPCMovement:Waypoints] WARNING: All pathfinding failed for %s -> %s gap (including cell-based). Using direct movement (may fall).",
+									print(string.format("[NPCMovement:Waypoints] WARNING: All pathfinding failed for %s -> %s gap. Using edge teleport crossing.",
 										prevTile.Name, currTile.Name))
 								end
 							end
@@ -897,7 +885,7 @@ local function buildEnrichedWaypoints(tilePath)
 		print("[NPCMovement:Waypoints] Built " .. #waypoints .. " enriched waypoints:" .. wpSummary)
 	end
 
-	return waypoints
+	return waypoints, directEdgeFailed
 end
 
 -- Teleport with throttle and safe-center validation
@@ -1319,6 +1307,9 @@ local function monitorMovement(npcModel, isRetreat)
 					if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
 						-- This is the region's capital AND the region is ultimately owned by a live player
 						safeCapitalCapture(tileCountry, owner)
+					elseif ServerState.isCountryUnowned(tileCountry) then
+						-- Unowned country capital captured — trigger takeover
+						safeCapitalCapture(tileCountry, owner)
 					else
 						-- Region is conquered (chain resolves to nil or non-Player) - treat as normal tile capture
 						if DEBUG then
@@ -1339,32 +1330,29 @@ local function monitorMovement(npcModel, isRetreat)
 		end
 	end
 
-	-- STILL MOVING: Apply path correction to keep NPC on safe corridor
-	local effectiveTarget = waypointPos
+-- STILL MOVING: Apply path correction to keep NPC on safe corridor
+local effectiveTarget = waypointPos
 
-	-- NOTE: Active edge detection disabled during movement
-	-- The ground check loop (every 0.1s) is sufficient to catch actual falls
-	-- Active edge detection was too aggressive and caused NPCs to get stuck
-	-- from momentary loss of ground contact during humanoid movement (normal behavior)
+if corridorOrigin then
+	effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
+end
 
-	-- Path correction: keep NPC in a safe corridor between consecutive waypoints
-	-- Uses previous waypoint as corridor origin (not global origin) for per-segment accuracy
-	local corridorOrigin = nil
-	if currentWaypoint > 1 then
-		corridorOrigin = enrichedWaypoints[currentWaypoint - 1].position
-	else
-		corridorOrigin = movement.originPosition
-	end
-
-	if corridorOrigin then
-		effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
-	end
-
-	humanoid:MoveTo(effectiveTarget)
-
-	-- STUCK detection sampling
+-- NEW: Emergency Brake System
+if not hasGroundAhead(npcModel, humanoid, 3.5) then
+	if DEBUG then warn("[NPCMovement:Brake] Emergency brake applied for " .. npcModel.Name .. " - cliff/void detected ahead!") end
+	humanoid:MoveTo(root.Position) -- Stop instantly
+	
+	-- Force the stuck detection to trigger instantly so the NPC initiates a recovery teleport or retry
 	movementStates[npcModel] = movementStates[npcModel] or {}
-	local state = movementStates[npcModel]
+	movementStates[npcModel].stuckSince = movementStates[npcModel].stuckSince or (os.clock() - (STUCK_CHECK_TIME * 2))
+	return
+end
+
+humanoid:MoveTo(effectiveTarget)
+
+-- STUCK detection sampling
+movementStates[npcModel] = movementStates[npcModel] or {}
+local state = movementStates[npcModel]
 
 	local now = os.clock()
 	state.lastSamplePos = state.lastSamplePos or root.Position
@@ -1481,6 +1469,10 @@ local function canMoveToTile(owner, role, targetTilePart, playerCountry)
 			end
 			return true, nil
 		elseif tileOwner == "Unowned" then
+			-- Allow movement into unowned country territory if at war with it
+			if DiplomacyManager.areCountriesAtWar(playerCountry, tileCountry) then
+				return true, nil
+			end
 			return false, "Cannot invade neutral territory (" .. tileCountry .. " is unowned)"
 		end
 	end
@@ -1612,12 +1604,13 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		return false, "Cannot determine if tiles are adjacent - resolution failed"
 	end
 
-	-- FIX v10: If tiles are directly adjacent, use direct 2-tile path (skip BFS)
+	-- FIX v10/v18: If tiles are directly adjacent, use direct 2-tile path (skip BFS)
 	-- This prevents routing through intermediate tiles when the destination is right next door.
 	-- Diplomacy/occupancy for the destination is checked separately by canMoveToTile below.
 	local playerCountry = TileManager.getPlayerCountry(owner)
 	local areTilesDirectlyAdjacent = TileAdjacencyManager.areTilesAdjacent(currentTilePart, resolvedTargetTilePart)
 	local tilePath
+	local excludedEdges = {}  -- Per-move exclusion set
 
 	if areTilesDirectlyAdjacent then
 		tilePath = {currentTilePart, resolvedTargetTilePart}
@@ -1626,7 +1619,7 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		end
 	else
 		-- Multi-tile pathfinding with diplomacy validation (for non-adjacent destinations)
-		tilePath = findTilePath(currentTilePart, resolvedTargetTilePart, nil, owner, role, playerCountry)
+		tilePath = findTilePath(currentTilePart, resolvedTargetTilePart, nil, owner, role, playerCountry, excludedEdges)
 	end
 
 	if not tilePath then
@@ -1644,9 +1637,17 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		print("[NPCMovement:Pathfinding] Found path: " .. pathStr)
 	end
 
-	-- NOTE: Path validation disabled - the edge detection and ground checks during movement
-	-- are more flexible and handle minor gaps better. The humanoid controller can bridge
-	-- small terrain variations, and our ground checks will catch actual fall-off situations.
+	-- For direct-adjacent moves, verify a walkable crossing proof exists before committing.
+	-- This catches adjacency-table false positives that would otherwise send NPCs into walls.
+	if areTilesDirectlyAdjacent then
+		local proof = TileAdjacencyManager.getAdjacencyProof(currentTilePart, resolvedTargetTilePart)
+		if not proof then
+			if DEBUG then
+				warn("[NPCMovement] No adjacency proof for direct move: " .. currentTilePart.Name .. " -> " .. resolvedTargetTilePart.Name .. " — blocking movement")
+			end
+			return false, "No walkable crossing between tiles"
+		end
+	end
 
 	-- FIX v8: playerCountry already defined above for pathfinding
 	local canMove, moveError = canMoveToTile(owner, role, resolvedTargetTilePart, playerCountry)
@@ -1704,7 +1705,12 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 	movementStates[npcModel].fallRecoveries = 0  -- FIX v9: Reset fall recovery counter on new movement
 
 	-- Build enriched waypoints with edge-crossing points for gap tiles
-	local enrichedWaypoints = buildEnrichedWaypoints(tilePath)
+	local enrichedWaypoints, directEdgeFailed = buildEnrichedWaypoints(tilePath, excludedEdges)
+
+	-- Adjacent tiles must cross their shared border directly (no intermediate routing).
+	-- The adjacency invariant guarantees a walkable crossing existed at init time.
+	-- getBestWalkableBorderCrossing retries with k=5 candidates at runtime.
+
 	if not enrichedWaypoints or #enrichedWaypoints < 2 then
 		releaseTileReservation(targetTileKey, npcModel)
 		return false, "Failed to build waypoints"
@@ -1883,15 +1889,14 @@ local function init()
 	CollectionService:GetInstanceAddedSignal(NPC_TAG):Connect(function(child)
 		-- Wait for components to replicate/initialize
 		task.defer(function()
-			local attempts = 0
-			while attempts < 10 do
-				if child:FindFirstChild("Humanoid") and child:FindFirstChild("NPCOwner") then
-					startGroundCheck(child)
-					return
-				end
-				task.wait(0.1)
-				attempts = attempts + 1
+			local humanoid = child:WaitForChild("Humanoid", 1)
+			local ownerVal  = child:WaitForChild("NPCOwner",  1)
+			if not child.Parent then return end  -- destroyed during the wait
+			if not humanoid or not ownerVal then
+				warn("[NPCMovement] NPC missing Humanoid/NPCOwner after 1s:", child.Name)
+				return
 			end
+			startGroundCheck(child)
 		end)
 	end)
 end

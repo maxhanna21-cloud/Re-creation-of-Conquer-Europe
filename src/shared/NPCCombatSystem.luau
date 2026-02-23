@@ -156,6 +156,11 @@ local function fireMultiLaser(npcModel, targetHumanoids, beamColor)
 			if targetRoot then
 				createLaserBeam(npcRoot.Position, targetRoot.Position, beamColor)
 				targetHumanoid:TakeDamage(damagePerTarget)
+				-- Auto-retaliation: notify target it was hit (only triggers for AutoRetaliate NPCs)
+				local targetNpcModel = targetHumanoid.Parent
+				if targetNpcModel then
+					Combat.noteHit(npcModel, targetNpcModel)
+				end
 				if DEBUG then
 					print(npcModel.Name, "SPLIT FIRE at", targetHumanoid.Parent.Name, "for", string.format("%.2f", damagePerTarget), "damage")
 				end
@@ -497,7 +502,7 @@ function Combat.clearManualTarget(attackerModel)
 end
 
 function Combat.registerNPC(npcModel, ownerPlayer, role)
-	if not npcModel or not ownerPlayer or not role then return end
+	if not npcModel or not role then return end
 	if combatLoops[npcModel] then return end
 
 	npcOwners[npcModel] = ownerPlayer
@@ -525,13 +530,12 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 
 				if target and target.Parent then
 					local targetHumanoid = target:FindFirstChildOfClass("Humanoid")
-					local targetOwner = Combat.getOwner(target)
 
 					-- Check tile adjacency
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, target)
 
-					-- FIX v4: Use canAttack() which checks war status AND alliance status
-					local canFight = DiplomacyManager.canAttack(npcOwner, targetOwner)
+					-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
+					local canFight = DiplomacyManager.canNPCAttack(npcModel, target)
 
 					if targetHumanoid and targetHumanoid.Health > 0 and canFight and isAdjacent then
 						table.insert(allValidTargets, targetHumanoid)
@@ -558,13 +562,12 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 
 					if threat and threat.Parent then
 						local threatHumanoid = threat:FindFirstChildOfClass("Humanoid")
-						local threatOwner = Combat.getOwner(threat)
 
 						-- Check tile adjacency for threats
 						local isAdjacent = areNPCsOnAdjacentTiles(npcModel, threat)
 
-						-- FIX v4: Use canAttack() for threat validation
-						local canFight = DiplomacyManager.canAttack(npcOwner, threatOwner)
+						-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
+						local canFight = DiplomacyManager.canNPCAttack(npcModel, threat)
 
 						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
 							-- Check if not already in targets list
@@ -602,19 +605,13 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 			for i = #attackers, 1, -1 do
 				local att = attackers[i]
 
-				if att and att.Parent and att:FindFirstChild("Humanoid") then
-					local attOwner = Combat.getOwner(att)
-
-					-- Check tile adjacency
+				if att and att.Parent then
+					local attHumanoid = att:FindFirstChildOfClass("Humanoid")
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, att)
-
-					-- FIX v4: Use canAttack() which checks war status AND alliance status
-					local canFight = DiplomacyManager.canAttack(defenderOwner, attOwner)
-
-					if att.Humanoid.Health > 0 and canFight and isAdjacent then
-						table.insert(allValidTargets, att.Humanoid)
+					local canFight = DiplomacyManager.canNPCAttack(npcModel, att)
+					if attHumanoid and attHumanoid.Health > 0 and canFight and isAdjacent then
+						table.insert(allValidTargets, attHumanoid)
 					else
-						-- Friendly, allied, dead, or not adjacent - remove from threat list
 						table.remove(attackers, i)
 					end
 				else
@@ -626,7 +623,8 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 		end)
 	end
 
-	print("Registered NPC:", npcModel.Name, "| Role:", role, "| Owner:", ownerPlayer.Name)
+	local ownerLabel = ownerPlayer and ownerPlayer.Name or "Country-owned"
+	print("Registered NPC:", npcModel.Name, "| Role:", role, "| Owner:", ownerLabel)
 end
 
 function Combat.unregisterNPC(npcModel)
@@ -711,6 +709,26 @@ function Combat.noteTargetingAttacker(aggressorModel, victimAttackerModel)
 	end
 end
 
+-- Record that attackerNpc hit targetNpc.
+-- Only records threat for NPCs with AutoRetaliate=true (country-owned starter NPCs).
+-- Player-owned NPCs are unaffected (no AutoRetaliate attribute set on them).
+function Combat.noteHit(attackerNpc, targetNpc)
+	if not attackerNpc or not targetNpc then return end
+	if targetNpc:GetAttribute("Dead") then return end
+	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
+
+	local targetRole = npcRoles[targetNpc]
+	if targetRole == "Defender" then
+		-- attackerModel = shooterNpc, defenderModel = targetNpc (victim)
+		Combat.noteAttackerTargeting(attackerNpc, targetNpc)
+	elseif targetRole == "Attacker" then
+		-- aggressorModel = attackerNpc (shooter), victimAttackerModel = targetNpc (victim)
+		Combat.noteTargetingAttacker(attackerNpc, targetNpc)
+	else
+		warn("[noteHit] Missing/unknown role for target:", targetNpc, targetRole)
+	end
+end
+
 function Combat.removeAttackerFromDefender(attackerModel, defenderModel)
 	if not attackerModel or not defenderModel then return end
 	local attackers = defenderAttackers[defenderModel]
@@ -748,12 +766,9 @@ function Combat.attackAttacker(attackerModel, targetAttackerModel)
 	if not attackerModel or not targetAttackerModel then return end
 	if not npcOwners[attackerModel] then return end
 
-	local attackerOwner = npcOwners[attackerModel]
-	local targetOwner = npcOwners[targetAttackerModel]
-
-	-- FIX v4: Use canAttack() instead of simple owner comparison
-	if not DiplomacyManager.canAttack(attackerOwner, targetOwner) then
-		return -- Can't attack (same owner, allied, or not at war)
+	-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
+	if not DiplomacyManager.canNPCAttack(attackerModel, targetAttackerModel) then
+		return -- Can't attack (same country, allied, or not at war)
 	end
 
 	Combat.addManualTarget(attackerModel, targetAttackerModel)

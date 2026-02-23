@@ -1,6 +1,6 @@
 -- CountryManager (ServerScriptService) - FIXED v5
 -- FIX v5: Wars and occupied territory persist when player leaves
---         New player inherits wars and occupied tiles
+-- New player inherits wars and occupied tiles
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -13,6 +13,7 @@ local ServerState = require(game:GetService("ServerScriptService"):WaitForChild(
 local TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileManager", 10))
 -- DiplomacyManager NOT cleared when player leaves (wars persist)
 local DiplomacyManager = require(game:GetService("ServerScriptService"):WaitForChild("DiplomacyManager", 10))
+local NPCSpawner = require(game:GetService("ServerScriptService"):WaitForChild("NPCSpawner", 10))
 local CountryClaimedEvent = ReplicatedStorage:FindFirstChild("CountryClaimedEvent")
 
 -- Core Data
@@ -40,84 +41,85 @@ local playerClaiming = {}
 local playerClaimTime = {}
 
 ---------------------------------------------------
--- Manpower Calculation System
+-- Manpower Calculation System (Optimized v6)
 ---------------------------------------------------
 
-local function calculateStartingManpower(population, globalAvgPopulation, minPopulation, maxPopulation)
-	if not population or population <= 0 then
-		warn("[CountryManager] Invalid population value, using default 20000")
-		return 20000
+local function calculateStartingManpower(stats, globalMins, globalMaxes, weights)
+	-- Normalization: Scales values to a 0.0 - 1.0 range
+	local function normalize(value, minVal, maxVal)
+		if maxVal <= minVal then return 0.5 end 
+		return math.clamp((value - minVal) / (maxVal - minVal), 0, 1)
 	end
 
-	local minMP, maxMP
+	local normPop = normalize(stats.population, globalMins.population, globalMaxes.population)
+	local normTiles = normalize(stats.tileCount, globalMins.tileCount, globalMaxes.tileCount)
+	local normArea = normalize(stats.totalArea, globalMins.totalArea, globalMaxes.totalArea)
 
-	if population < globalAvgPopulation * 0.7 then
-		-- Small population tier
-		minMP, maxMP = 10000, 30000
-	elseif population > globalAvgPopulation * 1.3 then
-		-- Large population tier
-		minMP, maxMP = 60000, 90000
-	else
-		-- Medium population tier
-		minMP, maxMP = 30000, 60000
-	end
+	-- Weighted score determines where the country sits on the 5k - 90k spectrum
+	local finalScore = (normPop * weights.population) + 
+					   (normTiles * weights.tileCount) + 
+					   (normArea * weights.totalArea)
 
-	-- Normalize within the tier based on overall population range
-	local normalizedScore = 0.5
-	if maxPopulation > minPopulation then
-		normalizedScore = (population - minPopulation) / (maxPopulation - minPopulation)
-	end
+	local MIN_MANPOWER = 5000
+	local MAX_MANPOWER = 90000
 
-	normalizedScore = math.clamp(normalizedScore, 0, 1)
-	local manpower = math.floor(minMP + (maxMP - minMP) * normalizedScore)
-
-	return manpower
+	return math.floor(MIN_MANPOWER + ((MAX_MANPOWER - MIN_MANPOWER) * finalScore))
 end
 
 local function calculateAllStartingManpower()
 	local startingManpower = {}
-	local populations = {}
-
-	local totalPopulation = 0
+	local finalStats = {}
+	
+	-- Pull physical stats already calculated by TileManager
+	local physicalStats = TileManager.getAllCountryTileStats()
+	
+	local globalMins = { population = math.huge, tileCount = math.huge, totalArea = math.huge }
+	local globalMaxes = { population = 0, tileCount = 0, totalArea = 0 }
 	local countryCount = 0
-	local minPopulation = math.huge
-	local maxPopulation = 0
 
-	-- Read Population IntValue from each country model
-	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
-		if countryModel:IsA("Model") then
+	-- 1. Combine Physical Stats with Population Data
+	for countryName, stats in pairs(physicalStats) do
+		local countryModel = EUROPE_MAP:FindFirstChild(countryName)
+		if countryModel then
 			local popValue = countryModel:FindFirstChild("Population")
-			local population = popValue and popValue.Value or 0
+			local population = popValue and popValue.Value or 20000 -- Fallback population
 
-			if population <= 0 then
-				warn("[CountryManager] " .. countryModel.Name .. " has no Population value, using default 20000")
-				populations[countryModel.Name] = nil
-			else
-				populations[countryModel.Name] = population
-				totalPopulation = totalPopulation + population
-				countryCount = countryCount + 1
-				minPopulation = math.min(minPopulation, population)
-				maxPopulation = math.max(maxPopulation, population)
-			end
+			finalStats[countryName] = {
+				population = population,
+				tileCount = stats.tileCount,
+				totalArea = stats.totalArea
+			}
+
+			-- Update Global Extremes for normalization
+			globalMins.population = math.min(globalMins.population, population)
+			globalMaxes.population = math.max(globalMaxes.population, population)
+			globalMins.tileCount = math.min(globalMins.tileCount, stats.tileCount)
+			globalMaxes.tileCount = math.max(globalMaxes.tileCount, stats.tileCount)
+			globalMins.totalArea = math.min(globalMins.totalArea, stats.totalArea)
+			globalMaxes.totalArea = math.max(globalMaxes.totalArea, stats.totalArea)
+			
+			countryCount = countryCount + 1
 		end
 	end
 
 	if countryCount == 0 then
-		warn("[CountryManager] No countries with Population values found for manpower calculation!")
+		warn("[CountryManager] No stats found in TileManager! Manpower defaulted.")
 		return startingManpower
 	end
 
-	local globalAvgPopulation = totalPopulation / countryCount
+	-- 2. Define Weights (Tuned to slightly favor land area)
+	local weights = {
+		totalArea = 0.40,  -- 40% weight on physical landmass (Primary)
+		population = 0.45, -- 45% weight on population (Close secondary)
+		tileCount = 0.15   -- 15% weight on administrative density (Modifier)
+	}
 
-	for countryName, population in pairs(populations) do
-		local manpower = calculateStartingManpower(
-			population,
-			globalAvgPopulation,
-			minPopulation,
-			maxPopulation
-		)
+	-- 3. Run final calculations
+	for countryName, stats in pairs(finalStats) do
+		local manpower = calculateStartingManpower(stats, globalMins, globalMaxes, weights)
 		startingManpower[countryName] = manpower
-		print(string.format("[CountryManager] %s: population=%d, manpower=%d", countryName, population, manpower))
+		print(string.format("[CountryManager] %s Manpower: %d (Pop: %d, Tiles: %d, Area: %.0f)", 
+			countryName, manpower, stats.population, stats.tileCount, stats.totalArea))
 	end
 
 	return startingManpower
@@ -226,9 +228,15 @@ local function releasePlayerCountries(player, reason)
 end
 
 local function hasAnyOwnedCountries()
-	for _, ownerValue in pairs(CountryOwners) do
+	for countryName, ownerValue in pairs(CountryOwners) do
 		if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") then
 			return true
+		end
+		if type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
+			local resolved = ServerState.resolveCountryOwner(countryName)
+			if resolved and typeof(resolved) == "Instance" and resolved:IsA("Player") and resolved.Parent then
+				return true
+			end
 		end
 	end
 	return false
@@ -246,18 +254,34 @@ local function startCoinIncomeLoop()
 		local now = os.clock()
 
 		for countryName, ownerValue in pairs(CountryOwners) do
-			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") and ownerValue.Parent then
-				local claimTime = playerClaimTime[ownerValue]
-				if claimTime and (now - claimTime) < COIN_INTERVAL then
-					continue
-				end
+			local resolvedOwner
+			local isDirectlyOwned = false
 
-				local leaderstats = ownerValue:FindFirstChild("leaderstats")
-				local coins = leaderstats and leaderstats:FindFirstChild("Coins")
+			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") then
+				resolvedOwner = ownerValue
+				isDirectlyOwned = true
+			elseif type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
+				resolvedOwner = ServerState.resolveCountryOwner(countryName)
+			end
 
-				if coins then
-					local newAmount = math.floor(coins.Value) + BASE_COIN_INCOME
-					coins.Value = newAmount
+			if not resolvedOwner or typeof(resolvedOwner) ~= "Instance"
+				or not resolvedOwner:IsA("Player") or not resolvedOwner.Parent then
+				continue
+			end
+
+			local claimTime = playerClaimTime[resolvedOwner]
+			if claimTime and (now - claimTime) < COIN_INTERVAL then
+				continue
+			end
+
+			local leaderstats = resolvedOwner:FindFirstChild("leaderstats")
+			local coins = leaderstats and leaderstats:FindFirstChild("Coins")
+
+			if coins then
+				local newAmount = math.floor(coins.Value) + BASE_COIN_INCOME
+				coins.Value = newAmount
+				-- Only mirror to country treasury for directly-owned countries
+				if isDirectlyOwned then
 					ServerState.setCountryCoins(countryName, newAmount)
 				end
 			end
@@ -279,18 +303,34 @@ local function startManpowerIncomeLoop()
 		local now = os.clock()
 
 		for countryName, ownerValue in pairs(CountryOwners) do
-			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") and ownerValue.Parent then
-				local claimTime = playerClaimTime[ownerValue]
-				if claimTime and (now - claimTime) < MANPOWER_INTERVAL then
-					continue
-				end
+			local resolvedOwner
+			local isDirectlyOwned = false
 
-				local leaderstats = ownerValue:FindFirstChild("leaderstats")
-				local manpower = leaderstats and leaderstats:FindFirstChild("Manpower")
+			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") then
+				resolvedOwner = ownerValue
+				isDirectlyOwned = true
+			elseif type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
+				resolvedOwner = ServerState.resolveCountryOwner(countryName)
+			end
 
-				if manpower then
-					local newAmount = math.floor(manpower.Value) + BASE_MANPOWER_INCOME
-					manpower.Value = newAmount
+			if not resolvedOwner or typeof(resolvedOwner) ~= "Instance"
+				or not resolvedOwner:IsA("Player") or not resolvedOwner.Parent then
+				continue
+			end
+
+			local claimTime = playerClaimTime[resolvedOwner]
+			if claimTime and (now - claimTime) < MANPOWER_INTERVAL then
+				continue
+			end
+
+			local leaderstats = resolvedOwner:FindFirstChild("leaderstats")
+			local manpower = leaderstats and leaderstats:FindFirstChild("Manpower")
+
+			if manpower then
+				local newAmount = math.floor(manpower.Value) + BASE_MANPOWER_INCOME
+				manpower.Value = newAmount
+				-- Only mirror to country treasury for directly-owned countries
+				if isDirectlyOwned then
 					ServerState.setCountryManpower(countryName, newAmount)
 				end
 			end
@@ -444,6 +484,59 @@ local function handleCountrySelection(player, countryName)
 	end
 end
 
+local function spawnStarterNPCs()
+	-- Collect all starting manpower values to compute the median
+	local allManpowers = {}
+	local countryManpowerMap = {}
+	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
+		if not countryModel:IsA("Model") then continue end
+		local countryName = countryModel.Name
+		local manpower = ServerState.getCountryManpower(countryName) or 0
+		table.insert(allManpowers, manpower)
+		countryManpowerMap[countryName] = manpower
+	end
+
+	-- Compute 37.5th percentile manpower (~62.5% get DefenderNPC, ~37.5% get AttackerNPC)
+	table.sort(allManpowers)
+	local n = #allManpowers
+	local attackerThreshold
+	if n == 0 then
+		attackerThreshold = 30000 -- fallback if no countries found
+	else
+		-- +1 corrects for >= boundary: country AT the index also gets DefenderNPC
+		local pIndex = math.max(1, math.floor(n * 0.375) + 1)
+		attackerThreshold = allManpowers[pIndex]
+	end
+	print("[CountryManager] Starter NPC attacker threshold (37.5th percentile): " .. attackerThreshold)
+
+	-- Spawn one starter NPC at each country's capital
+	-- Countries at or above the 37.5th percentile get a DefenderNPC; below get an AttackerNPC
+	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
+		if not countryModel:IsA("Model") then continue end
+		local countryName = countryModel.Name
+
+		local capitalPart = TileManager.getCountryCapital(countryName)
+		if not capitalPart then
+			warn("[CountryManager] No capital found for " .. countryName .. ", skipping starter NPC")
+			continue
+		end
+
+		local manpower = countryManpowerMap[countryName] or 0
+		local npcType = (manpower >= attackerThreshold) and "DefenderNPC" or "AttackerNPC"
+
+		local spawnPos = capitalPart.Position + Vector3.new(0, capitalPart.Size.Y / 2 + 3, 0)
+		local tileKey = TileManager.getTileKeyFromPart(capitalPart)
+
+		if not tileKey then
+			warn("[CountryManager] Could not get tile key for capital of " .. countryName .. ", skipping starter NPC")
+			continue
+		end
+
+		NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, nil) -- nil = country-owned
+		print("[CountryManager] Spawned starter " .. npcType .. " for " .. countryName .. " (manpower: " .. manpower .. ")")
+	end
+end
+
 local function initializeCountries()
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if countryModel:IsA("Model") then
@@ -461,6 +554,9 @@ local function initializeCountries()
 	end
 
 	isInitialized = true
+
+	-- Spawn one starter NPC at each country's capital
+	task.defer(spawnStarterNPCs)
 end
 
 ---------------------------------------------------

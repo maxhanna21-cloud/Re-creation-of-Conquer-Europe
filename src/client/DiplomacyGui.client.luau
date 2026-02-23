@@ -23,6 +23,7 @@ local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 30)
 local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 30)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
 local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent", 10)
+local BreakAllianceEvent = ReplicatedStorage:WaitForChild("BreakAllianceEvent", 10)
 
 if not DiplomacyRequest then
 	warn("[DiplomacyGui] DiplomacyRequest RemoteEvent not found!")
@@ -42,6 +43,7 @@ local popup = gui:WaitForChild("RequestPopup", 10)
 local declareWarBtn = warPanel:WaitForChild("DeclareWar", 10)
 local allianceBtn = warPanel:WaitForChild("FormAlliance", 10)
 local peaceBtn = warPanel:WaitForChild("SignPeace", 10)
+local breakAllianceBtn = warPanel:WaitForChild("BreakAlliance", 10)
 
 -- Popup Elements
 local messageLabel = popup:WaitForChild("Message", 10)
@@ -51,15 +53,22 @@ local declineBtn = popup:WaitForChild("ButtonContainer", 10).DeclineButton
 -- STATE VARIABLE (Prevents multiple clicks stacking up)
 local currentConnection = nil
 
--- FIX: Improved helper to find country model from any part inside EuropeMap
+-- FIX: Returns the effective owner of a tile.
+-- OwnerCountry is set on BOTH capture and annexation (server-side).
+-- BasePart attributes replicate to clients automatically.
 local function getCountryFromPart(part)
 	if not part or not part:IsA("BasePart") then return nil end
 
-	-- Walk up the hierarchy to find the country model
+	-- Check OwnerCountry attribute first (set on captured/annexed tiles)
+	local ownerAttr = part:GetAttribute("OwnerCountry")
+	if ownerAttr and ownerAttr ~= "" then
+		return ownerAttr
+	end
+
+	-- Fallback: walk hierarchy (tile was never captured/annexed)
 	local current = part.Parent
 	while current and current ~= EuropeMap and current ~= Workspace do
 		if current.Parent == EuropeMap then
-			-- Found the country model (direct child of EuropeMap)
 			return current.Name
 		end
 		current = current.Parent
@@ -91,6 +100,10 @@ local function startMapSelection(actionType, specificEvent)
 			elseif actionType == "PEACE" then
 				specificEvent:FireServer(targetCountry, "Peace")
 				print("Sent Peace Offer: " .. targetCountry)
+
+			elseif actionType == "BREAKALLIANCE" then
+				specificEvent:FireServer(targetCountry)
+				print("Sent Break Alliance: " .. targetCountry)
 			end
 
 			-- Stop listening after one click
@@ -116,6 +129,10 @@ end)
 
 peaceBtn.MouseButton1Click:Connect(function()
 	startMapSelection("PEACE", SendRequestEvent)
+end)
+
+breakAllianceBtn.MouseButton1Click:Connect(function()
+	startMapSelection("BREAKALLIANCE", BreakAllianceEvent)
 end)
 
 ---------------------------------------------------------

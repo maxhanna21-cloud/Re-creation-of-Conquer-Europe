@@ -135,7 +135,6 @@ local function handleSecondClick(player, targetModel)
 	end
 
 	local attackerOwner = Combat.getOwner(attackerModel)
-	local targetOwner = Combat.getOwner(targetModel)
 
 	-- Only require attacker to have an owner
 	if not attackerOwner then
@@ -146,15 +145,15 @@ local function handleSecondClick(player, targetModel)
 	local attackerRole = Combat.getRole(attackerModel)
 	local targetRole = Combat.getRole(targetModel)
 
-	-- Use DiplomacyManager.canAttack() for proper validation
-	if not DiplomacyManager.canAttack(attackerOwner, targetOwner) then
-		-- Determine reason for better feedback
-		if targetOwner and targetOwner == attackerOwner then
+	-- Use country-based attack validation so country-owned (nil-owner) NPCs are handled correctly
+	if not DiplomacyManager.canNPCAttack(attackerModel, targetModel) then
+		-- Determine reason for better feedback using country attributes
+		local attackerCountry = attackerModel:GetAttribute("Country")
+		local targetCountry = targetModel:GetAttribute("Country")
+		if attackerCountry == targetCountry then
 			print("Cannot attack: " .. targetModel.Name .. " is owned by you")
-		elseif targetOwner and DiplomacyManager.areAllied(attackerOwner, targetOwner) then
+		elseif DiplomacyManager.areCountriesAllied(attackerCountry, targetCountry) then
 			print("Cannot attack: " .. targetModel.Name .. " belongs to an allied country")
-		elseif not targetOwner then
-			print("Cannot attack: " .. targetModel.Name .. " belongs to an unowned country (no war declared)")
 		else
 			print("Cannot attack: You are not at war with " .. targetModel.Name .. "'s country")
 		end
@@ -274,6 +273,15 @@ local function handleTileClick(player, tilePart)
 		return
 	end
 
+	-- Secondary validation: confirm a walkable crossing proof exists for this pair.
+	-- areTilesAdjacent() is a lookup-only check; the proof confirms a real walkable border.
+	local proof = TileAdjacencyManager.getAdjacencyProof(currentTilePart, tilePart)
+	if not proof then
+		print("[Movement] BLOCKED: No walkable crossing proof for " .. currentTilePart.Name .. " -> " .. tilePart.Name .. " (adjacency table false positive?)")
+		clearSelection(player)
+		return
+	end
+
 	-- Check if NPC is moving (cancel current movement for new order)
 	if NPCMovementSystem.isMoving(npcModel) then
 		NPCMovementSystem.cancelMovement(npcModel)
@@ -324,6 +332,11 @@ local function connectNPC(npcModel)
 	local clickConnection = clickDetector.MouseClick:Connect(function(player)
 		local npc = getNPCModel(head)
 		if not npc then return end
+
+		-- Ignore dead/dying NPCs (cleanup sets Dead=true and destroys ClickDetector,
+		-- but guard here as a belt-and-suspenders safety check)
+		local hum = npc:FindFirstChildOfClass("Humanoid")
+		if not hum or hum.Health <= 0 or npc:GetAttribute("Dead") then return end
 
 		-- Check if clicking your currently selected NPC (deselect)
 		if selectedNPC[player] == npc then

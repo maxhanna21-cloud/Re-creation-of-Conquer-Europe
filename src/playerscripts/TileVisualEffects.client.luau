@@ -52,7 +52,9 @@ local function getFirstBasePartColor(countryModel)
 	return nil
 end
 
--- Initialize country colors and attach lightweight listeners for new parts
+-- Initialize country colors once at startup from the map's original tile colors.
+-- CountryColors is intentionally immutable after this point — updating it from live
+-- tile colors during gameplay would corrupt lookups once tiles are captured/repainted.
 local function scanCountryColors()
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if countryModel:IsA("Model") then
@@ -61,14 +63,6 @@ local function scanCountryColors()
 			if color then
 				CountryColors[countryName] = color
 			end
-
-			-- If parts are added later (map streaming or dynamic changes), update cache
-			countryModel.ChildAdded:Connect(function(child)
-				-- If it's a BasePart, assume it represents the country's color (cheap heuristic)
-				if child and child:IsA("BasePart") then
-					CountryColors[countryName] = child.Color
-				end
-			end)
 		end
 	end
 end
@@ -83,17 +77,10 @@ local function onTileCaptured(tilePart, playerName, countryName)
 		return
 	end
 
-	-- Resolve target color from cache (or fallback to scanning the country model)
+	-- Resolve target color from the startup cache.
+	-- Do NOT read live tile colors here — tiles may already be repainted by the server,
+	-- and sampling them would corrupt the cache with occupying-country colors.
 	local targetColor = CountryColors[countryName]
-	if not targetColor then
-		local countryModel = EUROPE_MAP:FindFirstChild(countryName)
-		if countryModel then
-			targetColor = getFirstBasePartColor(countryModel)
-			if targetColor then
-				CountryColors[countryName] = targetColor
-			end
-		end
-	end
 
 	if not targetColor then
 		-- Nothing we can do visually if we don't have a color

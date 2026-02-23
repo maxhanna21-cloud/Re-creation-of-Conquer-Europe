@@ -1,6 +1,12 @@
--- ServerState (ModuleScript in ServerScriptService) - UPDATED v2
+-- ServerState (ModuleScript in ServerScriptService) - UPDATED v3
 -- Centralized registry for shared server data
 -- Now includes CountryCoins, CountryManpower, AND OccupiedTerritories
+
+-- Module-level service references (evaluated once at require time, zero per-call overhead)
+local RunService = game:GetService("RunService")
+
+-- Rate-limit tracker for resolveTarget unknown-value warnings (one warn per unique pair)
+local _warnedUnknown = {}
 
 local ServerState = {
 	CountryOwners = {},
@@ -19,6 +25,9 @@ function ServerState.setCountryOwners(ownersTable)
 end
 
 function ServerState.getCountryOwners()
+	-- CONTRACT: returns the actual CountryOwners table by reference (not a copy).
+	-- All callers read the same live table. Do NOT change this to return a copy —
+	-- doing so would let resolveTarget() and other callers silently diverge.
 	return ServerState.CountryOwners
 end
 
@@ -58,6 +67,71 @@ function ServerState.resolveCountryOwner(countryName)
 		-- Follow the chain to the conquering country
 		countryName = conquerorCountry
 	end
+end
+
+-- SERVER-ONLY: Resolve a country name through "Conquered_X" chains, returning
+-- BOTH the canonical controlling country name AND the controlling Player (or nil).
+--
+-- Allowed CountryOwners values: Player instance | "Unowned" | "Conquered_X"
+-- Unknown string values are warned once and returned as (countryName, nil) so
+-- callers can still show a meaningful error instead of an opaque nil failure.
+--
+-- Returns: (canonicalCountryName: string, controllingPlayer: Player|nil)
+--          (nil, nil) only on cycle detection or invalid input.
+function ServerState.resolveTarget(countryName)
+	-- Server-only guard (module-level RunService, zero per-call overhead)
+	if RunService:IsClient() then
+		error("[ServerState.resolveTarget] This function is server-only and must not be called on the client.")
+	end
+
+	-- Input validation
+	if type(countryName) ~= "string" or countryName == "" then
+		warn("[ServerState.resolveTarget] Invalid countryName: " .. tostring(countryName))
+		return nil, nil
+	end
+
+	local owners = ServerState.getCountryOwners()  -- stable backing table by reference
+	local seen = {}
+
+	while true do
+		-- Cycle guard on the CURRENT node (before following any link)
+		if seen[countryName] then
+			warn(("[ServerState.resolveTarget] Cycle detected at: %s"):format(countryName))
+			return nil, nil
+		end
+		seen[countryName] = true
+
+		local owner = owners[countryName]
+
+		if typeof(owner) == "Instance" and owner:IsA("Player") then
+			return countryName, owner        -- player-owned: both values known
+		end
+		if type(owner) ~= "string" then
+			return countryName, nil          -- nil or unknown type: name resolved, no player
+		end
+		if owner == "Unowned" then
+			return countryName, nil          -- unowned country
+		end
+
+		local conqueror = owner:match("^Conquered_(.+)$")
+		if not conqueror then
+			-- Unknown string — warn once per (countryName, owner) pair to avoid log spam
+			local warnKey = countryName .. "|" .. owner
+			if not _warnedUnknown[warnKey] then
+				_warnedUnknown[warnKey] = true
+				warn(("[ServerState.resolveTarget] Unknown owner value for '%s': '%s'")
+					:format(countryName, owner))
+			end
+			return countryName, nil
+		end
+
+		countryName = conqueror  -- follow the chain
+	end
+end
+
+function ServerState.isCountryUnowned(countryName)
+	local owners = ServerState.getCountryOwners()
+	return owners[countryName] == "Unowned"
 end
 
 ---------------------------------------------------

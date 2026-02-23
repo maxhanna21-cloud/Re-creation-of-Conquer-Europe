@@ -38,7 +38,11 @@ local MAX_RASTER_ADJACENCY_DISTANCE = 12  -- studs (prevents false adjacencies o
 
 -- Extended adjacency configuration (fixes gaps and validates diagonals)
 -- INCREASED from 1.5 to 4 studs to allow more gap-bridging adjacencies
-local EXTENDED_ADJACENCY_THRESHOLD = 4  -- max edge-to-edge distance (studs) to consider adjacent
+local EXTENDED_ADJACENCY_THRESHOLD = 4  -- max edge-to-edge distance (studs) to consider adjacent (was 5; tightened to eliminate cross-sea false positives)
+-- NARROW STRAIT RULE: Tiles within this distance are treated as traversable even across water.
+-- This supports narrow-strait crossings (e.g., Calabria→Sicily, Øresund).
+-- If narrow-strait crossings break, check this value and the isPathWalkable fast-path.
+local narrowStraitFastPathCount = 0  -- Tracks adjacencies accepted via ≤4 stud fast-path
 -- local VALIDATE_EXTENDED_ONLY = true     -- FIX v9.2: Only validate EXTENDED adjacencies, trust rasterization
 local DEBUG_EXTENDED_ADJACENCY = false  -- enable to see which pairs get extended adjacency
 local DEBUG_REJECTED_ADJACENCY = true   -- FIX v9.3: Debug which adjacencies are rejected (enabled for testing)
@@ -46,15 +50,19 @@ local DEBUG_REJECTED_ADJACENCY = true   -- FIX v9.3: Debug which adjacencies are
 -- FIX v12: AABB-based adjacency rescue for tiles with short shared borders
 -- Catches tiles that touch geometrically but were missed by rasterization
 -- INCREASED from 6 to 12 studs to match MAX_RASTER_ADJACENCY_DISTANCE
-local AABB_ADJACENCY_RESCUE_THRESHOLD = 12  -- studs, matches MAX_RASTER_ADJACENCY_DISTANCE
+local AABB_ADJACENCY_RESCUE_THRESHOLD = 8  -- studs (was 12; tightened to eliminate distant false positives like DK-SE cross-sea)
 
 -- FIX v9.3: Stricter water detection thresholds
 local GROUND_RATIO_THRESHOLD = 0.85     -- Require 85% ground coverage (up from 60%)
 local MAX_CONSECUTIVE_MISSES = 1        -- If 2+ consecutive points miss ground, it's a water gap
 
+-- Top-k walkable border crossing: number of candidate boundary pairs to try before giving up
+local DEFAULT_CANDIDATE_K = 5
+
 -- Data structures
 local TileParts = {}       -- TileParts[countryName] = { BasePart, ... }
 local AdjacentTiles = {}   -- AdjacentTiles[tile] = { neighborPart, ... }
+local AdjacencyProof = {}  -- AdjacencyProof[tile][neighbor] = { mode: "raster"|"aabb", pointA: Vector3, pointB: Vector3, distance: number }
 local PositionToTile = {}  -- PositionToTile["x,z"] = BasePart
 local AllTilesList = {}    -- flat array of all tile parts
 
@@ -301,84 +309,307 @@ local function findClosestEdgePoints(tileA, tileB)
 	return pointA, pointB, rawCellDist
 end
 
--- FIX v9.3: Stricter walkability check for EXTENDED adjacencies
--- FIX v9.4: Allow close tiles (within EXTENDED_ADJACENCY_THRESHOLD) to traverse water
--- FIX v12: Added aabbOverride parameter for AABB rescue path
--- Now uses:
---   1. Higher ground ratio (85% instead of 60%)
---   2. Consecutive gap detection (2+ misses = water crossing)
---   3. Explicit midpoint check
---   4. EXCEPTION: Tiles within 3 studs are always walkable (NPCs can jump small gaps)
---   5. AABB override: when called from AABB rescue, use AABB edge points if raster fails
-local function isPathWalkable(tileA, tileB, aabbOverride)
-	-- Find the closest points between the two tiles
-	local closestA, closestB, edgeDist = findClosestEdgePoints(tileA, tileB)
+---------------------------------------------------
+-- Top-k candidate edge points (max-heap)
+---------------------------------------------------
 
-	-- FIX v9.4: If tiles are close enough (within extended adjacency threshold),
-	-- allow traversal even over water - NPCs can walk/jump small gaps
-	if edgeDist <= EXTENDED_ADJACENCY_THRESHOLD then
-		if DEBUG_EXTENDED_ADJACENCY then
-			print(string.format("[TileAdjacencyManager] Allowed close adjacency: %s <-> %s (%.1f studs, within threshold)",
-				tileA.Name, tileB.Name, edgeDist))
+-- Max-heap helpers (keyed on .distSq, index-1 based)
+local function heapSiftDown(heap, size, i)
+	while true do
+		local largest = i
+		local left = 2 * i
+		local right = 2 * i + 1
+		if left <= size and heap[left].distSq > heap[largest].distSq then
+			largest = left
 		end
-		return true
+		if right <= size and heap[right].distSq > heap[largest].distSq then
+			largest = right
+		end
+		if largest == i then break end
+		heap[i], heap[largest] = heap[largest], heap[i]
+		i = largest
+	end
+end
+
+local function heapSiftUp(heap, i)
+	while i > 1 do
+		local parent = math.floor(i / 2)
+		if heap[i].distSq > heap[parent].distSq then
+			heap[i], heap[parent] = heap[parent], heap[i]
+			i = parent
+		else
+			break
+		end
+	end
+end
+
+local function heapInsert(heap, size, k, entry)
+	if size < k then
+		size = size + 1
+		heap[size] = entry
+		heapSiftUp(heap, size)
+		return size
+	elseif entry.distSq < heap[1].distSq then
+		heap[1] = entry
+		heapSiftDown(heap, size, 1)
+	end
+	return size
+end
+
+-- AABB variant: top-k closest edge point candidates from bounding box sampling
+-- Defined first so _findCandidateEdgePoints can reference it as a fallback
+local function _findCandidateEdgePointsBBox(tileA, tileB, k)
+	k = k or DEFAULT_CANDIDATE_K
+	local cfA = tileA.CFrame
+	local cfB = tileB.CFrame
+	local halfA = tileA.Size / 2
+	local halfB = tileB.Size / 2
+
+	-- Build edge samples (same logic as findClosestEdgePointsBBox)
+	local edgeSamplesA = {}
+	local edgeSamplesB = {}
+	local numSamples = 16
+
+	for i = 0, numSamples do
+		local t = i / numSamples
+		table.insert(edgeSamplesA, cfA:PointToWorldSpace(Vector3.new(-halfA.X + t * 2 * halfA.X, halfA.Y, -halfA.Z)))
+		table.insert(edgeSamplesA, cfA:PointToWorldSpace(Vector3.new(-halfA.X + t * 2 * halfA.X, halfA.Y, halfA.Z)))
+		table.insert(edgeSamplesA, cfA:PointToWorldSpace(Vector3.new(-halfA.X, halfA.Y, -halfA.Z + t * 2 * halfA.Z)))
+		table.insert(edgeSamplesA, cfA:PointToWorldSpace(Vector3.new(halfA.X, halfA.Y, -halfA.Z + t * 2 * halfA.Z)))
+
+		table.insert(edgeSamplesB, cfB:PointToWorldSpace(Vector3.new(-halfB.X + t * 2 * halfB.X, halfB.Y, -halfB.Z)))
+		table.insert(edgeSamplesB, cfB:PointToWorldSpace(Vector3.new(-halfB.X + t * 2 * halfB.X, halfB.Y, halfB.Z)))
+		table.insert(edgeSamplesB, cfB:PointToWorldSpace(Vector3.new(-halfB.X, halfB.Y, -halfB.Z + t * 2 * halfB.Z)))
+		table.insert(edgeSamplesB, cfB:PointToWorldSpace(Vector3.new(halfB.X, halfB.Y, -halfB.Z + t * 2 * halfB.Z)))
 	end
 
-	-- FIX v12.2: For AABB rescue path, if raster edge distance exceeds the walkability bypass
-	-- threshold, fall back to AABB edge points for raycasting. Raster boundary cell centers can
-	-- be far apart (crossing water) even when tiles physically touch (AABB overlap).
-	-- Previously this only triggered at edgeDist > 6, missing cases like 4.47 studs where
-	-- raster points cross water but AABB distance is 0 (tiles overlap).
-	if aabbOverride and edgeDist > EXTENDED_ADJACENCY_THRESHOLD then
-		local rasterDist = edgeDist
-		local bboxA, bboxB, bboxDist = findClosestEdgePointsBBox(tileA, tileB)
-		if bboxDist <= EXTENDED_ADJACENCY_THRESHOLD then
-			-- AABB says tiles are close enough to bypass walkability entirely
+	-- Build top-k max-heap of closest pairs
+	local heap = {}
+	local heapSize = 0
+
+	for _, pA in ipairs(edgeSamplesA) do
+		for _, pB in ipairs(edgeSamplesB) do
+			local dx = pA.X - pB.X
+			local dz = pA.Z - pB.Z
+			local distSq = dx * dx + dz * dz
+			heapSize = heapInsert(heap, heapSize, k, {
+				distSq = distSq,
+				pointA = pA,
+				pointB = pB,
+			})
+		end
+	end
+
+	if heapSize == 0 then return {} end
+
+	-- Extract and sort ascending by distance
+	local candidates = {}
+	for i = 1, heapSize do
+		local entry = heap[i]
+		table.insert(candidates, {
+			pointA = entry.pointA,
+			pointB = entry.pointB,
+			distance = math.sqrt(entry.distSq),
+		})
+	end
+
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance
+	end)
+
+	return candidates
+end
+
+-- Returns top-k closest boundary-pair candidates using raster footprints
+-- Each candidate: {pointA: Vector3, pointB: Vector3, distance: number}
+-- Sorted ascending by distance
+local function _findCandidateEdgePoints(tileA, tileB, k)
+	k = k or DEFAULT_CANDIDATE_K
+	local footprintA = TileFootprint[tileA]
+	local footprintB = TileFootprint[tileB]
+
+	-- Fallback to AABB variant if footprints not available
+	if not footprintA or not footprintB then
+		return _findCandidateEdgePointsBBox(tileA, tileB, k)
+	end
+
+	-- Reuse boundary cell extraction logic from findClosestEdgePoints
+	local boundaryOffsets = {
+		{1, 0}, {-1, 0}, {0, 1}, {0, -1},
+		{1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+	}
+	local function getBoundaryCells(footprint)
+		local cells = {}
+		for cKey, _ in pairs(footprint) do
+			local cx, cz = parseCellKey(cKey)
+			if cx and cz then
+				local isBoundary = false
+				for _, offset in ipairs(boundaryOffsets) do
+					local nKey = cellKey(cx + offset[1], cz + offset[2])
+					if not footprint[nKey] then
+						isBoundary = true
+						break
+					end
+				end
+				if isBoundary then
+					local half = RASTER_CELL_SIZE * 0.5
+					local wx = (cx * RASTER_CELL_SIZE) + half
+					local wz = (cz * RASTER_CELL_SIZE) + half
+					table.insert(cells, {x = wx, z = wz, cx = cx, cz = cz})
+				end
+			end
+		end
+		if #cells == 0 then
+			for cKey, _ in pairs(footprint) do
+				local cx, cz = parseCellKey(cKey)
+				if cx and cz then
+					local half = RASTER_CELL_SIZE * 0.5
+					local wx = (cx * RASTER_CELL_SIZE) + half
+					local wz = (cz * RASTER_CELL_SIZE) + half
+					table.insert(cells, {x = wx, z = wz, cx = cx, cz = cz})
+				end
+			end
+		end
+		return cells
+	end
+
+	local boundaryCellsA = getBoundaryCells(footprintA)
+	local boundaryCellsB = getBoundaryCells(footprintB)
+
+	if #boundaryCellsA == 0 or #boundaryCellsB == 0 then
+		return _findCandidateEdgePointsBBox(tileA, tileB, k)
+	end
+
+	-- Build top-k max-heap of closest pairs
+	local heap = {}
+	local heapSize = 0
+
+	for _, cellA in ipairs(boundaryCellsA) do
+		for _, cellB in ipairs(boundaryCellsB) do
+			local dx = cellA.x - cellB.x
+			local dz = cellA.z - cellB.z
+			local distSq = dx * dx + dz * dz
+			heapSize = heapInsert(heap, heapSize, k, {
+				distSq = distSq,
+				cellA = cellA,
+				cellB = cellB,
+			})
+		end
+	end
+
+	if heapSize == 0 then
+		return _findCandidateEdgePointsBBox(tileA, tileB, k)
+	end
+
+	-- FIX v15: Check for overlapping boundary cells on distant tiles
+	local minDistSq = math.huge
+	for i = 1, heapSize do
+		if heap[i].distSq < minDistSq then
+			minDistSq = heap[i].distSq
+		end
+	end
+	local rawMinDist = math.sqrt(minDistSq)
+	local tileDelta = tileB.Position - tileA.Position
+	local actualTileDistance = math.sqrt(tileDelta.X * tileDelta.X + tileDelta.Z * tileDelta.Z)
+
+	if rawMinDist < 0.5 and actualTileDistance > 10 then
+		if DEBUG_EXTENDED_ADJACENCY then
+			warn(string.format("[TileAdjacencyManager] Candidate boundary cell overlap for distant tiles %s <-> %s (tile dist: %.1f, cell dist: %.1f), using AABB fallback",
+				tileA.Name, tileB.Name, actualTileDistance, rawMinDist))
+		end
+		return _findCandidateEdgePointsBBox(tileA, tileB, k)
+	end
+
+	-- Extract from heap and sort ascending by distance
+	local candidates = {}
+	for i = 1, heapSize do
+		local entry = heap[i]
+		local dist = math.sqrt(entry.distSq)
+		local ptA = Vector3.new(entry.cellA.x, tileA.Position.Y + tileA.Size.Y / 2, entry.cellA.z)
+		local ptB = Vector3.new(entry.cellB.x, tileB.Position.Y + tileB.Size.Y / 2, entry.cellB.z)
+		table.insert(candidates, { pointA = ptA, pointB = ptB, distance = dist })
+	end
+
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance
+	end)
+
+	return candidates
+end
+
+-- Unified edge point helpers: returns (pointA, pointB, distance) atomically
+-- Ensures distance and points are always computed by the same function
+local function getRasterEdge(tileA, tileB)
+	local pointA, pointB, dist = findClosestEdgePoints(tileA, tileB)
+	return pointA, pointB, dist
+end
+
+local function getAABBEdge(tileA, tileB)
+	local dist = calculateEdgeDistance(tileA, tileB)
+	local pointA, pointB = findClosestEdgePointsBBox(tileA, tileB)
+	return pointA, pointB, dist
+end
+
+-- FIX v18.1: Added MAX_STEP_HEIGHT to strictly prevent cliffs from passing as walkable
+local function isPathWalkable(tileA, tileB, opts)
+	opts = opts or {}
+	local mode = opts.mode or "raster"
+	local closestA, closestB, edgeDist
+
+	-- Determine edge points based on opts
+	if opts.pointA and opts.pointB then
+		closestA, closestB = opts.pointA, opts.pointB
+		edgeDist = opts.distance or math.sqrt((opts.pointA.X - opts.pointB.X)^2 + (opts.pointA.Z - opts.pointB.Z)^2)
+	elseif mode == "raster" then
+		closestA, closestB, edgeDist = getRasterEdge(tileA, tileB)
+	elseif mode == "aabb" then
+		closestA, closestB, edgeDist = getAABBEdge(tileA, tileB)
+	else
+		error("Invalid mode: " .. tostring(mode))
+	end
+
+	-- NARROW STRAIT RULE
+	if edgeDist <= EXTENDED_ADJACENCY_THRESHOLD then
+		local _, _, rasterDist = getRasterEdge(tileA, tileB)
+		if rasterDist <= EXTENDED_ADJACENCY_THRESHOLD then
+			narrowStraitFastPathCount = narrowStraitFastPathCount + 1
 			if DEBUG_EXTENDED_ADJACENCY then
-				print(string.format("[TileAdjacencyManager] AABB override bypass: %s <-> %s (bbox: %.1f <= threshold, raster was: %.1f)",
-					tileA.Name, tileB.Name, bboxDist, rasterDist))
+				print(string.format("[TileAdjacencyManager] Walkable (narrow-strait fast-path via raster: %.1f, %s mode): %s <-> %s",
+					rasterDist, mode, tileA.Name, tileB.Name))
 			end
 			return true
-		elseif bboxDist <= 6 then
-			closestA = bboxA
-			closestB = bboxB
-			edgeDist = bboxDist
-			if DEBUG_EXTENDED_ADJACENCY then
-				print(string.format("[TileAdjacencyManager] AABB override: using bbox edges for %s <-> %s (bbox: %.1f, raster was: %.1f)",
-					tileA.Name, tileB.Name, bboxDist, rasterDist))
-			end
 		end
 	end
 
-	-- If the closest edges are too far apart, definitely not walkable
-	if edgeDist > 6 then
+	local maxDistance = (mode == "aabb") and AABB_ADJACENCY_RESCUE_THRESHOLD or MAX_RASTER_ADJACENCY_DISTANCE
+	if edgeDist > maxDistance then
 		if DEBUG_REJECTED_ADJACENCY then
-			print(string.format("[TileAdjacencyManager] Rejected: %s <-> %s (edge distance %.1f > 6)",
-				tileA.Name, tileB.Name, edgeDist))
+			print(string.format("[TileAdjacencyManager] Rejected: %s <-> %s (edge distance %.1f > %d, %s mode)",
+				tileA.Name, tileB.Name, edgeDist, maxDistance, mode))
 		end
 		return false
 	end
 
 	local rayHeight = math.max(closestA.Y, closestB.Y) + 20
-	
-	-- DAILY DRIVER FIX: Dynamically calculate ray length to account for cliffs.
-	-- A fixed -50 ray will mid-air miss if the cliff is taller than 30 studs.
 	local heightDiff = math.abs(closestA.Y - closestB.Y)
-	local rayLength = math.max(100, heightDiff + 50) 
+	local rayLength = math.max(100, heightDiff + 50)
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterDescendantsInstances = {EUROPE_MAP}
 	rayParams.FilterType = Enum.RaycastFilterType.Include
 	rayParams.IgnoreWater = true
 
-	-- Check points along the shortest path between closest edges
-	-- Use more sample points for better precision
-	local numChecks = math.max(5, math.ceil(edgeDist / 0.4))  -- Check every 0.4 studs (denser sampling)
+	local numChecks = math.max(5, math.ceil(edgeDist / 0.4))
 	local groundCount = 0
 	local totalChecks = numChecks + 1
 	local consecutiveMisses = 0
 	local maxConsecutiveMisses = 0
-	local groundResults = {}  -- Track which samples had ground
+	local groundResults = {}
+
+	-- NEW: Strict Step Height Check Constants
+	local MAX_STEP_HEIGHT = 3.5 -- Allows walking up hills but blocks sheer cliffs
+	local lastValidY = nil
+	local failedDueToCliff = false
 
 	for i = 0, numChecks do
 		local fraction = i / numChecks
@@ -386,10 +617,22 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		local checkZ = closestA.Z + (closestB.Z - closestA.Z) * fraction
 		local origin = Vector3.new(checkX, rayHeight, checkZ)
 
-		-- DAILY DRIVER FIX: Apply the dynamic rayLength here
 		local result = Workspace:Raycast(origin, Vector3.new(0, -rayLength, 0), rayParams)
 
 		if result then
+			-- NEW: Vertical Blindness Fix
+			if lastValidY then
+				local stepHeight = math.abs(result.Position.Y - lastValidY)
+				if stepHeight > MAX_STEP_HEIGHT then
+					failedDueToCliff = true
+					if DEBUG_REJECTED_ADJACENCY then
+						warn(string.format("[TileAdjacencyManager] Path rejected: cliff detected (%.1f stud drop) between %s and %s", stepHeight, tileA.Name, tileB.Name))
+					end
+					break -- Abort path check immediately
+				end
+			end
+			
+			lastValidY = result.Position.Y
 			groundCount = groundCount + 1
 			consecutiveMisses = 0
 			table.insert(groundResults, true)
@@ -400,8 +643,11 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		end
 	end
 
-	-- FIX v9.3: CRITICAL - Check for consecutive misses (water crossing detection)
-	-- If we have 2+ consecutive misses, this is a water body, not a small gap
+	-- Immediately fail if the step-height exceeded limits
+	if failedDueToCliff then
+		return false
+	end
+
 	if maxConsecutiveMisses > MAX_CONSECUTIVE_MISSES then
 		if DEBUG_REJECTED_ADJACENCY then
 			print(string.format("[TileAdjacencyManager] Rejected (WATER): %s <-> %s (%d consecutive misses, distance: %.1f)",
@@ -410,11 +656,8 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		return false
 	end
 
-	-- FIX v9.3: CRITICAL - Explicit midpoint check
-	-- The middle of the path is most likely to be water
 	local midIndex = math.floor(#groundResults / 2) + 1
 	if #groundResults >= 3 then
-		-- Check that the middle section has ground
 		local midStart = math.max(1, midIndex - 1)
 		local midEnd = math.min(#groundResults, midIndex + 1)
 		local midGroundCount = 0
@@ -423,7 +666,6 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 				midGroundCount = midGroundCount + 1
 			end
 		end
-		-- Require at least 2 of 3 middle points to have ground
 		if midGroundCount < 2 then
 			if DEBUG_REJECTED_ADJACENCY then
 				print(string.format("[TileAdjacencyManager] Rejected (MID-WATER): %s <-> %s (only %d/3 middle points have ground)",
@@ -433,21 +675,64 @@ local function isPathWalkable(tileA, tileB, aabbOverride)
 		end
 	end
 
-	-- FIX v9.3: Higher ground ratio threshold (85%)
 	local groundRatio = groundCount / totalChecks
 	local isWalkable = groundRatio >= GROUND_RATIO_THRESHOLD
 
 	if DEBUG_REJECTED_ADJACENCY and not isWalkable then
-		print(string.format("[TileAdjacencyManager] Rejected (RATIO): %s <-> %s (ground ratio: %.0f%% < %.0f%%, distance: %.1f)",
-			tileA.Name, tileB.Name, groundRatio * 100, GROUND_RATIO_THRESHOLD * 100, edgeDist))
+		print(string.format("[TileAdjacencyManager:Runtime] Walkability failed: %s <-> %s (edgeDist: %.1f, groundRatio: %.2f, consecutiveMisses: %d, mode: %s)",
+			tileA.Name, tileB.Name, edgeDist, groundRatio, maxConsecutiveMisses, mode))
 	end
 
 	if DEBUG_EXTENDED_ADJACENCY and isWalkable then
-		print(string.format("[TileAdjacencyManager] Accepted: %s <-> %s (ground ratio: %.0f%%, distance: %.1f)",
-			tileA.Name, tileB.Name, groundRatio * 100, edgeDist))
+		print(string.format("[TileAdjacencyManager] Accepted: %s <-> %s (ground ratio: %.0f%%, distance: %.1f, mode: %s)",
+			tileA.Name, tileB.Name, groundRatio * 100, edgeDist, mode))
 	end
 
 	return isWalkable
+end
+
+-- Finds the best walkable border crossing among top-k candidate boundary pairs.
+-- Surface-corrects each candidate and revalidates the corrected segment inside the loop.
+-- Returns {pointA, pointB, distance} of first walkable candidate, or nil.
+local function _getBestWalkableBorderCrossing(tileA, tileB, k, mode)
+	k = k or DEFAULT_CANDIDATE_K
+	mode = mode or "raster"
+
+	local candidates
+	if mode == "aabb" then
+		candidates = _findCandidateEdgePointsBBox(tileA, tileB, k)
+	else
+		candidates = _findCandidateEdgePoints(tileA, tileB, k)
+	end
+
+	if not candidates or #candidates == 0 then return nil end
+
+	for _, candidate in ipairs(candidates) do
+		-- Step 1: Surface-correct the candidate points
+		local ptA = candidate.pointA
+		local ptB = candidate.pointB
+		local correctedA = TileAdjacencyManager.findNearestSurfacePoint(tileA, ptA)
+		local correctedB = TileAdjacencyManager.findNearestSurfacePoint(tileB, ptB)
+		if correctedA then ptA = correctedA end
+		if correctedB then ptB = correctedB end
+
+		-- Step 2: Recompute distance after correction
+		local dx = ptA.X - ptB.X
+		local dz = ptA.Z - ptB.Z
+		local correctedDist = math.sqrt(dx * dx + dz * dz)
+
+		-- Step 3: Validate the CORRECTED segment
+		if isPathWalkable(tileA, tileB, {
+			mode = mode,
+			pointA = ptA,
+			pointB = ptB,
+			distance = correctedDist
+		}) then
+			return { pointA = ptA, pointB = ptB, distance = correctedDist }
+		end
+	end
+
+	return nil
 end
 
 -- return center world position (x,z) of a cell
@@ -728,6 +1013,9 @@ local function hasInterveningTileBetweenBBox(tileA, tileB, cellToTilesLookup)
 end
 
 local function calculateAdjacenciesFromFootprints()
+	narrowStraitFastPathCount = 0  -- Reset counter for this adjacency build
+	AdjacencyProof = {}  -- CRITICAL: Clear proof table on adjacency rebuild (server restart, map regen, hot-reload)
+
 	-- Build CellToTiles mapping (cell -> list of tiles that cover it)
 	local CellToTilesLocal = {}
 
@@ -770,11 +1058,9 @@ local function calculateAdjacenciesFromFootprints()
 								if not pairsSeen[tileB] then pairsSeen[tileB] = {} end
 								pairsSeen[tileB][tileA] = true
 
-								-- FIX v9.5: Validate actual edge distance before marking as adjacent
-								-- This prevents false adjacencies where cells are grid neighbors
-								-- but the tiles are physically far apart
-								-- Use findClosestEdgePoints for accurate measurement (AABB can give false positives)
-								local _ptA, _ptB, edgeDist = findClosestEdgePoints(tileA, tileB)
+								-- FIX v9.5/v18: Validate actual edge distance before marking as adjacent
+								-- Use unified getRasterEdge helper for atomic (pointA, pointB, distance)
+								local _ptA, _ptB, edgeDist = getRasterEdge(tileA, tileB)
 								if edgeDist <= MAX_RASTER_ADJACENCY_DISTANCE then
 									-- FIX v11/v12: Check for intervening tiles between candidates.
 									local hasInterveningTile = hasInterveningTileBetween(tileA, tileB, CellToTilesLocal)
@@ -783,9 +1069,25 @@ local function calculateAdjacenciesFromFootprints()
 											tileA.Name, tileB.Name, edgeDist))
 									end
 									if not hasInterveningTile then
-										table.insert(AdjacentTiles[tileA], tileB)
-										if not AdjacentTiles[tileB] then AdjacentTiles[tileB] = {} end
-										table.insert(AdjacentTiles[tileB], tileA)
+										-- Top-k walkable border crossing: try up to k candidates along shared border
+										local bestCrossing = _getBestWalkableBorderCrossing(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
+										if bestCrossing then
+											table.insert(AdjacentTiles[tileA], tileB)
+											if not AdjacentTiles[tileB] then AdjacentTiles[tileB] = {} end
+											table.insert(AdjacentTiles[tileB], tileA)
+
+											-- Store proof: raster-based adjacency with walkable crossing points
+											if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
+											if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
+											AdjacencyProof[tileA][tileB] = { mode = "raster", pointA = bestCrossing.pointA, pointB = bestCrossing.pointB, distance = bestCrossing.distance }
+											AdjacencyProof[tileB][tileA] = { mode = "raster", pointA = bestCrossing.pointB, pointB = bestCrossing.pointA, distance = bestCrossing.distance }
+										else
+											rejectedByDistance = rejectedByDistance + 1
+											if DEBUG_REJECTED_ADJACENCY then
+												print(string.format("[TileAdjacencyManager] Rejected raster adjacency (WATER, %d candidates tried): %s <-> %s (closest edge dist %.1f)",
+													DEFAULT_CANDIDATE_K, tileA.Name, tileB.Name, edgeDist))
+											end
+										end
 									else
 										rejectedByDistance = rejectedByDistance + 1
 									end
@@ -812,8 +1114,8 @@ local function calculateAdjacenciesFromFootprints()
 	totalConnections = totalConnections / 2
 
 	local avgConnections = (totalConnections * 2) / math.max(1, #AllTilesList)
-	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected %d by distance)",
-		totalConnections, avgConnections, rejectedByDistance))
+	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected %d by distance, %d via narrow-strait fast-path)",
+		totalConnections, avgConnections, rejectedByDistance, narrowStraitFastPathCount))
 end
 
 -- FIX v9.3: Extended adjacencies with stricter water detection
@@ -883,8 +1185,16 @@ local function calculateExtendedAdjacencies()
 
 			-- Path A: Original gap-bridging logic (raster-based distance)
 			if rasterEdgeDistance > 0 and rasterEdgeDistance <= EXTENDED_ADJACENCY_THRESHOLD then
-				if isPathWalkable(tileA, tileB) then
+				-- Top-k walkable border crossing for gap-bridging
+				local bestCrossing = _getBestWalkableBorderCrossing(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
+				if bestCrossing then
 					shouldConnect = true
+
+					-- Store proof: raster gap-bridge with walkable crossing points
+					if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
+					if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
+					AdjacencyProof[tileA][tileB] = { mode = "raster", pointA = bestCrossing.pointA, pointB = bestCrossing.pointB, distance = bestCrossing.distance }
+					AdjacencyProof[tileB][tileA] = { mode = "raster", pointA = bestCrossing.pointB, pointB = bestCrossing.pointA, distance = bestCrossing.distance }
 				else
 					rejectedCount = rejectedCount + 1
 				end
@@ -914,18 +1224,28 @@ local function calculateExtendedAdjacencies()
 						print(string.format("[TileAdjacencyManager] AABB rescue rejected (intervening tile): %s <-> %s (AABB: %.1f, raster: %.1f)",
 								tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
 					end
-				-- Step 2: Check walkability (raycasting for water/void)
-				elseif isPathWalkable(tileA, tileB, true) then
-					shouldConnect = true
-					if DEBUG_EXTENDED_ADJACENCY then
-						print(string.format("[TileAdjacencyManager] AABB rescue adjacency: %s <-> %s (AABB: %.1f, raster: %.1f)",
-								tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
-					end
+				-- Step 2: Top-k walkable border crossing for AABB rescue
 				else
-					rejectedCount = rejectedCount + 1
-					if DEBUG_REJECTED_ADJACENCY then
-						print(string.format("[TileAdjacencyManager] AABB rescue rejected (unwalkable): %s <-> %s (AABB: %.1f, raster: %.1f)",
-								tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
+					local bestCrossing = _getBestWalkableBorderCrossing(tileA, tileB, DEFAULT_CANDIDATE_K, "aabb")
+					if bestCrossing then
+						shouldConnect = true
+
+						-- Store proof: AABB rescue with walkable crossing points
+						if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
+						if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
+						AdjacencyProof[tileA][tileB] = { mode = "aabb", pointA = bestCrossing.pointA, pointB = bestCrossing.pointB, distance = bestCrossing.distance }
+						AdjacencyProof[tileB][tileA] = { mode = "aabb", pointA = bestCrossing.pointB, pointB = bestCrossing.pointA, distance = bestCrossing.distance }
+
+						if DEBUG_EXTENDED_ADJACENCY then
+							print(string.format("[TileAdjacencyManager] AABB rescue adjacency: %s <-> %s (AABB: %.1f, raster: %.1f)",
+									tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
+						end
+					else
+						rejectedCount = rejectedCount + 1
+						if DEBUG_REJECTED_ADJACENCY then
+							print(string.format("[TileAdjacencyManager] AABB rescue rejected (unwalkable, %d candidates tried): %s <-> %s (AABB: %.1f, raster: %.1f)",
+									DEFAULT_CANDIDATE_K, tileA.Name, tileB.Name, aabbEdgeDistance, rasterEdgeDistance))
+						end
 					end
 				end
 			end
@@ -1385,7 +1705,7 @@ function TileAdjacencyManager.diagnoseAdjacency(tileA, tileB)
 			local hasRasterIntervening = hasInterveningTileBetween(tileA, tileB, CellToTilesMap)
 			warn(string.format("  Path B raster intervening (2nd opinion): %s", tostring(hasRasterIntervening)))
 			if not hasRasterIntervening then
-				local walkable = isPathWalkable(tileA, tileB, true)
+				local walkable = isPathWalkable(tileA, tileB, { mode = "aabb" })
 				warn(string.format("  Path B walkability (aabbOverride): %s", tostring(walkable)))
 				if not walkable then
 					warn("  ❌ BLOCKED at Path B: walkability check failed")
@@ -1415,6 +1735,21 @@ function TileAdjacencyManager.getTileCountry(tilePart)
 		current = current.Parent
 	end
 	return nil
+end
+
+-- Returns the current controlling country of a tile.
+-- Checks OwnerCountry attribute first (set on BOTH capture and annexation),
+-- then falls back to geographic Model parent (original owner).
+-- INVARIANT: All non-geographic control (occupation, annexation) sets OwnerCountry.
+-- Use this for "who currently controls this tile?" decisions.
+-- Use getTileCountry() for "where does this tile geographically belong?" decisions.
+function TileAdjacencyManager.getEffectiveOwner(tilePart)
+	if not tilePart then return nil end
+	local ownerAttr = tilePart:GetAttribute("OwnerCountry")
+	if ownerAttr and ownerAttr ~= "" then
+		return ownerAttr
+	end
+	return TileAdjacencyManager.getTileCountry(tilePart)
 end
 
 function TileAdjacencyManager.getAdjacentEnemyTiles(tilePart)
@@ -1516,6 +1851,16 @@ end
 function TileAdjacencyManager.findClosestEdgePoints(tileA, tileB)
 	if not tileA or not tileB then return nil, nil, math.huge end
 	return findClosestEdgePoints(tileA, tileB)
+end
+
+function TileAdjacencyManager.findCandidateEdgePoints(tileA, tileB, k)
+	if not tileA or not tileB then return {} end
+	return _findCandidateEdgePoints(tileA, tileB, k)
+end
+
+function TileAdjacencyManager.getBestWalkableBorderCrossing(tileA, tileB, k, mode)
+	if not tileA or not tileB then return nil end
+	return _getBestWalkableBorderCrossing(tileA, tileB, k, mode)
 end
 
 -- FIX v10: Find the nearest point on a tile's actual surface to a target XZ position.
@@ -1730,87 +2075,20 @@ function TileAdjacencyManager.recalculate()
 	calculateSafeCenters()
 end
 
--- FIX v17: Export isPathWalkable for use in NPCMovementSystem after edge point correction
--- Now accepts optional pre-computed edge points to avoid redundant findClosestEdgePoints() calls
-function TileAdjacencyManager.isPathWalkable(tileA, tileB, pointA, pointB)
-	if pointA and pointB then
-		-- Use provided edge points, validate walkability directly
-		local closestA, closestB = pointA, pointB
-		local edgeDist = math.sqrt((pointA.X - pointB.X)^2 + (pointA.Z - pointB.Z)^2)
+-- FIX v18: Export isPathWalkable for use in NPCMovementSystem
+-- Now uses opts table for unambiguous parameters
+function TileAdjacencyManager.isPathWalkable(tileA, tileB, opts)
+	return isPathWalkable(tileA, tileB, opts)
+end
 
-		-- FIX v9.4: Close tiles bypass water checks
-		if edgeDist <= EXTENDED_ADJACENCY_THRESHOLD then
-			return true
-		end
-
-		-- If edges are too far apart, not walkable
-		if edgeDist > 6 then
-			return false
-		end
-
-		local rayHeight = math.max(closestA.Y, closestB.Y) + 20
-
-		local rayParams = RaycastParams.new()
-		rayParams.FilterDescendantsInstances = {EUROPE_MAP}
-		rayParams.FilterType = Enum.RaycastFilterType.Include
-		rayParams.IgnoreWater = true
-
-		-- Dense sampling: every 0.4 studs along the edge path
-		local numChecks = math.max(5, math.ceil(edgeDist / 0.4))
-		local groundCount = 0
-		local totalChecks = numChecks + 1
-		local consecutiveMisses = 0
-		local maxConsecutiveMisses = 0
-		local groundResults = {}
-
-		for i = 0, numChecks do
-			local fraction = i / numChecks
-			local checkX = closestA.X + (closestB.X - closestA.X) * fraction
-			local checkZ = closestA.Z + (closestB.Z - closestA.Z) * fraction
-			local origin = Vector3.new(checkX, rayHeight, checkZ)
-
-			local result = Workspace:Raycast(origin, Vector3.new(0, -50, 0), rayParams)
-
-			if result then
-				groundCount = groundCount + 1
-				consecutiveMisses = 0
-				table.insert(groundResults, true)
-			else
-				consecutiveMisses = consecutiveMisses + 1
-				maxConsecutiveMisses = math.max(maxConsecutiveMisses, consecutiveMisses)
-				table.insert(groundResults, false)
-			end
-		end
-
-		-- Check for consecutive misses (water crossing detection)
-		if maxConsecutiveMisses > MAX_CONSECUTIVE_MISSES then
-			return false
-		end
-
-		-- Explicit midpoint check
-		local midIndex = math.floor(#groundResults / 2) + 1
-		if #groundResults >= 3 then
-			local midStart = math.max(1, midIndex - 1)
-			local midEnd = math.min(#groundResults, midIndex + 1)
-			local midGroundCount = 0
-			for idx = midStart, midEnd do
-				if groundResults[idx] then
-					midGroundCount = midGroundCount + 1
-				end
-			end
-			-- Require at least 2 of 3 middle points to have ground
-			if midGroundCount < 2 then
-				return false
-			end
-		end
-
-		-- 85% ground ratio threshold
-		local groundRatio = groundCount / totalChecks
-		return groundRatio >= GROUND_RATIO_THRESHOLD
-	else
-		-- No pre-computed points - call local isPathWalkable normally
-		return isPathWalkable(tileA, tileB, false)
+-- FIX v18: Export getAdjacencyProof for use in NPCMovementSystem
+-- Returns adjacency proof for a tile pair, or nil if not adjacent
+-- Returns: { mode: "raster"|"aabb", pointA: Vector3, pointB: Vector3, distance: number } or nil
+function TileAdjacencyManager.getAdjacencyProof(tileA, tileB)
+	if AdjacencyProof[tileA] and AdjacencyProof[tileA][tileB] then
+		return AdjacencyProof[tileA][tileB]
 	end
+	return nil
 end
 
 ---------------------------------------------------
