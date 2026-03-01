@@ -7,6 +7,7 @@ local CollectionService = game:GetService("CollectionService")
 
 local Combat = require(game.ServerScriptService:WaitForChild("NPCCombatSystem", 10))
 local TileManager = require(game.ServerScriptService:WaitForChild("TileManager", 10))
+local TileAdjacencyManager = require(game.ServerScriptService:WaitForChild("TileAdjacencyManager", 10))
 local UnitManager = require(game.ServerScriptService:WaitForChild("UnitManager", 10))
 local TileOwnershipManager = require(game.ServerScriptService:WaitForChild("TileOwnershipManager", 10))
 local CountryNPCRegistry = require(game.ServerScriptService:WaitForChild("CountryNPCRegistry", 10))
@@ -65,6 +66,14 @@ function NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, ownerPlaye
 	-- Store tile/country info for cleanup
 	npcClone:SetAttribute("TileKey", tileKey)
 	npcClone:SetAttribute("Country", countryName)
+	-- Fix C: Set CurrentTileId for reliable adjacency resolution (stable, unique tile identity)
+	local spawnTilePart = TileAdjacencyManager.getTileFromKey(tileKey)
+	if spawnTilePart then
+		local spawnTileId = TileAdjacencyManager.getTileId(spawnTilePart)
+		if spawnTileId then
+			npcClone:SetAttribute("CurrentTileId", spawnTileId)
+		end
+	end
 
 	-- Tag for diagnostics
 	CollectionService:AddTag(npcClone, NPC_TAG)

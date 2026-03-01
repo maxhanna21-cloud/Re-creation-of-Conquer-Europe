@@ -246,6 +246,11 @@ local function handleTileClick(player, tilePart)
 				if correctedKey then
 					npcModel:SetAttribute("TileKey", correctedKey)
 				end
+				-- Fix C: Update CurrentTileId to match the corrected tile
+				local correctedTileId = TileAdjacencyManager.getTileId(correctedTile)
+				if correctedTileId then
+					npcModel:SetAttribute("CurrentTileId", correctedTileId)
+				end
 			end
 		end
 	end

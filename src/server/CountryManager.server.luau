@@ -107,10 +107,10 @@ local function calculateAllStartingManpower()
 		return startingManpower
 	end
 
-	-- 2. Define Weights (Tuned to slightly favor land area)
+	-- 2. Define Weights
 	local weights = {
-		totalArea = 0.40,  -- 40% weight on physical landmass (Primary)
-		population = 0.45, -- 45% weight on population (Close secondary)
+		totalArea = 0.35,  -- 35% weight on physical landmass (Secondary)
+		population = 0.50, -- 50% weight on population (Primary)
 		tileCount = 0.15   -- 15% weight on administrative density (Modifier)
 	}
 
@@ -179,8 +179,10 @@ end
 
 -- FIX v5: Release countries WITHOUT clearing diplomacy or occupied territories
 local function releasePlayerCountries(player, reason)
+	local releasedAny = false
 	for country, owner in pairs(CountryOwners) do
 		if owner == player then
+			releasedAny = true
 			local leaderstats = player:FindFirstChild("leaderstats")
 
 			-- Save coins to country (for next player)
@@ -225,6 +227,19 @@ local function releasePlayerCountries(player, reason)
 		end
 	end
 	ServerState.setCountryOwners(CountryOwners)
+
+	-- Hide BuyNPCGui for the released player (client will re-show selection screen via CharacterAdded)
+	if releasedAny and player.Parent then
+		local playerGui = player:FindFirstChildOfClass("PlayerGui")
+		if playerGui then
+			local buyGui = playerGui:FindFirstChild("BuyNPCGui")
+			if buyGui then
+				buyGui.Enabled = false
+				local mainFrame = buyGui:FindFirstChild("MainFrame")
+				if mainFrame then mainFrame.Visible = false end
+			end
+		end
+	end
 end
 
 local function hasAnyOwnedCountries()

@@ -11,7 +11,6 @@ local Players = game:GetService("Players")
 local DiplomacyManager = require(ServerScriptService:WaitForChild("DiplomacyManager", 10))
 local ServerState = require(ServerScriptService:WaitForChild("ServerState", 10))
 local TileOwnershipManager = require(ServerScriptService:WaitForChild("TileOwnershipManager", 10))
-local CountryNPCRegistry = require(ServerScriptService:WaitForChild("CountryNPCRegistry", 10))
 
 -- 2. REQUIREMENTS (Remotes)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
@@ -33,7 +32,7 @@ local function getPlayerCountry(player)
 end
 
 -- HELPER: Raw single-level lookup (used ONLY for pre-resolution early-exit checks,
--- e.g. "does this country exist?", "is it unowned with no NPCs?").
+-- e.g. "does this country exist?").
 -- Do NOT use this to determine the controlling player — use ServerState.resolveTarget() instead.
 local function getCountryOwner(countryName)
 	local countryOwners = ServerState.getCountryOwners()
@@ -66,14 +65,9 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 		return
 	end
 
-	-- Check if target is unowned (with no NPCs)
-	if rawOwner == "Unowned" then
-		if not CountryNPCRegistry.hasNPCs(targetCountryName) then
-			GlobalNotificationEvent:FireClient(player, "❌ Cannot declare war on an unowned country. Wait for someone to claim it.", Color3.fromRGB(255, 200, 0))
-			return
-		end
-		-- Has NPCs — fall through and allow war declaration
-	end
+	-- Unowned countries (no player controlling them) are still valid war targets.
+	-- NPCs may or may not be present — either way the country has territory on the map.
+	-- (Conquered countries are handled below via the "Conquered_" chain resolution.)
 
 	-- If target is conquered, resolve the full chain to the actual controlling country/player.
 	-- ALL conquest-chain resolution goes through ServerState.resolveTarget() — no exceptions.
@@ -93,10 +87,7 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 			GlobalNotificationEvent:FireClient(player, "❌ The conquering country no longer exists.", Color3.fromRGB(255, 100, 100))
 			return
 		end
-		if resolvedOwner == "Unowned" then
-			GlobalNotificationEvent:FireClient(player, "❌ " .. canonicalName .. " is currently unowned.", Color3.fromRGB(255, 200, 0))
-			return
-		end
+		-- Unowned conqueror is still a valid war target (country has territory)
 		if targetCountryName == playerCountry then
 			GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
 			return

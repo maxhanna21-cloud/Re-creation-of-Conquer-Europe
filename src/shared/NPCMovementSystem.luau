@@ -144,9 +144,52 @@ local function isOnValidGround(npcModel)
 		return true
 	end
 
-	-- NPC is falling - check if there's ground below to catch them
+	-- FIX v21 (hardened): If the NPC is actively moving near a waypoint, use a
+	-- RELAXED ground check (20-stud drop) instead of blindly returning true.
+	-- Edge waypoints sit at mesh-edge height (often Y=4.6) while tile interiors
+	-- are at Y=7.6+.  Walking downhill creates velocity that triggers
+	-- FALL_Y_THRESHOLD.  The relaxed check still catches genuine void-falls
+	-- while tolerating the normal edge-descent velocity.
+	local mState = movementStates[npcModel]
+	local movement = activeMovements[npcModel]
 	local europeMap = Workspace:FindFirstChild("EuropeMap")
 	if not europeMap then return false end
+
+	if mState and mState.state == "Moving" and movement and movement.enrichedWaypoints then
+		local wpIdx = movement.currentWaypoint or 1
+		local nearWaypoint = false
+		for checkIdx = math.max(1, wpIdx - 1), math.min(#movement.enrichedWaypoints, wpIdx + 2) do
+			local wp = movement.enrichedWaypoints[checkIdx]
+			if wp then
+				local distToWP = ((root.Position - wp.position) * Vector3.new(1, 0, 1)).Magnitude
+				if wp.type == "edge" and distToWP < 12 then
+					nearWaypoint = true
+					break
+				end
+				if distToWP < 8 then
+					nearWaypoint = true
+					break
+				end
+			end
+		end
+		if nearWaypoint then
+			-- Near a waypoint during movement: relaxed ground check (20-stud drop).
+			-- Still catches genuine void-falls; tolerates normal edge descent.
+			local relaxedOrigin = root.Position + Vector3.new(0, 2, 0)
+			local relaxedParams = RaycastParams.new()
+			relaxedParams.FilterDescendantsInstances = {europeMap}
+			relaxedParams.FilterType = Enum.RaycastFilterType.Include
+			relaxedParams.IgnoreWater = true
+			local relaxedResult = Workspace:Raycast(relaxedOrigin, Vector3.new(0, -20, 0), relaxedParams)
+			if relaxedResult then
+				return true  -- Ground within 20 studs below, safe to continue movement
+			end
+			-- No ground within 20 studs even near waypoint
+			if DEBUG then
+				warn(string.format("[NPCMovement:GroundCheck] Near waypoint but no ground within 20 studs for %s", npcModel.Name))
+			end
+		end
+	end
 
 	-- DAILY DRIVER FIX: Use a dynamic ray length based on the distance to the map floor.
 	-- This prevents NPCs from "dying" mid-air while falling down a legal cliff.
@@ -167,17 +210,40 @@ local function isOnValidGround(npcModel)
 	end
 
 	-- NPC is falling AND there's no tile below (checked all the way to MAP_MIN_Y)
-	-- BUT check for gap-crossing waypoints before declaring emergency
-	local mState = movementStates[npcModel]
-	local movement = activeMovements[npcModel]
+	-- FIX v21 (hardened): Only auto-true when the NPC is ACTUALLY in a gap-crossing
+	-- segment (departure-edge → arrival-edge on a DIFFERENT tile).  This is the
+	-- teleport corridor where no ground is expected.  Merely being "near an edge
+	-- waypoint" is not sufficient — the NPC could be falling off a map edge.
 	if mState and mState.state == "Moving" and movement and movement.enrichedWaypoints then
 		local wpIdx = movement.currentWaypoint or 1
-		for checkIdx = math.max(1, wpIdx - 1), math.min(#movement.enrichedWaypoints, wpIdx + 1) do
-			local wp = movement.enrichedWaypoints[checkIdx]
-			if wp and wp.type == "edge" then
-				local distToEdge = ((root.Position - wp.position) * Vector3.new(1, 0, 1)).Magnitude
-				if distToEdge < 5 then
-					return true -- Near edge waypoint, trust the system to catch them
+		local wps = movement.enrichedWaypoints
+		-- Check if we're in a gap-crossing segment: current WP is edge, next is edge on different tile
+		local currWP = wps[wpIdx]
+		local nextWP = wps[wpIdx + 1]
+		local inGapCrossing = false
+		if currWP and nextWP
+			and currWP.type == "edge" and nextWP.type == "edge"
+			and currWP.tile ~= nextWP.tile then
+			inGapCrossing = true
+		end
+		-- Also check the previous pair (NPC may have just passed the departure edge)
+		if not inGapCrossing and wpIdx >= 2 then
+			local prevWP = wps[wpIdx - 1]
+			if prevWP and currWP
+				and prevWP.type == "edge" and currWP.type == "edge"
+				and prevWP.tile ~= currWP.tile then
+				inGapCrossing = true
+			end
+		end
+		if inGapCrossing then
+			-- Verify NPC is actually near the crossing edge
+			for checkIdx = math.max(1, wpIdx - 1), math.min(#wps, wpIdx + 1) do
+				local wp = wps[checkIdx]
+				if wp and wp.type == "edge" then
+					local distToEdge = ((root.Position - wp.position) * Vector3.new(1, 0, 1)).Magnitude
+					if distToEdge < 10 then
+						return true -- In gap-crossing corridor, teleport system will catch them
+					end
 				end
 			end
 		end
@@ -208,12 +274,12 @@ local function hasGroundAhead(npcModel, humanoid, distance)
 	params.IgnoreWater = true
 
 	local result = Workspace:Raycast(rayOrigin, rayDir, params)
-	
+
 	-- If no ground, or the drop is deeper than 5 studs, throw the brake
 	if not result or (root.Position.Y - result.Position.Y) > 5 then
 		return false
 	end
-	
+
 	return true
 end
 
@@ -810,6 +876,30 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 				print(string.format("[NPCMovement:Waypoints] Gap crossing: %s -> %s (%.1f stud gap)",
 					prevTile.Name, currTile.Name, edgeDist))
 			end
+		elseif pointA and pointB then
+			-- Touching tiles (edgeDist <= 0.1): still inject edge waypoint(s)
+			-- to avoid straight center-to-center lines crossing voids on curved tiles.
+			local prevPos = waypoints[#waypoints].position
+			local edgeMidpoint = (pointA + pointB) / 2
+
+			-- Pathfind from current position to the shared edge
+			local pfToEdge = computeWalkablePath(prevPos, edgeMidpoint)
+			if #pfToEdge > 0 then
+				for _, pfPos in ipairs(pfToEdge) do
+					table.insert(waypoints, {
+						type = "pathfind",
+						position = pfPos,
+						tile = prevTile
+					})
+				end
+			end
+
+			-- Insert the edge midpoint as a waypoint
+			table.insert(waypoints, {
+				type = "edge",
+				position = edgeMidpoint,
+				tile = prevTile
+			})
 		end
 
 		-- FIX v11: Arrival-tile pathfinding
@@ -1288,6 +1378,11 @@ local function monitorMovement(npcModel, isRetreat)
 			-- occupy new tile
 			TileManager.occupyTileGlobal(targetTileKey, npcModel)
 			npcModel:SetAttribute("TileKey", targetTileKey)
+			-- Fix C: Also store stable CurrentTileId (unique TileId of the tile part) for reliable adjacency resolution
+			local arrivalTileId = TileAdjacencyManager.getTileId(targetTilePart)
+			if arrivalTileId then
+				npcModel:SetAttribute("CurrentTileId", arrivalTileId)
+			end
 
 			if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
 				TileOwnershipManager.captureTile(targetTilePart, owner)
@@ -1330,29 +1425,29 @@ local function monitorMovement(npcModel, isRetreat)
 		end
 	end
 
--- STILL MOVING: Apply path correction to keep NPC on safe corridor
-local effectiveTarget = waypointPos
+	-- STILL MOVING: Apply path correction to keep NPC on safe corridor
+	local effectiveTarget = waypointPos
 
-if corridorOrigin then
-	effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
-end
+	if corridorOrigin then
+		effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
+	end
 
--- NEW: Emergency Brake System
-if not hasGroundAhead(npcModel, humanoid, 3.5) then
-	if DEBUG then warn("[NPCMovement:Brake] Emergency brake applied for " .. npcModel.Name .. " - cliff/void detected ahead!") end
-	humanoid:MoveTo(root.Position) -- Stop instantly
-	
-	-- Force the stuck detection to trigger instantly so the NPC initiates a recovery teleport or retry
+	-- NEW: Emergency Brake System
+	if not hasGroundAhead(npcModel, humanoid, 3.5) then
+		if DEBUG then warn("[NPCMovement:Brake] Emergency brake applied for " .. npcModel.Name .. " - cliff/void detected ahead!") end
+		humanoid:MoveTo(root.Position) -- Stop instantly
+
+		-- Force the stuck detection to trigger instantly so the NPC initiates a recovery teleport or retry
+		movementStates[npcModel] = movementStates[npcModel] or {}
+		movementStates[npcModel].stuckSince = movementStates[npcModel].stuckSince or (os.clock() - (STUCK_CHECK_TIME * 2))
+		return
+	end
+
+	humanoid:MoveTo(effectiveTarget)
+
+	-- STUCK detection sampling
 	movementStates[npcModel] = movementStates[npcModel] or {}
-	movementStates[npcModel].stuckSince = movementStates[npcModel].stuckSince or (os.clock() - (STUCK_CHECK_TIME * 2))
-	return
-end
-
-humanoid:MoveTo(effectiveTarget)
-
--- STUCK detection sampling
-movementStates[npcModel] = movementStates[npcModel] or {}
-local state = movementStates[npcModel]
+	local state = movementStates[npcModel]
 
 	local now = os.clock()
 	state.lastSamplePos = state.lastSamplePos or root.Position
@@ -1380,6 +1475,28 @@ local state = movementStates[npcModel]
 		if state.moveAttempts <= MAX_MOVE_RETRIES then
 			-- retry MoveTo with backoff
 			if DEBUG then print("[NPCMovement] Stuck detected for", npcModel.Name, "retrying MoveTo (attempt)", state.moveAttempts) end
+
+			-- NEW: Fallback PathfindingService Route for Non-Gap Crossings
+			-- If we are consistently getting stuck, try to calculate a path around the obstacle
+			if state.moveAttempts == 2 and currentWP.type ~= "edge" then
+				if DEBUG then print("[NPCMovement] Attempt 2: Injecting emergency pathfinding to waypoint for " .. npcModel.Name) end
+				local emergencyPath = computeWalkablePath(root.Position, waypointPos)
+				if #emergencyPath > 0 then
+					-- We found a path! Insert these waypoints right before the current one
+					for i = #emergencyPath, 1, -1 do
+						table.insert(enrichedWaypoints, currentWaypoint, {
+							type = "pathfind",
+							position = emergencyPath[i],
+							tile = currentWP.tile
+						})
+					end
+					-- Reset stuck state to let it follow the new path
+					state.stuckSince = nil
+					state.moveAttempts = 0
+					return
+				end
+			end
+
 			task.delay(MOVE_RETRY_BACKOFF * state.moveAttempts, function()
 				local h = getHumanoid(npcModel)
 				if h and npcModel and npcModel.Parent then
@@ -1574,6 +1691,11 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 					if correctedKey then
 						currentTileKey = correctedKey
 						npcModel:SetAttribute("TileKey", correctedKey)
+					end
+					-- Fix C: Update CurrentTileId to match the corrected tile
+					local correctedTileId = TileAdjacencyManager.getTileId(correctedTile)
+					if correctedTileId then
+						npcModel:SetAttribute("CurrentTileId", correctedTileId)
 					end
 				end
 			end

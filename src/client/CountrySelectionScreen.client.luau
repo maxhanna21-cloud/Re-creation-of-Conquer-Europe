@@ -1,26 +1,26 @@
--- LocalScript inside CountrySelectionScreen (FIXED - Auto-refresh on country claim)
+-- LocalScript inside CountrySelectionScreen (INSTANT LOAD + Respawn Fix)
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
 
-local SelectCountryEvent = ReplicatedStorage:WaitForChild("SelectCountryEvent", 10)
-local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 10)
+-- Wait for required RemoteEvents (Does not yield if they already exist)
+local SelectCountryEvent = ReplicatedStorage:WaitForChild("SelectCountryEvent", 15)
+local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 15)
+local CountryClaimedEvent = ReplicatedStorage:WaitForChild("CountryClaimedEvent", 15)
+local InitializationComplete = ReplicatedStorage:WaitForChild("InitializationComplete", 15)
 
--- NEW: Listen for when countries are claimed to refresh the list
-local CountryClaimedEvent = ReplicatedStorage:WaitForChild("CountryClaimedEvent", 10)
-
--- Wait for PlayerGui to be ready
-local gui = player:WaitForChild("PlayerGui", 10)
-local countryScreen = gui:WaitForChild("CountrySelectionScreen", 10)
+-- Get UI Elements
+local gui = player:WaitForChild("PlayerGui", 15)
+local countryScreen = gui:WaitForChild("CountrySelectionScreen", 15)
 local CountryList = countryScreen:WaitForChild("CountryFrame", 10):WaitForChild("CountryList", 10)
 local ButtonTemplate = CountryList:WaitForChild("CountryButtonTemplate", 10)
 
 local buttonConnections = {}
+local isOpening = false -- Guard to prevent overlapping logic
 
 -- Build country buttons
 local function buildCountryList(countries)
-	-- Clear old buttons
 	for _, child in ipairs(CountryList:GetChildren()) do
 		if child:IsA("TextButton") and child ~= ButtonTemplate then
 			local conn = buttonConnections[child.Name]
@@ -29,7 +29,6 @@ local function buildCountryList(countries)
 		end
 	end
 
-	-- Clear old connections
 	buttonConnections = {}
 
 	for i, countryName in ipairs(countries) do
@@ -49,57 +48,121 @@ local function buildCountryList(countries)
 	end
 end
 
--- Function to fetch from server
-local function fetchCountries()
-	local ok, result = pcall(function()
-		return GetAvailableCountries:InvokeServer()
-	end)
+-- Core function to instantly open menu
+-- Added 'force' parameter to override isOpening guard during critical transitions (death/switch)
+local function tryOpenMenu(force)
+	if isOpening and not force then return end
+	isOpening = true
 
-	if ok and type(result) == "table" then
-		buildCountryList(result)
-		return true
-	end
-
-	return false
-end
-
--- Initial fetch with retry
-local function initialFetch()
-	local MAX_WAIT_TIME = 10
-	local startTime = os.clock()
-
-	repeat
-		if fetchCountries() then
+	local success = pcall(function()
+		-- 1. Check if player already owns a country
+		local leaderstats = player:WaitForChild("leaderstats", 5)
+		local countryStat = leaderstats and leaderstats:FindFirstChild("Country")
+		
+		local statVal = countryStat and countryStat.Value or ""
+		
+		-- If they have a valid country, make sure the menu is OFF and exit
+		if statVal ~= "" and statVal ~= "None" and statVal ~= "Defeated" then
+			countryScreen.Enabled = false
 			return
 		end
-		task.wait(0.2)
-	until os.clock() - startTime > MAX_WAIT_TIME
 
-	warn("Could not retrieve country list. Check server logs.")
+		-- 2. Fetch countries with a retry loop
+		local attempts = 0
+		local maxAttempts = 10
+		local successData = nil
+
+		while attempts < maxAttempts do
+			local ok, result = pcall(function()
+				return GetAvailableCountries:InvokeServer()
+			end)
+
+			if ok and type(result) == "table" and #result > 0 then
+				successData = result
+				break
+			end
+			
+			attempts = attempts + 1
+			task.wait(0.5) -- Faster polling for smoother feel
+		end
+
+		if successData then
+			-- Final check before showing UI
+			local currentStat = player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Country")
+			local currentVal = currentStat and currentStat.Value or ""
+			
+			if currentVal == "" or currentVal == "None" or currentVal == "Defeated" then
+				buildCountryList(successData)
+				countryScreen.Enabled = true
+			else
+				countryScreen.Enabled = false
+			end
+		else
+			warn("[CountrySelection] Failed to retrieve country list. Map might still be scanning.")
+		end
+	end)
+
+	if not success then
+		warn("[CountrySelection] Critical error in tryOpenMenu")
+	end
+	
+	isOpening = false
 end
 
--- Start the initial fetch
-initialFetch()
+-- ==========================================
+-- TRIGGER EVENTS
+-- ==========================================
 
--- NEW: Listen for country claims and refresh the list
+-- 1. Try Immediately on Script Load
+task.defer(function()
+	tryOpenMenu(false)
+end)
+
+-- 2. Server Initialization Complete
+InitializationComplete.OnClientEvent:Connect(function()
+	tryOpenMenu(true)
+end)
+
+-- 3. Respawn / Character Added Handler
+player.CharacterAdded:Connect(function()
+	-- Proactive check: if we are respawning, we usually need the menu or a refresh
+	task.spawn(function()
+		-- Poll for leaderstats to catch "Defeated" or "None" status immediately
+		for _ = 1, 40 do -- Increase poll frequency for better "feel"
+			local leaderstats = player:FindFirstChild("leaderstats")
+			if leaderstats then
+				local countryStat = leaderstats:FindFirstChild("Country")
+				if countryStat then
+					local val = countryStat.Value
+					if val == "None" or val == "" or val == "Defeated" then
+						tryOpenMenu(true) -- Force open because we know they are country-less
+					else
+						countryScreen.Enabled = false -- Ensure hidden if they have a country
+					end
+					return
+				end
+			end
+			task.wait(0.05)
+		end
+		tryOpenMenu(true) -- Fallback
+	end)
+end)
+
+-- 4. Listen for other players claiming countries to auto-refresh
 CountryClaimedEvent.OnClientEvent:Connect(function(claimedCountry, claimingPlayerName)
-	-- 1. Refresh list for everyone else
 	if countryScreen.Enabled then
-		print("[CountrySelection] " .. claimedCountry .. " was claimed by " .. claimingPlayerName .. ", refreshing list...")
-		fetchCountries()
+		task.spawn(function()
+			local ok, result = pcall(function() return GetAvailableCountries:InvokeServer() end)
+			if ok and type(result) == "table" then buildCountryList(result) end
+		end)
 	end
 
-	-- 2. Check if the person who just claimed a country is ME
+	-- If YOU claimed it, hide the screen and initialize gameplay
 	if claimingPlayerName == player.Name then
-		print("I have claimed " .. claimedCountry .. ". Hiding selection screen.")
 		countryScreen.Enabled = false
-
-		-- FIX: Signal to the Diplomacy script with proper error handling
 		local joinSuccess = ReplicatedStorage:FindFirstChild("JoinSuccess")
-		if joinSuccess and joinSuccess:IsA("BindableEvent") then
-			joinSuccess:Fire()
-		else
-			warn("[CountrySelection] JoinSuccess BindableEvent not found or wrong type")
-		end
+		if joinSuccess then joinSuccess:Fire() end
 	end
 end)
+
+print("[CountrySelectionScreen] Reinforced logic initialized.")

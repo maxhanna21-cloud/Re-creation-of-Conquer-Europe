@@ -257,7 +257,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 		storedOriginalCountry = existingOccupation.originalCountry
 		storedOriginalColor = existingOccupation.originalColor
 	else
-		storedOriginalCountry = originalCountry
+		storedOriginalCountry = geographicCountry
 		storedOriginalColor = OriginalColors[tilePart] or tilePart.Color
 	end
 
@@ -274,7 +274,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 	tilePart.Color = occupyingColor
 
 	if DEBUG then
-		print("[TileOwnership] " .. playerCountry .. " captured tile in " .. originalCountry)
+		print("[TileOwnership] " .. playerCountry .. " captured tile in " .. (geographicCountry or "unknown"))
 	end
 
 	-- Fire event to notify clients
@@ -291,6 +291,9 @@ function TileOwnershipManager.releaseTile(tilePart)
 	local data = OccupiedTerritories[tilePart]
 	if not data then return false end
 
+	-- Capture originalCountry before clearing the record
+	local originalCountry = data.originalCountry
+
 	-- Revert color
 	tilePart.Color = data.originalColor
 
@@ -301,7 +304,13 @@ function TileOwnershipManager.releaseTile(tilePart)
 	OccupiedTerritories[tilePart] = nil
 
 	if DEBUG then
-		print("[TileOwnership] Released tile back to " .. data.originalCountry)
+		print("[TileOwnership] Released tile back to " .. (originalCountry or "unknown"))
+	end
+
+	-- Notify clients so they cancel any in-flight tween and start one to the correct color
+	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
+	if TileCapturedEvent and originalCountry then
+		TileCapturedEvent:FireAllClients(tilePart, "", originalCountry)
 	end
 
 	return true
@@ -363,11 +372,18 @@ function TileOwnershipManager.releaseCountryOccupiedTiles(countryName)
 		end
 	end
 
+	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
+
 	-- Now iterate over the collected keys to release tiles
 	for _, tilePart in ipairs(tilesToRelease) do
 		local data = OccupiedTerritories[tilePart]
 		if data and tilePart and tilePart.Parent then
 			tilePart.Color = data.originalColor
+			-- Notify clients so any in-flight capture tween is cancelled and
+			-- the tile tweens back to its original owner's color correctly
+			if TileCapturedEvent and data.originalCountry then
+				TileCapturedEvent:FireAllClients(tilePart, "", data.originalCountry)
+			end
 		end
 		OccupiedTerritories[tilePart] = nil
 		releasedCount = releasedCount + 1
@@ -539,6 +555,9 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 		end
 	end
 
+	-- Grab the event once; used in all recolor paths below
+	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
+
 	-- 1. TRANSFER TILES (skip third-party occupied tiles)
 	local countryModel = EUROPE_MAP:FindFirstChild(losingCountryName)
 	if countryModel then
@@ -568,6 +587,9 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 							originalCountry = occupationData.originalCountry,
 							originalColor = occupationData.originalColor
 						}
+						if TileCapturedEvent then
+							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+						end
 					end
 				else
 					-- Unoccupied core territory — winner takes it.
@@ -580,6 +602,9 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 						originalCountry = losingCountryName,
 						originalColor = OriginalColors[part] or preColor
 					}
+					if TileCapturedEvent then
+						TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+					end
 				end
 			end
 		end
@@ -631,6 +656,9 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 							originalColor = OriginalColors[part]
 						}
 						part.Color = winningColor
+						if TileCapturedEvent then
+							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+						end
 					end
 				end
 			end
@@ -668,6 +696,9 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 				warn(string.format("[TileOwnership] winningColor is nil when transferring %s tile, skipping color update", tilePart.Name))
 			else
 				tilePart.Color = winningColor
+				if TileCapturedEvent then
+					TileCapturedEvent:FireAllClients(tilePart, winningPlayer.Name, winningCountry)
+				end
 			end
 
 			if DEBUG then
@@ -751,7 +782,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 		if loserStats then
 			local countryStat = loserStats:FindFirstChild("Country")
 			if countryStat then
-				countryStat.Value = "Defeated"
+				-- Use "None" (not "Defeated") so the client CountrySelectionScreen
+				-- re-opens on the next CharacterAdded. The defeat notification is
+				-- already sent via GlobalNotificationEvent above.
+				countryStat.Value = "None"
 			end
 		end
 

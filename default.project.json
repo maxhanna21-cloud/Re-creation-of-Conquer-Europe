@@ -42,6 +42,9 @@
       },
       "CountrySelectionScreen": {
         "$className": "ScreenGui",
+        "$properties": {
+          "Enabled": false
+        },
         "$ignoreUnknownInstances": true,
         "CountrySelectionScreen": { "$path": "src/client/CountrySelectionScreen.client.luau" }
       },
