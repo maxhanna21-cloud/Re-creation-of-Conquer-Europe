@@ -38,6 +38,9 @@ local OccupiedTiles = {}
 
 -- NEW: GLOBAL TILE OCCUPATION (for movement system): { ["x,z"] = npcModel }
 local GlobalOccupiedTiles = {}
+-- TileId-primary occupancy map (enabled conditionally when positional key ambiguity is high)
+local GlobalOccupiedTilesById = {}
+local UseTileIdOccupancy = nil
 
 -- Tile statistics for manpower calculation
 -- { [countryName] = { tileCount = N, totalArea = X, avgArea = Y } }
@@ -66,6 +69,32 @@ end
 -- Get the tile key from a BasePart (tile)
 function TileManager.getTileKeyFromPart(tilePart)
 	return TileKeyUtils.getTileKeyFromPart(tilePart)
+end
+
+local function shouldUseTileIdOccupancy()
+	if UseTileIdOccupancy ~= nil then
+		return UseTileIdOccupancy
+	end
+
+	local tam = getTileAdjacencyManager()
+	local ambiguous = 0
+	if tam.getAmbiguousPositionalBucketCount then
+		ambiguous = tam.getAmbiguousPositionalBucketCount() or 0
+	end
+	UseTileIdOccupancy = ambiguous > 10
+	print(string.format("[TileManager] TileId occupancy gate: ambiguous positional buckets=%d -> %s",
+		ambiguous, UseTileIdOccupancy and "ENABLED" or "DISABLED"))
+	return UseTileIdOccupancy
+end
+
+local function getTileIdFromKey(tileKey)
+	if not tileKey then return nil end
+	local tam = getTileAdjacencyManager()
+	local tilePart = tam.getTileFromKey(tileKey)
+	if not tilePart then
+		tilePart = tam.getTileFromKeyWithFallback(tileKey)
+	end
+	return tam.getTileId(tilePart)
 end
 
 ---------------------------------------------------
@@ -256,6 +285,12 @@ function TileManager.occupyTile(countryName, tileKey, npcModel)
 
 	-- Also update global tracking
 	GlobalOccupiedTiles[tileKey] = npcModel
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId then
+			GlobalOccupiedTilesById[tileId] = npcModel
+		end
+	end
 end
 
 -- Release a tile within a country
@@ -266,6 +301,12 @@ function TileManager.releaseTile(countryName, tileKey)
 
 	-- Also update global tracking
 	GlobalOccupiedTiles[tileKey] = nil
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId then
+			GlobalOccupiedTilesById[tileId] = nil
+		end
+	end
 end
 
 ---------------------------------------------------
@@ -275,6 +316,12 @@ end
 -- Occupy a tile globally (regardless of country)
 function TileManager.occupyTileGlobal(tileKey, npcModel)
 	GlobalOccupiedTiles[tileKey] = npcModel
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId then
+			GlobalOccupiedTilesById[tileId] = npcModel
+		end
+	end
 
 	-- Also try to update country-specific tracking if we can determine the country
 	local npcCountry = npcModel:GetAttribute("Country")
@@ -290,6 +337,12 @@ end
 function TileManager.releaseTileGlobal(tileKey)
 	local npcModel = GlobalOccupiedTiles[tileKey]
 	GlobalOccupiedTiles[tileKey] = nil
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId then
+			GlobalOccupiedTilesById[tileId] = nil
+		end
+	end
 
 	-- Also try to update country-specific tracking
 	if npcModel then
@@ -302,17 +355,29 @@ end
 
 -- Check if a tile is occupied globally
 function TileManager.isTileOccupied(tileKey)
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId and GlobalOccupiedTilesById[tileId] ~= nil then
+			return true
+		end
+	end
 	return GlobalOccupiedTiles[tileKey] ~= nil
 end
 
 -- Get the NPC occupying a tile
 function TileManager.getTileOccupant(tileKey)
+	if shouldUseTileIdOccupancy() then
+		local tileId = getTileIdFromKey(tileKey)
+		if tileId and GlobalOccupiedTilesById[tileId] then
+			return GlobalOccupiedTilesById[tileId]
+		end
+	end
 	return GlobalOccupiedTiles[tileKey]
 end
 
 -- Check if a tile is occupied by a specific player's NPC
 function TileManager.isTileOccupiedByPlayer(tileKey, player)
-	local npc = GlobalOccupiedTiles[tileKey]
+	local npc = TileManager.getTileOccupant(tileKey)
 	if not npc then return false end
 
 	-- Check if NPC is owned by this player
@@ -322,6 +387,26 @@ function TileManager.isTileOccupiedByPlayer(tileKey, player)
 	end
 
 	return false
+end
+
+function TileManager.occupyTileById(tileId, npcModel)
+	if not tileId then return end
+	GlobalOccupiedTilesById[tileId] = npcModel
+end
+
+function TileManager.releaseTileById(tileId)
+	if not tileId then return end
+	GlobalOccupiedTilesById[tileId] = nil
+end
+
+function TileManager.getTileOccupantById(tileId)
+	if not tileId then return nil end
+	return GlobalOccupiedTilesById[tileId]
+end
+
+function TileManager.isTileOccupiedById(tileId)
+	if not tileId then return false end
+	return GlobalOccupiedTilesById[tileId] ~= nil
 end
 
 ---------------------------------------------------

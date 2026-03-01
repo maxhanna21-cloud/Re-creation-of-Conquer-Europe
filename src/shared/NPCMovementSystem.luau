@@ -402,8 +402,8 @@ local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner
 				for _, neighbor in ipairs(neighbors) do
 					if not visited[neighbor] then
 						-- FIX v18: Check if this edge is excluded (failed walkability this move)
-						local keyA = TileKeyUtils.getTileKeyFromPart(current)
-						local keyB = TileKeyUtils.getTileKeyFromPart(neighbor)
+							local keyA = TileAdjacencyManager.getTileId(current)
+							local keyB = TileAdjacencyManager.getTileId(neighbor)
 						local isExcluded = false
 						if keyA and keyB then
 							local edgeParts = {keyA, keyB}
@@ -632,8 +632,8 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 
 		-- Add failed edge to this move's exclusion set (using stable TileKeys)
 		if walkabilityFailed then
-			local keyA = TileKeyUtils.getTileKeyFromPart(prevTile)
-			local keyB = TileKeyUtils.getTileKeyFromPart(currTile)
+			local keyA = TileAdjacencyManager.getTileId(prevTile)
+			local keyB = TileAdjacencyManager.getTileId(currTile)
 			if keyA and keyB then
 				-- Create stable edge ID (sorted lexicographically)
 				local edgeParts = {keyA, keyB}

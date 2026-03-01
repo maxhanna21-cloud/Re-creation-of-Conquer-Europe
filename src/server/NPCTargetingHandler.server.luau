@@ -210,16 +210,20 @@ local function handleTileClick(player, tilePart)
 
 	-- FIX: Check if target tile is directly adjacent before allowing movement
 	-- MUST verify adjacency - block movement if we can't determine current tile
-	local currentTileKey = npcModel:GetAttribute("TileKey")
-	if not currentTileKey then
-		print("Movement failed: NPC has no current tile")
-		clearSelection(player)
-		return
-	end
-
-	local currentTilePart = TileAdjacencyManager.getTileFromKey(currentTileKey)
+	local currentTileId = npcModel:GetAttribute("CurrentTileId")
+	local currentTilePart = currentTileId and TileAdjacencyManager.getTileFromId(currentTileId) or nil
 	if not currentTilePart then
-		currentTilePart = TileAdjacencyManager.getTileFromKeyWithFallback(currentTileKey)
+		local currentTileKey = npcModel:GetAttribute("TileKey")
+		if not currentTileKey then
+			print("Movement failed: NPC has no current tile")
+			clearSelection(player)
+			return
+		end
+
+		currentTilePart = TileAdjacencyManager.getTileFromKey(currentTileKey)
+		if not currentTilePart then
+			currentTilePart = TileAdjacencyManager.getTileFromKeyWithFallback(currentTileKey)
+		end
 	end
 	if not currentTilePart then
 		print("Movement failed: Could not resolve NPC's current tile")
@@ -273,9 +277,21 @@ local function handleTileClick(player, tilePart)
 		-- FIX v12.2: Full diagnostic when adjacency fails
 		TileAdjacencyManager.diagnoseAdjacency(currentTilePart, tilePart)
 
-		print("Movement failed: Target tile (" .. tilePart.Name .. ") is not adjacent to current tile (" .. currentTilePart.Name .. ")")
-		clearSelection(player)
-		return
+		local repaired = TileAdjacencyManager.tryRepairAdjacencyPair(currentTilePart, tilePart)
+		if repaired then
+			isAdjacent = TileAdjacencyManager.areTilesAdjacent(currentTilePart, tilePart)
+			if isAdjacent then
+				print(string.format("[Movement] Repaired adjacency at runtime: %s <-> %s", currentTilePart.Name, tilePart.Name))
+			end
+		else
+			print(string.format("[Movement] Runtime adjacency repair did not connect: %s <-> %s", currentTilePart.Name, tilePart.Name))
+		end
+
+		if not isAdjacent then
+			print("Movement failed: Target tile (" .. tilePart.Name .. ") is not adjacent to current tile (" .. currentTilePart.Name .. ")")
+			clearSelection(player)
+			return
+		end
 	end
 
 	-- Secondary validation: confirm a walkable crossing proof exists for this pair.
