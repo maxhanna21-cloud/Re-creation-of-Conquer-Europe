@@ -50,6 +50,7 @@ local defenderAttackers = {}  -- Tracks who is attacking each Defender
 local attackerThreats = {}    -- Tracks who is attacking each Attacker (for auto-retaliation)
 local pathTimestamps = {}
 local debugParts = {}
+local npcInCombat = {}  -- npcModel -> bool: tracks active combat state for Health script management
 
 -- Manual targets: stores a LIST of targets for each attacker
 -- manualTargets[npcModel] = { targetModel1, targetModel2, ... }
@@ -89,6 +90,35 @@ local function setupDeathCleanup(npcModel)
 		Combat.unregisterNPC(npcModel)
 		Debris:AddItem(npcModel, 0.5)
 	end)
+end
+
+-- Enable or disable the Health regeneration script inside an NPC model
+local function setHealthScriptEnabled(npcModel, enabled)
+	if not npcModel then return end
+	local healthScript = npcModel:FindFirstChild("Health", true)
+	if healthScript and (healthScript:IsA("Script") or healthScript:IsA("LocalScript")) then
+		healthScript.Enabled = enabled
+		if DEBUG then
+			print("[Combat] Health script " .. (enabled and "enabled" or "disabled") .. " for " .. npcModel.Name)
+		end
+	end
+end
+
+-- Update the NPC's combat state and manage its Health script accordingly.
+-- Called each combat-loop iteration with the current count of valid targets.
+local function updateCombatHealthState(npcModel, inCombat)
+	if npcInCombat[npcModel] == inCombat then return end  -- State unchanged; skip
+	npcInCombat[npcModel] = inCombat
+	if inCombat then
+		-- Entering combat: always disable the Health script
+		setHealthScriptEnabled(npcModel, false)
+	else
+		-- Leaving combat: re-enable Health only when the NPC is also not moving
+		local isMoving = npcModel:GetAttribute("IsMoving") == true
+		if not isMoving then
+			setHealthScriptEnabled(npcModel, true)
+		end
+	end
 end
 
 local function drawDebugLine(name, startPos, endPos, color, lifetime)
@@ -217,6 +247,9 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 
 			local allTargets = getAllTargets() -- Returns ALL valid target humanoids
 
+			-- Sync Health script with current combat state
+			updateCombatHealthState(npcModel, #allTargets > 0)
+
 			-- Only go idle if country-owned AND no targets/threats
 			if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
 				-- No active player owner AND no threats - NPC is idle
@@ -299,6 +332,9 @@ local function startDefenderCombatLoop(npcModel, getAllTargets)
 			local now = os.clock()
 
 			local allTargets = getAllTargets()
+
+			-- Sync Health script with current combat state
+			updateCombatHealthState(npcModel, #allTargets > 0)
 
 			-- Only go idle if country-owned AND no threats
 			if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
@@ -667,6 +703,7 @@ function Combat.unregisterNPC(npcModel)
 	attackerThreats[npcModel] = nil
 	pathTimestamps[npcModel] = nil
 	combatLoops[npcModel] = nil
+	npcInCombat[npcModel] = nil
 end
 
 -- Track when an attacker is targeting a defender (for defender auto-retaliation)
@@ -778,6 +815,12 @@ end
 function Combat.getOwner(npc) return npcOwners[npc] end
 function Combat.getRole(npc) return npcRoles[npc] end
 function Combat.isLoopRunning(npc) return combatLoops[npc] ~= nil end
+
+-- Returns true when the NPC currently has active combat targets or is being attacked.
+-- Used by NPCMovementSystem and NPCTargetingHandler to block/gate movement.
+function Combat.isInCombat(npc)
+	return npcInCombat[npc] == true
+end
 
 function Combat.getAttackerCount(defenderModel)
 	local attackers = defenderAttackers[defenderModel]

@@ -303,6 +303,13 @@ local function handleTileClick(player, tilePart)
 		return
 	end
 
+	-- Block movement while the NPC is engaged in combat
+	if Combat.isInCombat(npcModel) then
+		print("[Movement] " .. npcModel.Name .. " cannot move: currently engaged in combat")
+		clearSelection(player)
+		return
+	end
+
 	-- Check if NPC is moving (cancel current movement for new order)
 	if NPCMovementSystem.isMoving(npcModel) then
 		NPCMovementSystem.cancelMovement(npcModel)

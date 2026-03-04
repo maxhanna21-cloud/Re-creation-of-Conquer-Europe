@@ -61,6 +61,7 @@ local SAFE_CENTER_GROUND_TOLERANCE = 100 -- INCREASED: Allows NPCs to "see" the 
 -- local MOVEMENT_EDGE_CHECK_DISTANCE = 3   -- studs ahead to check for ground during movement
 local MOVEMENT_PATH_DRIFT_MAX = 5        -- max studs NPC can drift from origin-to-target line before correction
 local EDGE_ARRIVAL_THRESHOLD = 2         -- tighter arrival threshold for edge-crossing waypoints (studs)
+local FINAL_TILE_ARRIVAL_THRESHOLD = 1.0 -- XZ-only threshold for the very last tile-centre waypoint (no MoveToFinished)
 local MAX_FALL_RECOVERIES = 3            -- FIX v9: max consecutive fall recoveries before aborting movement
 local FALL_RECOVERY_RESET_TIME = 5.0     -- FIX v9: seconds of no falls before counter resets
 
@@ -85,6 +86,18 @@ end
 local function getHumanoid(model)
 	if not model then return nil end
 	return model:FindFirstChildOfClass("Humanoid")
+end
+
+-- Enable or disable the Health regeneration script inside an NPC model
+local function setNPCHealthScriptEnabled(npcModel, enabled)
+	if not npcModel then return end
+	local healthScript = npcModel:FindFirstChild("Health", true)
+	if healthScript and (healthScript:IsA("Script") or healthScript:IsA("LocalScript")) then
+		healthScript.Enabled = enabled
+		if DEBUG then
+			print("[NPCMovement] Health script " .. (enabled and "enabled" or "disabled") .. " for " .. npcModel.Name)
+		end
+	end
 end
 
 local function getTileSpawnPosition(tilePart)
@@ -894,11 +907,15 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 				end
 			end
 
-			-- Insert the edge midpoint as a waypoint
+			-- Insert the edge midpoint as a waypoint, tagged with currTile so that
+			-- the arrival pathfinding block below (line ~923) runs and generates
+			-- intermediate waypoints from the border to the destination tile center.
+			-- (Previously tagged prevTile, which silently skipped arrival pathfinding
+			-- for all touching-tile moves, causing the NPC to stop 8+ studs from center.)
 			table.insert(waypoints, {
 				type = "edge",
 				position = edgeMidpoint,
-				tile = prevTile
+				tile = currTile
 			})
 		end
 
@@ -1125,15 +1142,22 @@ local function startGroundCheck(npcModel)
 						local safePos = getTileSpawnPosition(tilePart)
 						if safePos then
 							local driftXZ = ((root.Position - safePos) * Vector3.new(1,0,1)).Magnitude
-							if driftXZ > IDLE_DRIFT_THRESHOLD then
+							-- FIX jitter: suppress drift correction for 1 second after movement stops.
+							-- Without this, stopMovement's MoveTo(root.Position) and this nudge fire
+							-- almost simultaneously, creating a brief visible jitter.
+							local stateData = movementStates[npcModel]
+							local timeSinceStop = os.clock() - (stateData and stateData.lastStopTime or 0)
+							local timeSinceNudge = os.clock() - (stateData and stateData.lastNudgeTime or 0)
+							-- Only issue a new MoveTo once per 4 seconds so the humanoid walks
+							-- back at full natural speed without being interrupted every 100ms.
+							if driftXZ > IDLE_DRIFT_THRESHOLD and timeSinceStop > 1.0 and timeSinceNudge > 4.0 then
 								if DEBUG then
-									print("[NPCMovement:GroundCheck] Drifting idle NPC " .. npcModel.Name .. " is " .. string.format("%.1f", driftXZ) .. " studs from center, snapping back")
+									print("[NPCMovement:GroundCheck] Idle NPC " .. npcModel.Name .. " is " .. string.format("%.1f", driftXZ) .. " studs from center, walking back")
 								end
-								root.AssemblyLinearVelocity = Vector3.new(0,0,0)
-								npcModel:PivotTo(CFrame.new(safePos))
+								root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
 								local humanoid = getHumanoid(npcModel)
 								if humanoid then humanoid:MoveTo(safePos) end
-								if DEBUG then print("[NPCMovement] Snapped idle " .. npcModel.Name .. " back to center") end
+								if stateData then stateData.lastNudgeTime = os.clock() end
 							end
 						end
 					end
@@ -1214,11 +1238,24 @@ local function stopMovement(npcModel, newState)
 	movementStates[npcModel].state = newState or "Idle"
 	movementStates[npcModel].moveAttempts = 0
 	movementStates[npcModel].stuckSince = nil
+	movementStates[npcModel].lastStopTime = os.clock()
 
+	-- Freeze the humanoid at its current position (used for abort/retreat/stuck paths).
+	-- Natural tile-arrival does NOT go through stopMovement, so this never interferes
+	-- with the humanoid's final walk to tile centre.
 	local humanoid = getHumanoid(npcModel)
 	local root = getRootPart(npcModel)
 	if humanoid and root then
 		humanoid:MoveTo(root.Position)
+	end
+
+	-- Clear the moving flag and re-enable the Health script if the NPC is not in combat
+	if npcModel and npcModel.Parent then
+		npcModel:SetAttribute("IsMoving", nil)
+		getDependencies()
+		if Combat and not Combat.isInCombat(npcModel) then
+			setNPCHealthScriptEnabled(npcModel, true)
+		end
 	end
 
 	if DEBUG then
@@ -1266,16 +1303,15 @@ local function monitorMovement(npcModel, isRetreat)
 
 	local distanceXZ = ((root.Position - waypointPos) * Vector3.new(1,0,1)).Magnitude
 
-	-- Use tighter arrival threshold for edge waypoints (must reach edge precisely)
-	local arrivalThreshold = (currentWP.type == "tile") and ARRIVAL_THRESHOLD or EDGE_ARRIVAL_THRESHOLD
+	-- Use tighter arrival threshold for edge waypoints (must reach edge precisely).
+	-- For the very last tile-centre waypoint use a 1-stud XZ threshold so the NPC
+	-- physically walks all the way to the centre before any game logic fires.
+	local isFinalTileDest = (currentWaypoint == #enrichedWaypoints) and (currentWP.type == "tile")
+	local arrivalThreshold = isFinalTileDest and FINAL_TILE_ARRIVAL_THRESHOLD
+		or (currentWP.type == "tile" and ARRIVAL_THRESHOLD or EDGE_ARRIVAL_THRESHOLD)
 
 	-- ARRIVAL AT WAYPOINT
 	if distanceXZ <= arrivalThreshold then
-		-- Snap to waypoint only for tile waypoints (snapping to edge could be risky)
-		if currentWP.type == "tile" then
-			npcModel:PivotTo(CFrame.new(waypointPos))
-		end
-
 		if isRetreat then
 			if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " retreat complete") end
 			stopMovement(npcModel, "Idle")
@@ -1345,84 +1381,99 @@ local function monitorMovement(npcModel, isRetreat)
 				end
 			end
 
+			-- Normal intermediate progression.
+			-- The heartbeat keeps running for every waypoint, including the final
+			-- tile centre.  FINAL_TILE_ARRIVAL_THRESHOLD (1 stud) ensures the NPC
+			-- walks all the way there before game logic fires — no MoveToFinished needed.
 			local nextWaypointPosition = enrichedWaypoints[currentWaypoint].position
 			if humanoid and nextWaypointPosition then
-				humanoid:MoveTo(nextWaypointPosition)
+				-- Walk toward the XZ centre at the NPC's current floor height so the
+				-- humanoid navigates horizontally without fighting an elevated target Y.
+				humanoid:MoveTo(Vector3.new(nextWaypointPosition.X, root.Position.Y, nextWaypointPosition.Z))
 			end
 			return
 		end
 
-		-- FINAL DESTINATION REACHED: occupancy / capture logic
-		local targetTileKey = movement.targetTileKey
-		local originTileKey = movement.originTileKey
+		-- FINAL DESTINATION REACHED
+		-- The heartbeat XZ check above (FINAL_TILE_ARRIVAL_THRESHOLD = 1 stud) fired,
+		-- meaning the NPC is physically at the tile centre.  Run all game logic now.
+		getDependencies()
 		local owner = Combat.getOwner(npcModel)
 		local role = Combat.getRole(npcModel)
-
+		local targetTileKey = movement.targetTileKey
+		local originTileKey = movement.originTileKey
+		local originPosition = movement.originPosition
 		local targetTilePart = TileAdjacencyManager.getTileFromKey(targetTileKey)
 		local tileCountry = TileAdjacencyManager.getTileCountry(targetTilePart)
 		local playerCountry = owner and TileManager.getPlayerCountry(owner)
 
+		-- Occupancy check — is another NPC already here?
 		local currentOccupant = TileManager.getTileOccupant(targetTileKey)
 		local isOccupiedByOther = currentOccupant ~= nil and currentOccupant ~= npcModel
 
 		if isOccupiedByOther then
-			if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " tile occupied by " .. currentOccupant.Name .. ", retreating") end
-			NPCMovementSystem.startRetreat(npcModel, originTileKey, movement.originPosition)
-			return
-		else
-			-- release old tile
-			if originTileKey then
-				TileManager.releaseTile(npcModel:GetAttribute("Country"), originTileKey)
-			end
-
-			-- occupy new tile
-			TileManager.occupyTileGlobal(targetTileKey, npcModel)
-			npcModel:SetAttribute("TileKey", targetTileKey)
-			-- Fix C: Also store stable CurrentTileId (unique TileId of the tile part) for reliable adjacency resolution
-			local arrivalTileId = TileAdjacencyManager.getTileId(targetTilePart)
-			if arrivalTileId then
-				npcModel:SetAttribute("CurrentTileId", arrivalTileId)
-			end
-
-			if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
-				TileOwnershipManager.captureTile(targetTilePart, owner)
-
-				-- FIX: Check if this tile is the ACTUAL capital of the country being invaded
-				-- tileCountry = geographic region name (e.g., "Germany"), never changes even after conquest
-				local actualCapital = TileManager.getCountryCapital(tileCountry)
-
-				if actualCapital and targetTilePart == actualCapital then
-					-- CRITICAL GUARD: Only trigger capital conquest if the region is still "alive"
-					-- (owned by a Player, not already conquered)
-					-- FIX: Use ServerState.resolveCountryOwner() to handle conquest chains
-					-- Example: France → Conquered_Germany → Conquered_Poland → PlayerPolish
-					local currentOwner = ServerState.resolveCountryOwner(tileCountry)
-
-					-- Check if the chain resolves to an active Player
-					if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
-						-- This is the region's capital AND the region is ultimately owned by a live player
-						safeCapitalCapture(tileCountry, owner)
-					elseif ServerState.isCountryUnowned(tileCountry) then
-						-- Unowned country capital captured — trigger takeover
-						safeCapitalCapture(tileCountry, owner)
-					else
-						-- Region is conquered (chain resolves to nil or non-Player) - treat as normal tile capture
-						if DEBUG then
-							print(string.format("[NPCMovement] Captured %s's capital, but %s is already conquered (resolved owner: %s)",
-								tileCountry, tileCountry, tostring(currentOwner or "nil")))
-						end
-					end
-				end
-			elseif tileCountry and tileCountry == playerCountry then
-				if TileOwnershipManager.isOccupied(targetTilePart) and not TileOwnershipManager.isOccupiedBy(targetTilePart, owner) then
-					TileOwnershipManager.reclaimTile(targetTilePart, owner)
-				end
-			end
-
-			if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " arrived at " .. targetTileKey) end
-			stopMovement(npcModel, "Idle")
+			if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " tile occupied by " .. currentOccupant.Name .. ", retreating from center") end
+			NPCMovementSystem.startRetreat(npcModel, originTileKey, originPosition)
 			return
 		end
+
+		-- Release old tile, claim new tile
+		if originTileKey then
+			TileManager.releaseTile(npcModel:GetAttribute("Country"), originTileKey)
+		end
+		TileManager.occupyTileGlobal(targetTileKey, npcModel)
+		npcModel:SetAttribute("TileKey", targetTileKey)
+		local arrivalTileId = TileAdjacencyManager.getTileId(targetTilePart)
+		if arrivalTileId then
+			npcModel:SetAttribute("CurrentTileId", arrivalTileId)
+		end
+
+		-- Tile capture / capital conquest logic
+		if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
+			TileOwnershipManager.captureTile(targetTilePart, owner)
+			local actualCapital = TileManager.getCountryCapital(tileCountry)
+			if actualCapital and targetTilePart == actualCapital then
+				local currentOwner = ServerState.resolveCountryOwner(tileCountry)
+				if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
+					safeCapitalCapture(tileCountry, owner)
+				elseif ServerState.isCountryUnowned(tileCountry) then
+					safeCapitalCapture(tileCountry, owner)
+				else
+					if DEBUG then
+						print(string.format("[NPCMovement] Captured %s's capital, but %s is already conquered (resolved owner: %s)",
+							tileCountry, tileCountry, tostring(currentOwner or "nil")))
+					end
+				end
+			end
+		elseif tileCountry and tileCountry == playerCountry then
+			if TileOwnershipManager.isOccupied(targetTilePart) and not TileOwnershipManager.isOccupiedBy(targetTilePart, owner) then
+				TileOwnershipManager.reclaimTile(targetTilePart, owner)
+			end
+		end
+
+		if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " arrived at " .. targetTileKey) end
+
+		-- Zero residual velocity so the NPC stands still
+		local stopRoot = getRootPart(npcModel)
+		if stopRoot then stopRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end
+
+		if activeMovements[npcModel] then
+			releaseTileReservation(targetTileKey, npcModel)
+			activeMovements[npcModel] = nil
+		end
+		movementStates[npcModel] = movementStates[npcModel] or {}
+		movementStates[npcModel].state = "Idle"
+		movementStates[npcModel].moveAttempts = 0
+		movementStates[npcModel].stuckSince = nil
+		movementStates[npcModel].lastStopTime = os.clock()
+		if npcModel and npcModel.Parent then
+			npcModel:SetAttribute("IsMoving", nil)
+			if Combat and not Combat.isInCombat(npcModel) then
+				setNPCHealthScriptEnabled(npcModel, true)
+			end
+		end
+		if DEBUG then print("[NPCMovement] " .. npcModel.Name .. " reached tile centre of " .. targetTileKey) end
+		return
 	end
 
 	-- STILL MOVING: Apply path correction to keep NPC on safe corridor
@@ -1443,7 +1494,14 @@ local function monitorMovement(npcModel, isRetreat)
 		return
 	end
 
-	humanoid:MoveTo(effectiveTarget)
+	-- For the final tile-centre waypoint, flatten the target to the NPC's current
+	-- floor Y so the humanoid navigates horizontally rather than toward an elevated
+	-- point.  The heartbeat XZ check (FINAL_TILE_ARRIVAL_THRESHOLD) handles arrival.
+	if isFinalTileDest then
+		humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))
+	else
+		humanoid:MoveTo(effectiveTarget)
+	end
 
 	-- STUCK detection sampling
 	movementStates[npcModel] = movementStates[npcModel] or {}
@@ -1825,6 +1883,10 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 	movementStates[npcModel].stuckSince = nil
 	movementStates[npcModel].moveAttempts = 0
 	movementStates[npcModel].fallRecoveries = 0  -- FIX v9: Reset fall recovery counter on new movement
+
+	-- Mark as moving and disable the Health regeneration script for the duration
+	npcModel:SetAttribute("IsMoving", true)
+	setNPCHealthScriptEnabled(npcModel, false)
 
 	-- Build enriched waypoints with edge-crossing points for gap tiles
 	local enrichedWaypoints, directEdgeFailed = buildEnrichedWaypoints(tilePath, excludedEdges)
