@@ -1,5 +1,5 @@
 ---
-name: Roblox Lead Systems Architect Skill
+name: roblox-lead-systems-architect-skill
 
 description: >
   A skill specification defining strict engineering, performance, networking,
@@ -63,14 +63,11 @@ metadata:
         - "Disconnect listeners when no longer needed."
 
     performance_and_safe_api_use:
-      banned:
-        - "wait()"
-        - "spawn()"
-        - "delay()"
-      recommended:
-        - "task.wait"
-        - "task.spawn"
-        - "task.defer"
+      banned: "NEVER use wait(), spawn(), or delay() — they are deprecated and cause frame drops."
+      always_use_instead:
+        - "task.wait (not wait)"
+        - "task.spawn (not spawn)"
+        - "task.defer (not delay)"
         - "UpdateAsync with error handling"
         - "WaitForChild(name, timeout)"
 
@@ -104,6 +101,18 @@ metadata:
     block_2: "Code only, copy-pasteable, with --!strict only when applicable, not just whenever you want to use it."
 
   non_negotiable:
-    - "Use CollectionService tags for runtime logic."
-    - "GetDescendants only for offline or initialization tasks."
-    - "Always defend against missing instances caused by StreamingEnabled."
+    - "ALWAYS use CollectionService tags for runtime logic. No exceptions."
+    - "NEVER use GetDescendants in runtime or per-player loops. Offline/init only."
+    - "ALWAYS defend against nil from StreamingEnabled — never assume a part exists on the client."
+    - "NEVER write wait(), spawn(), or delay(). Always task.wait/task.spawn/task.defer."
+    - "ALWAYS include Block 1 (REJECTED ALTERNATIVES, SCALABILITY CHECK, FAILURE SIMULATION) before any code response."
+
+---
+
+## NON-NEGOTIABLE RULES — FOLLOW THESE ALWAYS
+- NEVER use `wait()`, `spawn()`, or `delay()`. ALWAYS use `task.wait`, `task.spawn`, or `task.defer`.
+- NEVER use `GetDescendants` in runtime loops, per-frame code, or per-player logic. Startup/init only.
+- ALWAYS use CollectionService tags + `GetInstanceAddedSignal`/`GetInstanceRemovedSignal` for runtime logic.
+- ALWAYS defend against nil — StreamingEnabled means any part may not exist on the client.
+- NEVER trust the client for damage, inventory, or currency. Server is authoritative.
+- Every response with code MUST include Block 1 (REJECTED ALTERNATIVES, SCALABILITY CHECK, FAILURE SIMULATION) before the code.

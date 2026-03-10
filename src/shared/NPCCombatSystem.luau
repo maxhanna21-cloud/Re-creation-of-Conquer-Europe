@@ -491,6 +491,15 @@ function Combat.removeManualTarget(attackerModel, targetModel)
 	for i, existing in ipairs(targets) do
 		if existing == targetModel then
 			table.remove(targets, i)
+
+			-- Reciprocal cleanup: remove attackerModel from the target's tracking list
+			local targetRole = npcRoles[targetModel]
+			if targetRole == "Defender" then
+				Combat.removeAttackerFromDefender(attackerModel, targetModel)
+			elseif targetRole == "Attacker" then
+				Combat.removeThreatFromAttacker(attackerModel, targetModel)
+			end
+
 			if DEBUG then
 				print("[Combat] " .. targetModel.Name .. " removed from " .. attackerModel.Name .. "'s targets")
 			end
@@ -501,9 +510,24 @@ function Combat.removeManualTarget(attackerModel, targetModel)
 	return false
 end
 
--- Clear all manual targets
+-- Clear all manual targets and clean up reciprocal tracking lists
 function Combat.clearAllManualTargets(attackerModel)
 	if not attackerModel then return end
+
+	local targets = manualTargets[attackerModel]
+	if targets then
+		for _, target in ipairs(targets) do
+			if target then
+				local targetRole = npcRoles[target]
+				if targetRole == "Defender" then
+					Combat.removeAttackerFromDefender(attackerModel, target)
+				elseif targetRole == "Attacker" then
+					Combat.removeThreatFromAttacker(attackerModel, target)
+				end
+			end
+		end
+	end
+
 	manualTargets[attackerModel] = nil
 end
 
@@ -747,22 +771,47 @@ function Combat.noteTargetingAttacker(aggressorModel, victimAttackerModel)
 end
 
 -- Record that attackerNpc hit targetNpc.
--- Only records threat for NPCs with AutoRetaliate=true (country-owned starter NPCs).
--- Player-owned NPCs are unaffected (no AutoRetaliate attribute set on them).
+-- Disengage logic applies to ALL AttackerNPCs (player-owned and country-owned).
+-- Auto-retaliation (threat tracking) only applies to NPCs with AutoRetaliate=true.
 function Combat.noteHit(attackerNpc, targetNpc)
 	if not attackerNpc or not targetNpc then return end
 	if targetNpc:GetAttribute("Dead") then return end
-	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
 
 	local targetRole = npcRoles[targetNpc]
+
+	-- When any AttackerNPC is hit by an enemy that it is NOT already
+	-- manually targeting, it disengages from all current manual targets
+	-- so it stops its offensive. This applies to ALL AttackerNPCs.
+	-- Only manualTargets is checked (not attackerThreats), because threats
+	-- are registered early via handleSecondClick before combat even starts.
+	if targetRole == "Attacker" then
+		local alreadyTargeting = false
+
+		local targets = manualTargets[targetNpc]
+		if targets then
+			for _, t in ipairs(targets) do
+				if t == attackerNpc then
+					alreadyTargeting = true
+					break
+				end
+			end
+		end
+
+		if not alreadyTargeting then
+			Combat.clearAllManualTargets(targetNpc)
+			if DEBUG then
+				print("[Combat] " .. targetNpc.Name .. " disengaged from manual targets after being attacked by " .. attackerNpc.Name)
+			end
+		end
+	end
+
+	-- Auto-retaliation threat tracking only for AutoRetaliate NPCs (country-owned)
+	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
+
 	if targetRole == "Defender" then
-		-- attackerModel = shooterNpc, defenderModel = targetNpc (victim)
 		Combat.noteAttackerTargeting(attackerNpc, targetNpc)
 	elseif targetRole == "Attacker" then
-		-- aggressorModel = attackerNpc (shooter), victimAttackerModel = targetNpc (victim)
 		Combat.noteTargetingAttacker(attackerNpc, targetNpc)
-	else
-		warn("[noteHit] Missing/unknown role for target:", targetNpc, targetRole)
 	end
 end
 

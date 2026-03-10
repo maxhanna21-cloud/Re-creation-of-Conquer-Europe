@@ -6,21 +6,46 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
 
--- Configuration
-local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
-local COUNTRY_SELECTION_GUI_NAME = "CountrySelectionScreen"
-local ServerState = require(game:GetService("ServerScriptService"):WaitForChild("ServerState", 10))
-local TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileManager", 10))
--- DiplomacyManager NOT cleared when player leaves (wars persist)
-local DiplomacyManager = require(game:GetService("ServerScriptService"):WaitForChild("DiplomacyManager", 10))
-local NPCSpawner = require(game:GetService("ServerScriptService"):WaitForChild("NPCSpawner", 10))
-local CountryClaimedEvent = ReplicatedStorage:FindFirstChild("CountryClaimedEvent")
-
 -- Core Data
 local CountryOwners = {}
 
 -- Track initialization state
 local isInitialized = false
+
+-- Forward-declare modules (assigned after require below)
+local TileManager = nil
+
+---------------------------------------------------
+-- EARLY SETUP: Register OnServerInvoke BEFORE heavy module requires.
+-- If a client calls InvokeServer() before this handler exists, Roblox
+-- hangs the call indefinitely — which is the root cause of the intermittent
+-- black/missing country-selection screen.
+---------------------------------------------------
+local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 10)
+if GetAvailableCountries then
+	GetAvailableCountries.OnServerInvoke = function()
+		if not isInitialized or not TileManager then
+			return {}
+		end
+		local ok, result = pcall(TileManager.getAvailableCountries)
+		if ok then
+			return result
+		else
+			warn("GetAvailableCountries crashed!")
+			return {}
+		end
+	end
+end
+
+-- Configuration (heavy requires — these can yield for seconds while scanning tiles)
+local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
+local COUNTRY_SELECTION_GUI_NAME = "CountrySelectionScreen"
+local ServerState = require(game:GetService("ServerScriptService"):WaitForChild("ServerState", 10))
+TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileManager", 10))
+-- DiplomacyManager NOT cleared when player leaves (wars persist)
+local DiplomacyManager = require(game:GetService("ServerScriptService"):WaitForChild("DiplomacyManager", 10))
+local NPCSpawner = require(game:GetService("ServerScriptService"):WaitForChild("NPCSpawner", 10))
+local CountryClaimedEvent = ReplicatedStorage:FindFirstChild("CountryClaimedEvent")
 
 -- Income Loop States
 local CoinLoopRunning = false
@@ -579,30 +604,20 @@ end
 ---------------------------------------------------
 
 local SelectCountryEvent = ReplicatedStorage:WaitForChild("SelectCountryEvent", 10)
-local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 10)
+-- GetAvailableCountries handler was registered early (top of script) to prevent InvokeServer hangs.
 local InitializationComplete = ReplicatedStorage:WaitForChild("InitializationComplete", 10)
 
 SelectCountryEvent.OnServerEvent:Connect(handleCountrySelection)
-
-GetAvailableCountries.OnServerInvoke = function()
-	if not isInitialized then
-		warn("[CountryManager] GetAvailableCountries called before initialization.")
-		return {}
-	end
-
-	local ok, result = pcall(TileManager.getAvailableCountries)
-	if ok then
-		return result
-	else
-		warn("GetAvailableCountries crashed!")
-		return {}
-	end
-end
 
 Players.PlayerAdded:Connect(function(player)
 	player.CharacterRemoving:Connect(function(character)
 		onCharacterRemoving(player, character)
 	end)
+	-- Players who join after the initial FireAllClients would never receive InitializationComplete.
+	-- Fire it directly to each late joiner so their client can open the selection screen.
+	if isInitialized then
+		InitializationComplete:FireClient(player)
+	end
 end)
 
 for _, player in ipairs(Players:GetPlayers()) do

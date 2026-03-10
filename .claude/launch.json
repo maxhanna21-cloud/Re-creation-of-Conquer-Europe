@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Rojo",
+      "runtimeExecutable": "rojo",
+      "runtimeArgs": ["serve", "default.project.json"],
+      "port": 34872
+    }
+  ]
+}

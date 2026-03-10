@@ -16,6 +16,10 @@ local countryScreen = gui:WaitForChild("CountrySelectionScreen", 15)
 local CountryList = countryScreen:WaitForChild("CountryFrame", 10):WaitForChild("CountryList", 10)
 local ButtonTemplate = CountryList:WaitForChild("CountryButtonTemplate", 10)
 
+-- Ensure the screen starts DISABLED so a failed fetch never leaves a black screen
+-- (the ScreenGui's default Enabled state in Studio is unpredictable)
+countryScreen.Enabled = false
+
 local buttonConnections = {}
 local isOpening = false -- Guard to prevent overlapping logic
 
@@ -67,38 +71,42 @@ local function tryOpenMenu(force)
 			return
 		end
 
-		-- 2. Fetch countries with a retry loop
-		local attempts = 0
-		local maxAttempts = 10
+		-- 2. Fetch countries - retry indefinitely until server is ready.
+		--    Hard attempt cap removed: the old 30-attempt ceiling caused permanent
+		--    silent failure whenever server init exceeded 30 s or InvokeServer hiccuped.
 		local successData = nil
+		local pollAttempt = 0
 
-		while attempts < maxAttempts do
+		while not successData do
+			pollAttempt += 1
 			local ok, result = pcall(function()
 				return GetAvailableCountries:InvokeServer()
 			end)
 
 			if ok and type(result) == "table" and #result > 0 then
 				successData = result
-				break
+			else
+				task.wait(2)
+				-- Re-check mid-wait: bail if the player claimed a country another way
+				local ls = player:FindFirstChild("leaderstats")
+				local cs = ls and ls:FindFirstChild("Country")
+				local cv = cs and cs.Value or ""
+				if cv ~= "" and cv ~= "None" and cv ~= "Defeated" then
+					countryScreen.Enabled = false
+					return
+				end
 			end
-			
-			attempts = attempts + 1
-			task.wait(0.5) -- Faster polling for smoother feel
 		end
 
-		if successData then
-			-- Final check before showing UI
-			local currentStat = player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Country")
-			local currentVal = currentStat and currentStat.Value or ""
-			
-			if currentVal == "" or currentVal == "None" or currentVal == "Defeated" then
-				buildCountryList(successData)
-				countryScreen.Enabled = true
-			else
-				countryScreen.Enabled = false
-			end
+		-- Final check before showing UI
+		local currentStat = player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Country")
+		local currentVal = currentStat and currentStat.Value or ""
+
+		if currentVal == "" or currentVal == "None" or currentVal == "Defeated" then
+			buildCountryList(successData)
+			countryScreen.Enabled = true
 		else
-			warn("[CountrySelection] Failed to retrieve country list. Map might still be scanning.")
+			countryScreen.Enabled = false
 		end
 	end)
 
@@ -119,33 +127,22 @@ task.defer(function()
 end)
 
 -- 2. Server Initialization Complete
+-- Only trigger if the polling loop isn't already running. Prevents a second
+-- concurrent loop from spawning and conflicting with the first.
 InitializationComplete.OnClientEvent:Connect(function()
-	tryOpenMenu(true)
+	if not isOpening then
+		tryOpenMenu(false)
+	end
 end)
 
 -- 3. Respawn / Character Added Handler
+-- With ResetOnSpawn=true a brand-new LocalScript handles every spawn, so this
+-- only fires for a subsequent spawn while THIS script instance is still alive.
+-- Guard against spawning a second loop if the first one is still running.
 player.CharacterAdded:Connect(function()
-	-- Proactive check: if we are respawning, we usually need the menu or a refresh
-	task.spawn(function()
-		-- Poll for leaderstats to catch "Defeated" or "None" status immediately
-		for _ = 1, 40 do -- Increase poll frequency for better "feel"
-			local leaderstats = player:FindFirstChild("leaderstats")
-			if leaderstats then
-				local countryStat = leaderstats:FindFirstChild("Country")
-				if countryStat then
-					local val = countryStat.Value
-					if val == "None" or val == "" or val == "Defeated" then
-						tryOpenMenu(true) -- Force open because we know they are country-less
-					else
-						countryScreen.Enabled = false -- Ensure hidden if they have a country
-					end
-					return
-				end
-			end
-			task.wait(0.05)
-		end
-		tryOpenMenu(true) -- Fallback
-	end)
+	if not isOpening then
+		tryOpenMenu(false)
+	end
 end)
 
 -- 4. Listen for other players claiming countries to auto-refresh
@@ -153,7 +150,8 @@ CountryClaimedEvent.OnClientEvent:Connect(function(claimedCountry, claimingPlaye
 	if countryScreen.Enabled then
 		task.spawn(function()
 			local ok, result = pcall(function() return GetAvailableCountries:InvokeServer() end)
-			if ok and type(result) == "table" then buildCountryList(result) end
+			-- Guard against a transient empty result destroying the existing button list
+			if ok and type(result) == "table" and #result > 0 then buildCountryList(result) end
 		end)
 	end
 
