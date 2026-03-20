@@ -23,16 +23,27 @@ local TileManager = nil
 ---------------------------------------------------
 local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 10)
 if GetAvailableCountries then
-	GetAvailableCountries.OnServerInvoke = function()
+	GetAvailableCountries.OnServerInvoke = function(requestingPlayer)
 		if not isInitialized or not TileManager then
-			return {}
+			return nil -- nil = server not ready; client should retry
 		end
+
+		-- Server-authoritative ownership check: if the player already owns a
+		-- country, return false so the client knows to hide the selection screen
+		-- instead of relying on the replicated Country stat (which can be stale
+		-- due to replication delay after death/reset).
+		for _, owner in pairs(CountryOwners) do
+			if owner == requestingPlayer then
+				return false
+			end
+		end
+
 		local ok, result = pcall(TileManager.getAvailableCountries)
 		if ok then
 			return result
 		else
-			warn("GetAvailableCountries crashed!")
-			return {}
+			warn("[CountryManager] GetAvailableCountries crashed!")
+			return nil
 		end
 	end
 end
@@ -525,32 +536,10 @@ local function handleCountrySelection(player, countryName)
 end
 
 local function spawnStarterNPCs()
-	-- Collect all starting manpower values to compute the median
-	local allManpowers = {}
-	local countryManpowerMap = {}
-	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
-		if not countryModel:IsA("Model") then continue end
-		local countryName = countryModel.Name
-		local manpower = ServerState.getCountryManpower(countryName) or 0
-		table.insert(allManpowers, manpower)
-		countryManpowerMap[countryName] = manpower
-	end
-
-	-- Compute 37.5th percentile manpower (~62.5% get DefenderNPC, ~37.5% get AttackerNPC)
-	table.sort(allManpowers)
-	local n = #allManpowers
-	local attackerThreshold
-	if n == 0 then
-		attackerThreshold = 30000 -- fallback if no countries found
-	else
-		-- +1 corrects for >= boundary: country AT the index also gets DefenderNPC
-		local pIndex = math.max(1, math.floor(n * 0.375) + 1)
-		attackerThreshold = allManpowers[pIndex]
-	end
-	print("[CountryManager] Starter NPC attacker threshold (37.5th percentile): " .. attackerThreshold)
+	-- Fixed threshold: >= 10,000 manpower gets DefenderNPC, < 10,000 gets AttackerNPC
+	local DEFENDER_MANPOWER_THRESHOLD = 10000
 
 	-- Spawn one starter NPC at each country's capital
-	-- Countries at or above the 37.5th percentile get a DefenderNPC; below get an AttackerNPC
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if not countryModel:IsA("Model") then continue end
 		local countryName = countryModel.Name
@@ -561,8 +550,8 @@ local function spawnStarterNPCs()
 			continue
 		end
 
-		local manpower = countryManpowerMap[countryName] or 0
-		local npcType = (manpower >= attackerThreshold) and "DefenderNPC" or "AttackerNPC"
+		local manpower = ServerState.getCountryManpower(countryName) or 0
+		local npcType = (manpower >= DEFENDER_MANPOWER_THRESHOLD) and "DefenderNPC" or "AttackerNPC"
 
 		local spawnPos = capitalPart.Position + Vector3.new(0, capitalPart.Size.Y / 2 + 3, 0)
 		local tileKey = TileManager.getTileKeyFromPart(capitalPart)
@@ -613,11 +602,35 @@ Players.PlayerAdded:Connect(function(player)
 	player.CharacterRemoving:Connect(function(character)
 		onCharacterRemoving(player, character)
 	end)
-	-- Players who join after the initial FireAllClients would never receive InitializationComplete.
-	-- Fire it directly to each late joiner so their client can open the selection screen.
-	if isInitialized then
-		InitializationComplete:FireClient(player)
-	end
+
+	-- Fire InitializationComplete every time the character spawns if the player
+	-- doesn't own a country.  This covers:
+	--   • Late joiners (who missed the initial FireAllClients)
+	--   • Respawns after death/reset (where releasePlayerCountries already ran
+	--     in CharacterRemoving, but the client's fresh LocalScript may have read
+	--     the old Country stat before replication caught up)
+	player.CharacterAdded:Connect(function()
+		if not isInitialized then return end
+
+		-- Defer so that releasePlayerCountries (from CharacterRemoving) has
+		-- finished updating CountryOwners before we check.
+		task.defer(function()
+			-- If the player left the game during the defer, bail out
+			if not player.Parent then return end
+
+			local ownsCountry = false
+			for _, owner in pairs(CountryOwners) do
+				if owner == player then
+					ownsCountry = true
+					break
+				end
+			end
+
+			if not ownsCountry then
+				InitializationComplete:FireClient(player)
+			end
+		end)
+	end)
 end)
 
 for _, player in ipairs(Players:GetPlayers()) do

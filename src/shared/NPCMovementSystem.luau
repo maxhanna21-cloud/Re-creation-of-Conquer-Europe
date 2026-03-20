@@ -596,50 +596,49 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 		local pointA, pointB, edgeDist
 
 		if proof then
-			-- Use the exact proof points and mode from adjacency creation
-			-- NO surface correction here — proof points are the canonical validation segment
-			local isWalkable = TileAdjacencyManager.isPathWalkable(prevTile, currTile, {
-				mode = proof.mode,
-				pointA = proof.pointA,
-				pointB = proof.pointB,
-				distance = proof.distance  -- Pass stored distance (atomic with points)
-			})
-
-			if isWalkable then
-				-- Proof validated successfully, use proof points directly
+			-- Split handling by proof mode
+			if proof.mode == "strait" then
+				-- Strait proofs are intentional water crossings — use proof points directly
+				-- No walkability validation needed (water crossing is by design)
 				pointA = proof.pointA
 				pointB = proof.pointB
 				edgeDist = proof.distance
 			else
-				-- Proof failed at runtime — try finding a different walkable crossing live
-				-- Preserve the proof's mode (raster vs aabb) for correct candidate generation
-				local liveCrossing = TileAdjacencyManager.getBestWalkableBorderCrossing(prevTile, currTile, nil, proof.mode)
-				if liveCrossing then
-					pointA = liveCrossing.pointA
-					pointB = liveCrossing.pointB
-					edgeDist = liveCrossing.distance
-					-- No surface correction needed — getBestWalkableBorderCrossing already
-					-- surface-corrects and revalidates inside its loop
+				-- Raster and aabb proofs require land walkability validation
+				-- Use the exact proof points and mode from adjacency creation
+				-- NO surface correction here — proof points are the canonical validation segment
+				local isWalkable = TileAdjacencyManager.isPathWalkable(prevTile, currTile, {
+					mode = proof.mode,
+					pointA = proof.pointA,
+					pointB = proof.pointB,
+					distance = proof.distance  -- Pass stored distance (atomic with points)
+				})
+
+				if isWalkable then
+					-- Proof validated successfully, use proof points directly
+					pointA = proof.pointA
+					pointB = proof.pointB
+					edgeDist = proof.distance
 				else
-					walkabilityFailed = true
-					if DEBUG then
-						warn(string.format("[NPCMovement:Waypoints] Proof + live crossing both failed (mode: %s): %s -> %s",
-							proof.mode, prevTile.Name, currTile.Name))
+					-- Proof failed at runtime — try finding a different walkable crossing live
+					-- Preserve the proof's mode (raster vs aabb) for correct candidate generation
+					local liveCrossing = TileAdjacencyManager.getBestWalkableBorderCrossing(prevTile, currTile, nil, proof.mode)
+					if liveCrossing then
+						pointA = liveCrossing.pointA
+						pointB = liveCrossing.pointB
+						edgeDist = liveCrossing.distance
+						-- No surface correction needed — getBestWalkableBorderCrossing already
+						-- surface-corrects and revalidates inside its loop
+					else
+						walkabilityFailed = true
+						if DEBUG then
+							warn(string.format("[NPCMovement:Waypoints] Proof + live crossing both failed (mode: %s): %s -> %s",
+								proof.mode, prevTile.Name, currTile.Name))
+						end
+						pointA = nil
+						pointB = nil
 					end
-					pointA = nil
-					pointB = nil
 				end
-			end
-		else
-			-- No proof — try top-k walkable border crossing (defaults to raster mode)
-			local crossing = TileAdjacencyManager.getBestWalkableBorderCrossing(prevTile, currTile)
-			if crossing then
-				pointA = crossing.pointA
-				pointB = crossing.pointB
-				edgeDist = crossing.distance
-				-- No surface correction needed — already done inside getBestWalkableBorderCrossing
-			else
-				walkabilityFailed = true
 			end
 		end
 
