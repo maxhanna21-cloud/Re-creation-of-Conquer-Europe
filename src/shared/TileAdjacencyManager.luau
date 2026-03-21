@@ -725,6 +725,78 @@ local function getAABBEdge(tileA, tileB)
 	return pointA, pointB, dist
 end
 
+-- Evidence gate: verify proof endpoints actually land on the claimed tiles.
+-- Returns true if both endpoints raycast to their respective tiles and the path
+-- is not void-dominated. Returns false (with reason string) if validation fails.
+--
+-- Small-tile fallback: if the raycast misses the expected tile but lands within
+-- RASTER_CELL_SIZE of the tile's Position (XZ), accept with a warning.
+-- This handles sub-cell tiles (e.g. Solrød Kommune at 0.9×0.6 studs) where
+-- vertical raycasts can miss due to mesh precision.
+local VOID_RATIO_REJECTION_THRESHOLD = 0.6  -- reject if >60% of path samples hit nothing
+local ENDPOINT_PROXIMITY_FALLBACK = RASTER_CELL_SIZE  -- 2 studs — forgive endpoint miss if within this XZ distance of tile center
+
+local function validateProofEndpoints(tileA, tileB, pointA, pointB)
+	-- Raycast at pointA — should hit tileA
+	local rayParams = RaycastParams.new()
+	rayParams.FilterDescendantsInstances = { EUROPE_MAP }
+	rayParams.FilterType = Enum.RaycastFilterType.Include
+	rayParams.IgnoreWater = true
+
+	local hitA = Workspace:Raycast(Vector3.new(pointA.X, pointA.Y + 50, pointA.Z), Vector3.new(0, -100, 0), rayParams)
+	local aValid = hitA and hitA.Instance == tileA
+	if not aValid and hitA then
+		-- Small-tile fallback: accept if hit is near tileA's center
+		local dxA = pointA.X - tileA.Position.X
+		local dzA = pointA.Z - tileA.Position.Z
+		if math.sqrt(dxA * dxA + dzA * dzA) <= ENDPOINT_PROXIMITY_FALLBACK then
+			aValid = true
+		end
+	end
+	if not aValid then
+		local hitName = hitA and hitA.Instance.Name or "VOID"
+		return false, string.format("pointA hit %s instead of %s", hitName, tileA.Name)
+	end
+
+	-- Raycast at pointB — should hit tileB
+	local hitB = Workspace:Raycast(Vector3.new(pointB.X, pointB.Y + 50, pointB.Z), Vector3.new(0, -100, 0), rayParams)
+	local bValid = hitB and hitB.Instance == tileB
+	if not bValid and hitB then
+		local dxB = pointB.X - tileB.Position.X
+		local dzB = pointB.Z - tileB.Position.Z
+		if math.sqrt(dxB * dxB + dzB * dzB) <= ENDPOINT_PROXIMITY_FALLBACK then
+			bValid = true
+		end
+	end
+	if not bValid then
+		local hitName = hitB and hitB.Instance.Name or "VOID"
+		return false, string.format("pointB hit %s instead of %s", hitName, tileB.Name)
+	end
+
+	-- Void ratio check: sample 5 points along the path
+	local voidCount = 0
+	local totalSamples = 5
+	for i = 1, totalSamples do
+		local frac = i / (totalSamples + 1)
+		local sampleX = pointA.X + (pointB.X - pointA.X) * frac
+		local sampleZ = pointA.Z + (pointB.Z - pointA.Z) * frac
+		local sampleHit = Workspace:Raycast(
+			Vector3.new(sampleX, pointA.Y + 50, sampleZ),
+			Vector3.new(0, -100, 0),
+			rayParams
+		)
+		if not sampleHit then
+			voidCount = voidCount + 1
+		end
+	end
+
+	if voidCount / totalSamples > VOID_RATIO_REJECTION_THRESHOLD then
+		return false, string.format("void-dominated path (%d/%d void)", voidCount, totalSamples)
+	end
+
+	return true, nil
+end
+
 -- Forward declarations (defined later but called from the adjacency pipeline)
 local hasInterveningTileBetween
 
@@ -1146,7 +1218,7 @@ end
 
 -- Intervening tile detection using raster footprints.
 -- Samples 9 fractions along the edge-to-edge path and checks CellToTilesMap.
--- Returns true if more than 50% of samples find a third tile between tileA and tileB.
+-- Returns true if 25% or more of samples find a third tile between tileA and tileB.
 hasInterveningTileBetween = function(tileA, tileB, cellToTilesLookup)
 	local ptA, ptB, edgeDist = findClosestEdgePoints(tileA, tileB)
 	if not ptA or not ptB or edgeDist <= 0.5 then
@@ -1179,7 +1251,7 @@ hasInterveningTileBetween = function(tileA, tileB, cellToTilesLookup)
 		end
 	end
 
-	return interveningCount > (totalSamples / 2)
+	return interveningCount >= math.ceil(totalSamples * 0.25)
 end
 
 
@@ -1207,7 +1279,7 @@ local function calculateAdjacenciesFromFootprints()
 	-- Find adjacencies
 	AdjacentTiles = {}
 	local pairsSeen = {}
-	local rejected = { distance = 0, unwalkable = 0 }
+	local rejected = { distance = 0, unwalkable = 0, endpoint = 0 }
 
 	for tileA, footprint in pairs(TileFootprint) do
 		if not AdjacentTiles[tileA] then AdjacentTiles[tileA] = {} end
@@ -1239,19 +1311,37 @@ local function calculateAdjacenciesFromFootprints()
 									-- try walkability first (land), then probe for narrow strait if walkability fails.
 									local classification, crossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 									if classification and crossing then
-										local proofMode = (classification == "strait") and "strait" or "raster"
+										-- Evidence gate: validate proof endpoints hit the correct tiles.
+										-- SKIP for edgeDist <= 0: tiles sharing raster cells are definitively adjacent.
+										-- Raster cell-sharing is stronger evidence than raycast validation, and
+										-- proof endpoints at cell boundaries often miss MeshPart geometry (causing
+										-- false rejections like Bavaria <-> Baden Württemberg).
+										local epValid = true
+										local epReason = nil
+										if edgeDist > 0 then
+											epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
+										end
+										if epValid then
+											local proofMode = (classification == "strait") and "strait" or "raster"
 
-										table.insert(AdjacentTiles[tileA], tileB)
-										if not AdjacentTiles[tileB] then AdjacentTiles[tileB] = {} end
-										table.insert(AdjacentTiles[tileB], tileA)
+											table.insert(AdjacentTiles[tileA], tileB)
+											if not AdjacentTiles[tileB] then AdjacentTiles[tileB] = {} end
+											table.insert(AdjacentTiles[tileB], tileA)
 
-										if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
-										if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
-										AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
-										AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
+											if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
+											if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
+											AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
+											AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
 
-										if proofMode == "strait" then
-											narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
+											if proofMode == "strait" then
+												narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
+											end
+										else
+											rejected.endpoint = rejected.endpoint + 1
+											if DEBUG_REJECTED_ADJACENCY then
+												print(string.format("[TileAdjacencyManager] Raster pair rejected (endpoint validation): %s <-> %s (%s)",
+													tileA.Name, tileB.Name, epReason or "unknown"))
+											end
 										end
 									else
 										rejected.unwalkable = rejected.unwalkable + 1
@@ -1283,8 +1373,8 @@ local function calculateAdjacenciesFromFootprints()
 	totalConnections = totalConnections / 2
 
 	local avgConnections = (totalConnections * 2) / math.max(1, #AllTilesList)
-	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, narrow-strait=%d)",
-		totalConnections, avgConnections, rejected.distance, rejected.unwalkable, narrowStraitAcceptedCount))
+	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
+		totalConnections, avgConnections, rejected.distance, rejected.unwalkable, rejected.endpoint, narrowStraitAcceptedCount))
 
 	-- Top-5 tiles by neighbor count (outlier detection — tiles with unexpectedly many neighbors are suspicious)
 	local tilesByDegree = {}
@@ -1315,6 +1405,7 @@ local function calculateExtendedAdjacencies()
 	local rejectedReasons = {
 		intervening = 0,
 		unwalkable = 0,
+		endpoint = 0,
 	}
 
 	local function addAdjacency(a, b, existing)
@@ -1388,20 +1479,31 @@ local function calculateExtendedAdjacencies()
 			-- Try walkability first (land), then probe for narrow strait if walkability fails.
 			local classification, crossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and crossing then
-				local proofMode = (classification == "strait") and "strait" or "raster"
-				shouldConnect = true
+				-- Evidence gate: validate proof endpoints hit the correct tiles
+				local epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
+				if epValid then
+					local proofMode = (classification == "strait") and "strait" or "raster"
+					shouldConnect = true
 
-				if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
-				if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
-				AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
-				AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
+					if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
+					if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
+					AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
+					AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
 
-				if proofMode == "strait" then
-					narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
-					if DEBUG_EXTENDED_ADJACENCY or DEBUG_REJECTED_ADJACENCY then
-						local gapText = crossing.waterGapStuds and string.format("%.1f", crossing.waterGapStuds) or "?"
-						print(string.format("[TileAdjacencyManager] Narrow-strait adjacency: %s <-> %s (segment: %.1f, water gap: %s)",
-							tileA.Name, tileB.Name, crossing.distance, gapText))
+					if proofMode == "strait" then
+						narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
+						if DEBUG_EXTENDED_ADJACENCY or DEBUG_REJECTED_ADJACENCY then
+							local gapText = crossing.waterGapStuds and string.format("%.1f", crossing.waterGapStuds) or "?"
+							print(string.format("[TileAdjacencyManager] Narrow-strait adjacency: %s <-> %s (segment: %.1f, water gap: %s)",
+								tileA.Name, tileB.Name, crossing.distance, gapText))
+						end
+					end
+				else
+					rejectedCount = rejectedCount + 1
+					rejectedReasons.endpoint = rejectedReasons.endpoint + 1
+					if DEBUG_REJECTED_ADJACENCY then
+						print(string.format("[TileAdjacencyManager] Extended rejected (endpoint validation): %s <-> %s (%s)",
+							tileA.Name, tileB.Name, epReason or "unknown"))
 					end
 				end
 			else
@@ -1426,9 +1528,9 @@ local function calculateExtendedAdjacencies()
 		end
 	end
 
-	print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, narrow-strait=%d)",
+	print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
 		extendedCount, rejectedCount,
-		rejectedReasons.intervening, rejectedReasons.unwalkable, narrowStraitAcceptedCount))
+		rejectedReasons.intervening, rejectedReasons.unwalkable, rejectedReasons.endpoint, narrowStraitAcceptedCount))
 end
 
 ---------------------------------------------------
@@ -2352,12 +2454,19 @@ function TileAdjacencyManager.tryRepairAdjacencyPair(tileA, tileB)
 	local mode = nil
 
 	-- Phase 1 parity: raster-adjacent with walkability
-	-- Requires: shared raster-neighbor cells + edge distance + walkability proof
 	if sharesRasterNeighborCell(tileA, tileB) and rasterEdgeDistance <= MAX_RASTER_ADJACENCY_DISTANCE then
 		local bestCrossing = _getBestWalkableBorderCrossing(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 		if bestCrossing then
-			crossing = bestCrossing
-			mode = "raster"
+			-- Skip validation gate for cell-sharing tiles (rasterEdgeDistance <= 0):
+			-- same rationale as Phase 1 init — cell-sharing is definitive adjacency evidence.
+			local epValid = true
+			if rasterEdgeDistance > 0 then
+				epValid = validateProofEndpoints(tileA, tileB, bestCrossing.pointA, bestCrossing.pointB)
+			end
+			if epValid then
+				crossing = bestCrossing
+				mode = "raster"
+			end
 		end
 	end
 
@@ -2367,8 +2476,11 @@ function TileAdjacencyManager.tryRepairAdjacencyPair(tileA, tileB)
 		if not hasIntervening then
 			local classification, classifyCrossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and classifyCrossing then
-				crossing = classifyCrossing
-				mode = (classification == "strait") and "strait" or "raster"
+				local epValid = validateProofEndpoints(tileA, tileB, classifyCrossing.pointA, classifyCrossing.pointB)
+				if epValid then
+					crossing = classifyCrossing
+					mode = (classification == "strait") and "strait" or "raster"
+				end
 			end
 		end
 	end
