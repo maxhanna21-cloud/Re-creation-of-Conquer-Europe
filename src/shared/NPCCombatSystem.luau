@@ -231,8 +231,9 @@ local function areNPCsOnAdjacentTiles(npcA, npcB)
 	return TAM.canNPCsInteract(npcA, npcB)
 end
 
--- Combat loop for ATTACKERS (now multi-target with split damage + auto-retaliation + adjacency check)
-local function startAttackerCombatLoop(npcModel, getAllTargets)
+-- Unified combat loop for both Attackers and Defenders (multi-target with split damage + adjacency check)
+-- Only difference between roles is beamColor, which is passed as a parameter.
+local function startCombatLoop(npcModel, getAllTargets, beamColor)
 	if not npcModel then return end
 	if combatLoops[npcModel] then return end
 
@@ -240,7 +241,6 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 
 	task.spawn(function()
 		local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-		local beamColor = Color3.fromRGB(255, 0, 0) -- Red for Attackers
 
 		while combatLoops[npcModel] and npcModel.Parent and humanoid and humanoid.Health > 0 do
 			local now = os.clock()
@@ -274,10 +274,10 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 						local targetRoot = getRootPart(firstTarget.Parent)
 						if targetRoot then
 							local targetPos = targetRoot.Position
-							local attackerPos = npcRoot.Position
+							local npcPos = npcRoot.Position
 							local lookAtCFrame = CFrame.lookAt(
-								attackerPos,
-								Vector3.new(targetPos.X, attackerPos.Y, targetPos.Z)
+								npcPos,
+								Vector3.new(targetPos.X, npcPos.Y, targetPos.Z)
 							)
 							npcRoot.CFrame = CFrame.new(npcRoot.CFrame.Position) * (lookAtCFrame - lookAtCFrame.Position)
 						end
@@ -294,88 +294,6 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 				end
 			else
 				-- No targets - idle
-				if DEBUG then
-					local targetKey = npcModel.Name .. "_Target"
-					if debugParts[targetKey] then
-						debugParts[targetKey]:Destroy()
-						debugParts[targetKey] = nil
-					end
-				end
-				local root = getRootPart(npcModel)
-				if root then
-					humanoid:MoveTo(root.Position)
-				end
-			end
-
-			task.wait(LOOP_WAIT)
-		end
-
-		-- Only unregister if the NPC is actually being destroyed
-		if not npcModel.Parent then
-			Combat.unregisterNPC(npcModel)
-		end
-	end)
-end
-
--- Combat loop for DEFENDERS (multi-target with split damage - auto retaliation + adjacency check)
-local function startDefenderCombatLoop(npcModel, getAllTargets)
-	if not npcModel then return end
-	if combatLoops[npcModel] then return end
-
-	combatLoops[npcModel] = true
-
-	task.spawn(function()
-		local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-		local beamColor = Color3.fromRGB(0, 150, 255) -- Blue for Defenders
-
-		while combatLoops[npcModel] and npcModel.Parent and humanoid and humanoid.Health > 0 do
-			local now = os.clock()
-
-			local allTargets = getAllTargets()
-
-			-- Sync Health script with current combat state
-			updateCombatHealthState(npcModel, #allTargets > 0)
-
-			-- Only go idle if country-owned AND no threats
-			if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
-				-- No active player owner AND no threats - NPC is idle
-				local root = getRootPart(npcModel)
-				if root then
-					humanoid:MoveTo(root.Position)
-				end
-				task.wait(LOOP_WAIT)
-				continue
-			end
-
-			if #allTargets > 0 then
-				local npcRoot = getRootPart(npcModel)
-
-				if npcRoot then
-					humanoid:MoveTo(npcRoot.Position)
-
-					local firstTarget = allTargets[1]
-					if firstTarget and firstTarget.Parent then
-						local targetRoot = getRootPart(firstTarget.Parent)
-						if targetRoot then
-							local targetPos = targetRoot.Position
-							local defenderPos = npcRoot.Position
-							local lookAtCFrame = CFrame.lookAt(
-								defenderPos,
-								Vector3.new(targetPos.X, defenderPos.Y, targetPos.Z)
-							)
-							npcRoot.CFrame = CFrame.new(npcRoot.CFrame.Position) * (lookAtCFrame - lookAtCFrame.Position)
-						end
-					end
-
-					if #allTargets > 0 then
-						local lastShot = npcCooldown[npcModel] or 0
-						if now - lastShot >= SHOOT_INTERVAL then
-							fireMultiLaser(npcModel, allTargets, beamColor)
-							npcCooldown[npcModel] = now
-						end
-					end
-				end
-			else
 				if DEBUG then
 					local targetKey = npcModel.Name .. "_Target"
 					if debugParts[targetKey] then
@@ -577,7 +495,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 
 	if role == "Attacker" then
 		-- Attackers use multi-target combat with manually assigned targets + auto-retaliation
-		startAttackerCombatLoop(npcModel, function()
+		startCombatLoop(npcModel, function()
 			local npcOwner = Combat.getOwner(npcModel)
 			local allValidTargets = {}
 
@@ -653,10 +571,10 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 			end
 
 			return allValidTargets
-		end)
+		end, Color3.fromRGB(255, 0, 0))
 	else -- Defender
 		-- Defenders use multi-target combat with auto-retaliation
-		startDefenderCombatLoop(npcModel, function()
+		startCombatLoop(npcModel, function()
 			local defenderOwner = Combat.getOwner(npcModel)
 			local allValidTargets = {}
 
@@ -680,7 +598,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 			end
 
 			return allValidTargets
-		end)
+		end, Color3.fromRGB(0, 150, 255))
 	end
 
 	local ownerLabel = ownerPlayer and ownerPlayer.Name or "Country-owned"

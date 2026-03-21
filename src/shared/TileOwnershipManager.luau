@@ -52,6 +52,10 @@ local OccupiedTerritories = {}
 -- Store country colors
 local CountryColors = {}
 
+-- Pre-built lookup: countryTiles[countryName] = {BasePart, BasePart, ...}
+-- Populated once at init; avoids runtime GetDescendants calls.
+local countryTiles = {}
+
 -- Capital capture guard
 local capitalsBeingCaptured = {}
 
@@ -63,20 +67,21 @@ local function scanCountryColors()
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if countryModel:IsA("Model") then
 			local countryName = countryModel.Name
-
-			for _, part in ipairs(countryModel:GetDescendants()) do
-				if part:IsA("BasePart") then
-					CountryColors[countryName] = part.Color
-					OriginalColors[part] = part.Color
-					break
-				end
-			end
+			local tiles = {}
+			local colorSet = false
 
 			for _, part in ipairs(countryModel:GetDescendants()) do
 				if part:IsA("BasePart") then
 					OriginalColors[part] = part.Color
+					table.insert(tiles, part)
+					if not colorSet then
+						CountryColors[countryName] = part.Color
+						colorSet = true
+					end
 				end
 			end
+
+			countryTiles[countryName] = tiles
 		end
 	end
 
@@ -537,11 +542,11 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	-- FIX: Validate winningColor exists, fallback to OriginalColors sampling
 	if not winningColor then
 		warn(string.format("[TileOwnership] CountryColors[%s] is nil, sampling from OriginalColors", winningCountry))
-		local winningCountryModel = EUROPE_MAP:FindFirstChild(winningCountry)
-		if winningCountryModel then
-			-- Find a tile in the winning country's Model and use its original color
-			for _, part in ipairs(winningCountryModel:GetDescendants()) do
-				if part:IsA("BasePart") and OriginalColors[part] then
+		local winningTiles = countryTiles[winningCountry]
+		if winningTiles then
+			-- Find a tile in the winning country's cached tile list and use its original color
+			for _, part in ipairs(winningTiles) do
+				if OriginalColors[part] then
 					winningColor = OriginalColors[part]
 					CountryColors[winningCountry] = winningColor  -- Update cache
 					break
@@ -559,52 +564,50 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 
 	-- 1. TRANSFER TILES (skip third-party occupied tiles)
-	local countryModel = EUROPE_MAP:FindFirstChild(losingCountryName)
-	if countryModel then
-		for _, part in ipairs(countryModel:GetDescendants()) do
-			if part:IsA("BasePart") then
-				-- Mark conquered capital tiles with attributes (defense-in-depth)
-				if part.Name == "Capital" then
-					part:SetAttribute("FormerCapitalOf", losingCountryName)
-					part:SetAttribute("ConqueredBy", winningCountry)
-				end
+	local losingTiles = countryTiles[losingCountryName]
+	if losingTiles then
+		for _, part in ipairs(losingTiles) do
+			-- Mark conquered capital tiles with attributes (defense-in-depth)
+			if part.Name == "Capital" then
+				part:SetAttribute("FormerCapitalOf", losingCountryName)
+				part:SetAttribute("ConqueredBy", winningCountry)
+			end
 
-				local occupationData = OccupiedTerritories[part]
-				if occupationData then
-					if occupationData.occupyingCountry ~= winningCountry
-						and occupationData.occupyingCountry ~= losingCountryName then
-						-- Third party occupies this tile — leave their color and ownership intact
-						if DEBUG then
-							print(string.format("[TileOwnership] Skipping %s (third-party: %s)",
-								part.Name, occupationData.occupyingCountry))
-						end
-					else
-						-- Loser or winner had it — transfer to winner
-						part.Color = winningColor
-						part:SetAttribute("OwnerCountry", winningCountry)
-						OccupiedTerritories[part] = {
-							occupyingCountry = winningCountry,
-							originalCountry = occupationData.originalCountry,
-							originalColor = occupationData.originalColor
-						}
-						if TileCapturedEvent then
-							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
-						end
+			local occupationData = OccupiedTerritories[part]
+			if occupationData then
+				if occupationData.occupyingCountry ~= winningCountry
+					and occupationData.occupyingCountry ~= losingCountryName then
+					-- Third party occupies this tile — leave their color and ownership intact
+					if DEBUG then
+						print(string.format("[TileOwnership] Skipping %s (third-party: %s)",
+							part.Name, occupationData.occupyingCountry))
 					end
 				else
-					-- Unoccupied core territory — winner takes it.
-					-- Capture color BEFORE recoloring to avoid originalColor bug.
-					local preColor = part.Color
+					-- Loser or winner had it — transfer to winner
 					part.Color = winningColor
 					part:SetAttribute("OwnerCountry", winningCountry)
 					OccupiedTerritories[part] = {
 						occupyingCountry = winningCountry,
-						originalCountry = losingCountryName,
-						originalColor = OriginalColors[part] or preColor
+						originalCountry = occupationData.originalCountry,
+						originalColor = occupationData.originalColor
 					}
 					if TileCapturedEvent then
 						TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
 					end
+				end
+			else
+				-- Unoccupied core territory — winner takes it.
+				-- Capture color BEFORE recoloring to avoid originalColor bug.
+				local preColor = part.Color
+				part.Color = winningColor
+				part:SetAttribute("OwnerCountry", winningCountry)
+				OccupiedTerritories[part] = {
+					occupyingCountry = winningCountry,
+					originalCountry = losingCountryName,
+					originalColor = OriginalColors[part] or preColor
+				}
+				if TileCapturedEvent then
+					TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
 				end
 			end
 		end
@@ -644,10 +647,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 
 	local conqueredByLoser = collectConqueredCountries(losingCountryName)
 	for conqueredName, _ in pairs(conqueredByLoser) do
-		local conqueredModel = EUROPE_MAP:FindFirstChild(conqueredName)
-		if conqueredModel then
-			for _, part in ipairs(conqueredModel:GetDescendants()) do
-				if part:IsA("BasePart") and OriginalColors[part] then
+		local conqueredTiles = countryTiles[conqueredName]
+		if conqueredTiles then
+			for _, part in ipairs(conqueredTiles) do
+				if OriginalColors[part] then
 					local existingData = OccupiedTerritories[part]
 					if not existingData then
 						OccupiedTerritories[part] = {
@@ -812,10 +815,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 			table.insert(allCountriesToCheck, cName)
 		end
 		for _, cName in ipairs(allCountriesToCheck) do
-			local cModel = EUROPE_MAP:FindFirstChild(cName)
-			if cModel then
-				for _, part in ipairs(cModel:GetDescendants()) do
-					if part:IsA("BasePart") and OriginalColors[part] then
+			local cTiles = countryTiles[cName]
+			if cTiles then
+				for _, part in ipairs(cTiles) do
+					if OriginalColors[part] then
 						if not OccupiedTerritories[part] then
 							missingCount = missingCount + 1
 						end
