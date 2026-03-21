@@ -56,6 +56,7 @@ TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileM
 -- DiplomacyManager NOT cleared when player leaves (wars persist)
 local DiplomacyManager = require(game:GetService("ServerScriptService"):WaitForChild("DiplomacyManager", 10))
 local NPCSpawner = require(game:GetService("ServerScriptService"):WaitForChild("NPCSpawner", 10))
+local CountryNPCRegistry = require(game:GetService("ServerScriptService"):WaitForChild("CountryNPCRegistry", 10))
 local CountryClaimedEvent = ReplicatedStorage:FindFirstChild("CountryClaimedEvent")
 
 -- Income Loop States
@@ -176,16 +177,7 @@ local function getCapitalCFrame(countryName)
 end
 
 local function getCountryNPCs(countryName)
-	local npcs = {}
-	for _, child in ipairs(Workspace:GetChildren()) do
-		if child:IsA("Model") and child:FindFirstChild("Humanoid") and child:FindFirstChild("NPCOwner") then
-			local npcCountry = child:GetAttribute("Country")
-			if npcCountry == countryName then
-				table.insert(npcs, child)
-			end
-		end
-	end
-	return npcs
+	return CountryNPCRegistry.getNPCs(countryName)
 end
 
 local function transferCountryNPCs(countryName, newOwner)

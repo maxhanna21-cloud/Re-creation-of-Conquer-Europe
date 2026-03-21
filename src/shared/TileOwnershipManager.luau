@@ -55,6 +55,9 @@ local CountryColors = {}
 -- Capital capture guard
 local capitalsBeingCaptured = {}
 
+-- Precomputed tile parts per country (built at init, avoids runtime GetDescendants)
+local CountryTileParts = {} -- { [countryName] = { BasePart, ... } }
+
 ---------------------------------------------------
 -- Initialization
 ---------------------------------------------------
@@ -63,20 +66,21 @@ local function scanCountryColors()
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if countryModel:IsA("Model") then
 			local countryName = countryModel.Name
+			local tileParts = {}
+			local colorSet = false
 
 			for _, part in ipairs(countryModel:GetDescendants()) do
 				if part:IsA("BasePart") then
-					CountryColors[countryName] = part.Color
+					if not colorSet then
+						CountryColors[countryName] = part.Color
+						colorSet = true
+					end
 					OriginalColors[part] = part.Color
-					break
+					table.insert(tileParts, part)
 				end
 			end
 
-			for _, part in ipairs(countryModel:GetDescendants()) do
-				if part:IsA("BasePart") then
-					OriginalColors[part] = part.Color
-				end
-			end
+			CountryTileParts[countryName] = tileParts
 		end
 	end
 
@@ -537,11 +541,11 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	-- FIX: Validate winningColor exists, fallback to OriginalColors sampling
 	if not winningColor then
 		warn(string.format("[TileOwnership] CountryColors[%s] is nil, sampling from OriginalColors", winningCountry))
-		local winningCountryModel = EUROPE_MAP:FindFirstChild(winningCountry)
-		if winningCountryModel then
-			-- Find a tile in the winning country's Model and use its original color
-			for _, part in ipairs(winningCountryModel:GetDescendants()) do
-				if part:IsA("BasePart") and OriginalColors[part] then
+		local cachedParts = CountryTileParts[winningCountry]
+		if cachedParts then
+			-- Find a tile in the winning country's precomputed parts and use its original color
+			for _, part in ipairs(cachedParts) do
+				if OriginalColors[part] then
 					winningColor = OriginalColors[part]
 					CountryColors[winningCountry] = winningColor  -- Update cache
 					break
@@ -559,10 +563,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 
 	-- 1. TRANSFER TILES (skip third-party occupied tiles)
-	local countryModel = EUROPE_MAP:FindFirstChild(losingCountryName)
-	if countryModel then
-		for _, part in ipairs(countryModel:GetDescendants()) do
-			if part:IsA("BasePart") then
+	local losingTileParts = CountryTileParts[losingCountryName]
+	if losingTileParts then
+		for _, part in ipairs(losingTileParts) do
+			do
 				-- Mark conquered capital tiles with attributes (defense-in-depth)
 				if part.Name == "Capital" then
 					part:SetAttribute("FormerCapitalOf", losingCountryName)
@@ -644,10 +648,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 
 	local conqueredByLoser = collectConqueredCountries(losingCountryName)
 	for conqueredName, _ in pairs(conqueredByLoser) do
-		local conqueredModel = EUROPE_MAP:FindFirstChild(conqueredName)
-		if conqueredModel then
-			for _, part in ipairs(conqueredModel:GetDescendants()) do
-				if part:IsA("BasePart") and OriginalColors[part] then
+		local conqueredParts = CountryTileParts[conqueredName]
+		if conqueredParts then
+			for _, part in ipairs(conqueredParts) do
+				if OriginalColors[part] then
 					local existingData = OccupiedTerritories[part]
 					if not existingData then
 						OccupiedTerritories[part] = {
@@ -812,10 +816,10 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 			table.insert(allCountriesToCheck, cName)
 		end
 		for _, cName in ipairs(allCountriesToCheck) do
-			local cModel = EUROPE_MAP:FindFirstChild(cName)
-			if cModel then
-				for _, part in ipairs(cModel:GetDescendants()) do
-					if part:IsA("BasePart") and OriginalColors[part] then
+			local cParts = CountryTileParts[cName]
+			if cParts then
+				for _, part in ipairs(cParts) do
+					if OriginalColors[part] then
 						if not OccupiedTerritories[part] then
 							missingCount = missingCount + 1
 						end

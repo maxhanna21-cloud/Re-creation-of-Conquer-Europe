@@ -61,33 +61,35 @@ end
 --------------------------------------------------------------------------------
 -- countryModelCache[part] = { countryModel = Model or false, lastAccess = number }
 local countryModelCache = {}
-local cacheAccessOrder = {} -- array of parts, oldest at index 1
+-- Dict-based LRU: maps part -> accessOrder (monotonically increasing counter)
+local cacheAccessIndex = {} -- { [part] = number }
+local accessCounter = 0
+local cacheSize = 0
 
 local function touchCacheEntry(part)
-	-- remove existing occurrence
-	for i = #cacheAccessOrder, 1, -1 do
-		if cacheAccessOrder[i] == part then
-			table.remove(cacheAccessOrder, i)
-			break
-		end
+	-- O(1): just stamp the current counter value
+	if not cacheAccessIndex[part] then
+		cacheSize = cacheSize + 1
 	end
-	table.insert(cacheAccessOrder, part) -- newest on the end
+	accessCounter = accessCounter + 1
+	cacheAccessIndex[part] = accessCounter
 end
 
 local function evictOldestEntries()
-	while #cacheAccessOrder > CACHE_MAX_SIZE do
-		-- remove CACHE_EVICT_COUNT or until under limit
-		local removed = 0
-		for i = 1, CACHE_EVICT_COUNT do
-			if #cacheAccessOrder == 0 then break end
-			local oldPart = table.remove(cacheAccessOrder, 1)
-			if oldPart then
-				countryModelCache[oldPart] = nil
-			end
-			removed = removed + 1
-		end
-		-- safety: if nothing removed, break to avoid infinite loop
-		if removed == 0 then break end
+	if cacheSize <= CACHE_MAX_SIZE then return end
+	-- Collect all entries and sort by access order — only runs when cache overflows
+	local entries = {}
+	for part, order in pairs(cacheAccessIndex) do
+		table.insert(entries, {part = part, order = order})
+	end
+	table.sort(entries, function(a, b) return a.order < b.order end)
+	-- Evict the oldest CACHE_EVICT_COUNT entries
+	local toEvict = math.min(CACHE_EVICT_COUNT, #entries)
+	for i = 1, toEvict do
+		local oldPart = entries[i].part
+		countryModelCache[oldPart] = nil
+		cacheAccessIndex[oldPart] = nil
+		cacheSize = cacheSize - 1
 	end
 end
 
@@ -181,12 +183,9 @@ local function setupCacheInvalidation()
 			if countryModelCache[desc] ~= nil then
 				countryModelCache[desc] = nil
 			end
-			-- remove from access order
-			for i = #cacheAccessOrder, 1, -1 do
-				if cacheAccessOrder[i] == desc then
-					table.remove(cacheAccessOrder, i)
-					break
-				end
+			if cacheAccessIndex[desc] then
+				cacheAccessIndex[desc] = nil
+				cacheSize = cacheSize - 1
 			end
 		end
 	end)
@@ -276,7 +275,9 @@ local function cleanup()
 	end
 	-- Clear cache tables
 	countryModelCache = {}
-	cacheAccessOrder = {}
+	cacheAccessIndex = {}
+	accessCounter = 0
+	cacheSize = 0
 
 	-- Destroy cursor clone safely
 	if Cursor and Cursor.Parent then

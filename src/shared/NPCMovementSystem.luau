@@ -397,10 +397,11 @@ local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner
 	-- Breadth-first search through adjacent tiles
 	local queue = {{sourceTilePart, {sourceTilePart}}}  -- {current tile, path taken}
 	local visited = {[sourceTilePart] = true}
+	local queueFront = 0
 
-	while #queue > 0 do
-		local current, path = queue[1][1], queue[1][2]
-		table.remove(queue, 1)
+	while queueFront < #queue do
+		queueFront = queueFront + 1
+		local current, path = queue[queueFront][1], queue[queueFront][2]
 
 		-- If we've reached the destination, return the path
 		if current == destinationTilePart then
@@ -1478,8 +1479,8 @@ local function monitorMovement(npcModel, isRetreat)
 	-- STILL MOVING: Apply path correction to keep NPC on safe corridor
 	local effectiveTarget = waypointPos
 
-	if corridorOrigin then
-		effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
+	if movement and movement.originPosition then
+		effectiveTarget = getPathCorrectedPosition(npcModel, movement.originPosition, waypointPos)
 	end
 
 	-- NEW: Emergency Brake System

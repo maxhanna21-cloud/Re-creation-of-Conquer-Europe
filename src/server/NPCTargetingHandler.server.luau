@@ -19,6 +19,10 @@ local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 
 local selectedNPC = {} -- player -> npcModel
 
+-- Rate-limiting: prevent client spam on tile click events
+local playerClickCooldowns = {} -- player -> last tick()
+local TILE_CLICK_COOLDOWN = 0.15 -- seconds between allowed clicks
+
 -- Store both the flag AND the connection for proper cleanup
 -- connectedNPCs[npcModel] = { connected = true, clickConnection = RBXScriptConnection }
 local connectedNPCs = {}
@@ -411,6 +415,7 @@ Players.PlayerRemoving:Connect(function(player)
 	if selectedNPC[player] then
 		selectedNPC[player] = nil
 	end
+	playerClickCooldowns[player] = nil
 end)
 
 -- Properly clean up NPC tracking and connections when destroyed
@@ -430,6 +435,12 @@ end)
 -- Listen for tile click events from client
 -- Supports: tile-based NPC selection, movement, and combat assignment
 NPCMoveToTileEvent.OnServerEvent:Connect(function(player, tilePart)
+	-- Rate-limit: reject rapid-fire clicks from client
+	local now = tick()
+	local lastClick = playerClickCooldowns[player]
+	if lastClick and (now - lastClick) < TILE_CLICK_COOLDOWN then return end
+	playerClickCooldowns[player] = now
+
 	-- Validate that it's actually a tile
 	if not isTilePart(tilePart) then return end
 
