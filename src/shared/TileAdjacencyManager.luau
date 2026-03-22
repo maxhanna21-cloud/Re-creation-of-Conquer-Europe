@@ -1318,7 +1318,11 @@ local function calculateAdjacenciesFromFootprints()
 										-- false rejections like Bavaria <-> Baden Württemberg).
 										local epValid = true
 										local epReason = nil
-										if edgeDist > 0 then
+										-- Skip endpoint validation for straits: _classifyCandidatePair
+										-- already validated the crossing geometry with multiple raycasts.
+										-- validateProofEndpoints void-ratio check rejects straits because
+										-- the path between edge points crosses water by definition.
+										if edgeDist > 0 and classification ~= "strait" then
 											epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
 										end
 										if epValid then
@@ -1479,8 +1483,14 @@ local function calculateExtendedAdjacencies()
 			-- Try walkability first (land), then probe for narrow strait if walkability fails.
 			local classification, crossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and crossing then
-				-- Evidence gate: validate proof endpoints hit the correct tiles
-				local epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
+				-- Evidence gate: validate proof endpoints hit the correct tiles.
+				-- Skip for strait classifications — path crosses water by definition,
+				-- and _classifyCandidatePair already validated the crossing geometry.
+				local epValid = true
+				local epReason = nil
+				if classification ~= "strait" then
+					epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
+				end
 				if epValid then
 					local proofMode = (classification == "strait") and "strait" or "raster"
 					shouldConnect = true
@@ -2476,7 +2486,11 @@ function TileAdjacencyManager.tryRepairAdjacencyPair(tileA, tileB)
 		if not hasIntervening then
 			local classification, classifyCrossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and classifyCrossing then
-				local epValid = validateProofEndpoints(tileA, tileB, classifyCrossing.pointA, classifyCrossing.pointB)
+				-- Skip endpoint validation for straits — water crossing by definition
+				local epValid = true
+				if classification ~= "strait" then
+					epValid = validateProofEndpoints(tileA, tileB, classifyCrossing.pointA, classifyCrossing.pointB)
+				end
 				if epValid then
 					crossing = classifyCrossing
 					mode = (classification == "strait") and "strait" or "raster"

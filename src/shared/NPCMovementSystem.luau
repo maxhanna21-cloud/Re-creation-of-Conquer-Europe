@@ -930,6 +930,24 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 				-- Strategy 1: PathfindingService
 				local arrivalPath = computeWalkablePath(lastWP.position, arrivalSafeCenter)
 
+				-- Validate arrival path stays within tile boundaries.
+				-- PathfindingService uses the global NavMesh and can route through
+				-- neighboring tiles. If any waypoint is off-tile, discard the path
+				-- and fall back to cell-based BFS (constrained to raster footprint).
+				if #arrivalPath > 0 then
+					for _, pfPos in ipairs(arrivalPath) do
+						if not TileAdjacencyManager.isPositionOnTile(currTile, pfPos) then
+							if DEBUG then
+								print(string.format(
+									"[NPCMovement:Waypoints] Arrival path on %s crosses tile boundary at (%.1f, %.1f, %.1f), falling back to cell-based BFS",
+									currTile.Name, pfPos.X, pfPos.Y, pfPos.Z))
+							end
+							arrivalPath = {}
+							break
+						end
+					end
+				end
+
 				if #arrivalPath > 0 then
 					if DEBUG then
 						print(string.format(
@@ -1493,14 +1511,11 @@ local function monitorMovement(npcModel, isRetreat)
 		return
 	end
 
-	-- For the final tile-centre waypoint, flatten the target to the NPC's current
-	-- floor Y so the humanoid navigates horizontally rather than toward an elevated
-	-- point.  The heartbeat XZ check (FINAL_TILE_ARRIVAL_THRESHOLD) handles arrival.
-	if isFinalTileDest then
-		humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))
-	else
-		humanoid:MoveTo(effectiveTarget)
-	end
+	-- Flatten ALL MoveTo targets to the NPC's current floor Y so the humanoid
+	-- navigates horizontally. Without this, edge waypoints at tile-surface height
+	-- (Y≈4.6) cause the humanoid to walk downward toward cliff faces and fall off.
+	-- Roblox physics keeps the humanoid grounded regardless of MoveTo Y.
+	humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))
 
 	-- STUCK detection sampling
 	movementStates[npcModel] = movementStates[npcModel] or {}

@@ -1,552 +1,351 @@
-# TileAdjacencyManager v28: Evidence-Validated Adjacency
+# NPC Movement & Tile Adjacency Fix Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate 240 false adjacencies (14.3% of all connections) by adding raycast-based endpoint validation and tightening the intervening tile threshold — without changing any existing thresholds or rearchitecting the pipeline.
+**Goal:** Fix three NPC movement/adjacency bugs: (1) NPCs falling off cliff faces during tile transitions, (2) adjacency detection failing for narrow-strait tiles like Όρος Άθως, (3) arrival pathfinding routing NPCs through neighboring tiles' territory.
 
-**Architecture:** Two surgical changes to `ServerScriptService.TileAdjacencyManager`: (1) a new `validateProofEndpoints` function that raycasts at proof points to confirm they actually land on the claimed tiles, inserted as a final gate before any adjacency is accepted; (2) lowering the intervening tile detection threshold from >50% to ≥25% so that 3+ out of 9 samples finding a third tile blocks the pair.
+**Architecture:** Three independent surgical changes — no new files, no threshold tuning, no rearchitecting. (1) Y-flatten all `humanoid:MoveTo()` targets so NPCs walk horizontally instead of descending toward cliff faces. (2) Skip the `validateProofEndpoints` function for strait-classified tile pairs since the path between edge points crosses water by definition. (3) Validate that PathfindingService arrival waypoints stay within the destination tile's oriented bounding box; if any waypoint is off-tile, fall back to cell-based BFS which is constrained to the tile's raster footprint.
 
-**Tech Stack:** Luau, Roblox Workspace raycasts, existing TileAdjacencyManager raster pipeline
+**Tech Stack:** Luau, Roblox `Humanoid:MoveTo()`, `TileAdjacencyManager` raster/strait pipeline, `PathfindingService`, `isPositionOnTile` OBB check
+
+---
+
+## Root Cause Analysis
+
+### Bug 1 — NPC falls off map (Denmark: Schleswig-Holstein → Lolland Kommune)
+
+**What happens:** The NPC walks from the tile center at Y≈7.6 (surface + humanoid height) toward the departure edge waypoint at Y≈4.6 (tile AABB top surface). The `humanoid:MoveTo(effectiveTarget)` call on every Heartbeat frame uses the raw waypoint Y=4.6, causing the humanoid to seek a lower position. This directs the NPC downward toward the cliff face at the tile boundary, and the NPC walks off the edge into the void. After ~3 seconds of falling, the gap-crossing teleport eventually fires and warps the NPC to the destination tile center.
+
+**Root cause location:** `NPCMovementSystem.luau`, lines ~1496-1503. The "STILL MOVING" section only Y-flattens the MoveTo target for the final tile-center waypoint (`if isFinalTileDest`). For all intermediate waypoints (including edge waypoints at Y=4.6), the raw Y is used.
+
+**Evidence from logs:**
+```
+[NPCMovement:Waypoints] Edge check: Schleswig-Holstein -> Lolland Kommune, edgeDist=0.179, pointA=(56.5,4.6,246.3), pointB=(56.5,4.6,246.5)
+[NPCMovement:GroundCheck] Near waypoint but no ground within 20 studs for AttackerNPC  ← NPC fell off
+[NPCMovement:GapCross] Teleporting AttackerNPC past arrival edge to tile waypoint at (55.0, 7.6, 248.5)  ← 3 sec later
+```
+
+### Bug 2 — Adjacency fails for narrow-strait tiles (Greece: Κεντρική Μακεδονία → Όρος Άθως)
+
+**What happens:** The tiles are physically adjacent with a narrow water strait (0.71 studs gap). `_classifyCandidatePair()` correctly identifies this as a strait crossing. The `diagnoseAdjacency()` function reports "Phase 2 PASS: narrow strait." But the actual adjacency pipeline (both init-time and runtime repair) calls `validateProofEndpoints()` after classification, and the void-ratio check inside it rejects the pair. The diagnostic function does NOT run `validateProofEndpoints`, which is why it shows PASS while the pipeline rejects.
+
+**Root cause location:** `TileAdjacencyManager.luau`, the `validateProofEndpoints` function (lines 776-795). The void-ratio check samples 5 points along the path between the two edge points. For strait crossings, this path crosses water — so most samples hit void. If >60% hit void, the pair is rejected. This check was designed for land crossings and is counterproductive for water straits.
+
+**Evidence from logs:**
+```
+Phase 2 PASS: narrow strait (segment=2.47, water gap=0.71)  ← diagnostic says PASS
+[Movement] Runtime adjacency repair did not connect: Κεντρική Μακεδονία <-> Όρος Άθως  ← but repair fails
+Movement failed: Target tile (Όρος Άθως) is not adjacent  ← movement blocked
+```
+
+Additionally, Όρος Άθως has only 2 raster cells (tile size: 5.465 × 4.070 studs). The `ENDPOINT_PROXIMITY_FALLBACK` of 2 studs may not reach the edge point, which could be ~2.7 studs from the tile center.
+
+### Bug 3 — NPC walks through neighboring tiles (Sweden: Södermanlands län → Västmanlands län)
+
+**What happens:** After the gap-crossing teleport, the NPC follows PathfindingService-generated arrival waypoints from the entry edge to the tile center. But PathfindingService uses Roblox's global NavMesh, which spans ALL tiles. The computed path routes south (back toward the origin tile) then west then north — crossing through Södermanlands län and potentially other tiles' territory. The NPC walks over other countries' tiles for ~8 seconds to traverse what should be a simple adjacent move.
+
+**Root cause location:** `NPCMovementSystem.luau`, lines ~930-945. The `computeWalkablePath()` call generates arrival waypoints using PathfindingService without any tile-boundary constraint. The cell-based BFS fallback (Strategy 2) IS tile-constrained but is never tried because PathfindingService succeeds (with an off-tile path).
+
+**Evidence from logs:**
+```
+[NPCMovement:Waypoints] Built 14 enriched waypoints:
+  [3] edge at (12.3, 4.6, 308.3) (Västmanlands län)  ← entry point
+  [4] pathfind at (12.9, 7.6, 304.4) (Västmanlands län)  ← goes SOUTH (backward!)
+  [5] pathfind at (11.0, 7.6, 302.7)  ← further south, into Södermanlands län territory
+  ...8 more waypoints circling around...
+  [14] tile at (17.2, 7.6, 312.1) (Västmanlands län)  ← finally arrives
+```
+
+Västmanlands län OBB Z-range is [305.6, 319.9]. Waypoint 4 at Z=304.4 and waypoint 5 at Z=302.7 are both OUTSIDE the tile's bounds, confirming the path crosses into neighboring tiles.
 
 ---
 
 ## File Structure
 
-All changes are in a single file:
+Two files modified, no new files created:
 
-- **Modify:** `ServerScriptService.TileAdjacencyManager` (2508 lines)
-  - Add new function `validateProofEndpoints` (~45 lines) near line 730 (after the edge-point helpers, before `isPathWalkable`)
-  - Modify `hasInterveningTileBetween` at line 1182 (threshold change: 1 line)
-  - Modify `calculateAdjacenciesFromFootprints` Phase 1 at lines 1241-1251 (wrap acceptance in validation gate)
-  - Modify `calculateExtendedAdjacencies` Phase 2 at lines 1390-1397 (wrap acceptance in validation gate)
-  - Modify `tryRepairAdjacencyPair` at lines 2356-2380 (wrap acceptance in validation gate)
-  - Add a `rejectedReasons.endpoint` counter in both Phase 1 and Phase 2 stat tracking
+- **Modify:** `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau` (~2090 lines)
+  - Task 1: Replace Y-conditional MoveTo with always-flattened MoveTo at lines ~1496-1503
+  - Task 3: Insert off-tile validation block after the `computeWalkablePath` call at line ~931
 
-No new files. No changes to NPCMovementSystem or any other script.
+- **Modify:** `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/TileAdjacencyManager.luau` (~2619 lines)
+  - Task 2a: Add `and classification ~= "strait"` to Phase 1 init endpoint validation condition at line ~1321
+  - Task 2b: Wrap Phase 2 init endpoint validation in `if classification ~= "strait"` at line ~1483
+  - Task 2c: Wrap tryRepairAdjacencyPair Phase 2 endpoint validation in `if classification ~= "strait"` at line ~2479
 
-**Design decision:** `applyExplicitStraitConnections()` (line 2399) intentionally does NOT go through `validateProofEndpoints`. Explicit straits are manually curated in `STRAIT_CONNECTIONS` and always connect regardless of geometry. The validation gate only applies to the automatic pipeline (Phase 1 raster, Phase 2 extended, and runtime repair).
-
----
-
-### Task 1: Add `validateProofEndpoints` function
-
-**Files:**
-- Modify: `ServerScriptService.TileAdjacencyManager` — insert new function after line 726 (after `getAABBEdge`, before the forward-declaration comment at line 728 / variable at line 729)
-
-This is the core evidence gate. It raycasts downward at each proof endpoint to verify the point actually lands on the expected tile, then samples the path for excessive void.
-
-- [ ] **Step 1: Add the validation function**
-
-Insert the following function after the `getAABBEdge` helper (line 726). This goes before the `hasInterveningTileBetween` forward declaration:
-
-```luau
--- Evidence gate: verify proof endpoints actually land on the claimed tiles.
--- Returns true if both endpoints raycast to their respective tiles and the path
--- is not void-dominated. Returns false (with reason string) if validation fails.
---
--- Small-tile fallback: if the raycast misses the expected tile but lands within
--- RASTER_CELL_SIZE of the tile's Position (XZ), accept with a warning.
--- This handles sub-cell tiles (e.g. Solrød Kommune at 0.9×0.6 studs) where
--- vertical raycasts can miss due to mesh precision.
-local VOID_RATIO_REJECTION_THRESHOLD = 0.6  -- reject if >60% of path samples hit nothing
-local ENDPOINT_PROXIMITY_FALLBACK = RASTER_CELL_SIZE  -- 2 studs — forgive endpoint miss if within this XZ distance of tile center
-
-local function validateProofEndpoints(tileA, tileB, pointA, pointB)
-	-- Raycast at pointA — should hit tileA
-	local rayParams = RaycastParams.new()
-	rayParams.FilterDescendantsInstances = { EUROPE_MAP }
-	rayParams.FilterType = Enum.RaycastFilterType.Include
-	rayParams.IgnoreWater = true
-
-	local hitA = Workspace:Raycast(Vector3.new(pointA.X, pointA.Y + 50, pointA.Z), Vector3.new(0, -100, 0), rayParams)
-	local aValid = hitA and hitA.Instance == tileA
-	if not aValid and hitA then
-		-- Small-tile fallback: accept if hit is near tileA's center
-		local dxA = pointA.X - tileA.Position.X
-		local dzA = pointA.Z - tileA.Position.Z
-		if math.sqrt(dxA * dxA + dzA * dzA) <= ENDPOINT_PROXIMITY_FALLBACK then
-			aValid = true
-		end
-	end
-	if not aValid then
-		local hitName = hitA and hitA.Instance.Name or "VOID"
-		return false, string.format("pointA hit %s instead of %s", hitName, tileA.Name)
-	end
-
-	-- Raycast at pointB — should hit tileB
-	local hitB = Workspace:Raycast(Vector3.new(pointB.X, pointB.Y + 50, pointB.Z), Vector3.new(0, -100, 0), rayParams)
-	local bValid = hitB and hitB.Instance == tileB
-	if not bValid and hitB then
-		local dxB = pointB.X - tileB.Position.X
-		local dzB = pointB.Z - tileB.Position.Z
-		if math.sqrt(dxB * dxB + dzB * dzB) <= ENDPOINT_PROXIMITY_FALLBACK then
-			bValid = true
-		end
-	end
-	if not bValid then
-		local hitName = hitB and hitB.Instance.Name or "VOID"
-		return false, string.format("pointB hit %s instead of %s", hitName, tileB.Name)
-	end
-
-	-- Void ratio check: sample 5 points along the path
-	local voidCount = 0
-	local totalSamples = 5
-	for i = 1, totalSamples do
-		local frac = i / (totalSamples + 1)
-		local sampleX = pointA.X + (pointB.X - pointA.X) * frac
-		local sampleZ = pointA.Z + (pointB.Z - pointA.Z) * frac
-		local sampleHit = Workspace:Raycast(
-			Vector3.new(sampleX, pointA.Y + 50, sampleZ),
-			Vector3.new(0, -100, 0),
-			rayParams
-		)
-		if not sampleHit then
-			voidCount = voidCount + 1
-		end
-	end
-
-	if voidCount / totalSamples > VOID_RATIO_REJECTION_THRESHOLD then
-		return false, string.format("void-dominated path (%d/%d void)", voidCount, totalSamples)
-	end
-
-	return true, nil
-end
-```
-
-- [ ] **Step 2: Verify the script parses**
-
-Run the game briefly (Start → Stop) and check the output console for syntax errors. The new function is not yet called, so behavior should be unchanged.
-
-- [ ] **Step 3: Commit**
-
-```
-git add -A && git commit -m "feat(adjacency): add validateProofEndpoints evidence gate function"
-```
+**IMPORTANT:** Edit these files using the Edit tool on the local `.luau` files on disk. Do NOT use the Roblox Studio MCP `multi_edit` tool.
 
 ---
 
-### Task 2: Lower the intervening tile threshold from >50% to ≥25%
+### Task 1: Y-flatten ALL MoveTo targets in the movement loop
+
+**Bug fixed:** Denmark — NPC falls off cliff faces when walking toward edge waypoints at Y=4.6.
 
 **Files:**
-- Modify: `ServerScriptService.TileAdjacencyManager:1182` — change the return condition
+- Modify: `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau`
 
-Currently line 1182 reads:
+**Why this is safe:** Roblox humanoids follow the ground surface via physics regardless of the `MoveTo` target's Y coordinate. The Y component only affects the *direction* the humanoid tries to move. By flattening Y to `root.Position.Y`, the humanoid walks horizontally while physics handles elevation changes (stepping up curbs, descending gentle slopes). This is already how the final tile-center waypoint works — this change just extends it to ALL waypoints.
+
+- [ ] **Step 1: Read the file and find the exact code to change**
+
+Read `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau` starting around line 1490. Find this exact 6-line block:
+
 ```luau
-return interveningCount > (totalSamples / 2)
+	-- For the final tile-centre waypoint, flatten the target to the NPC's current
+	-- floor Y so the humanoid navigates horizontally rather than toward an elevated
+	-- point.  The heartbeat XZ check (FINAL_TILE_ARRIVAL_THRESHOLD) handles arrival.
+	if isFinalTileDest then
+		humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))
+	else
+		humanoid:MoveTo(effectiveTarget)
+	end
 ```
 
-This requires MORE than 50% of samples (5+ out of 9) to find a third tile. Our audit showed the Midtjylland↔Sorø false adjacency had 4/9 = 44% intervening — just below threshold. Lowering to 25% means 3+ out of 9 samples blocks the pair.
+- [ ] **Step 2: Replace with always-Y-flattened MoveTo**
 
-- [ ] **Step 1: Change the threshold**
+Using the Edit tool on the file at `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau`, replace the exact 6-line block from Step 1 with this 4-line replacement:
 
-On line 1182, replace:
 ```luau
-	return interveningCount > (totalSamples / 2)
-```
-with:
-```luau
-	return interveningCount >= math.ceil(totalSamples * 0.25)
-```
-
-Also update the comment on line 1147-1149 to reflect the new threshold:
-```luau
--- Intervening tile detection using raster footprints.
--- Samples 9 fractions along the edge-to-edge path and checks CellToTilesMap.
--- Returns true if 25% or more of samples find a third tile between tileA and tileB.
+	-- Flatten ALL MoveTo targets to the NPC's current floor Y so the humanoid
+	-- navigates horizontally. Without this, edge waypoints at tile-surface height
+	-- (Y≈4.6) cause the humanoid to walk downward toward cliff faces and fall off.
+	-- Roblox physics keeps the humanoid grounded regardless of MoveTo Y.
+	humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))
 ```
 
-- [ ] **Step 2: Verify parse**
+**What changed:** Removed the `if isFinalTileDest then ... else ... end` conditional. Now ALL waypoints (edge, pathfind, tile) get Y-flattened to the NPC's current standing height. The `else` branch that used `humanoid:MoveTo(effectiveTarget)` with the raw Y is deleted.
 
-Start → Stop the game. Check console for errors. No behavioral test yet — the threshold change affects Phase 2 which runs at init.
+- [ ] **Step 3: Verify the edit**
 
-- [ ] **Step 3: Commit**
-
-```
-git add -A && git commit -m "fix(adjacency): lower intervening tile threshold from >50% to >=25%"
-```
+Read back lines ~1490-1510 of the modified file. Confirm:
+- The `if isFinalTileDest then` block is GONE
+- There is a single `humanoid:MoveTo(Vector3.new(effectiveTarget.X, root.Position.Y, effectiveTarget.Z))` line
+- The emergency brake code (`if not hasGroundAhead(...)`) still exists ABOVE the MoveTo line (it should be unchanged)
 
 ---
 
-### Task 3: Wire the validation gate into Phase 1 (calculateAdjacenciesFromFootprints)
+### Task 2: Skip endpoint validation for strait-classified tile pairs
+
+**Bug fixed:** Greece — adjacency detection fails for narrow-strait tiles (Κεντρική Μακεδονία ↔ Όρος Άθως) because `validateProofEndpoints` void-ratio check rejects water crossings.
 
 **Files:**
-- Modify: `ServerScriptService.TileAdjacencyManager:1241-1262` — wrap the acceptance block
+- Modify: `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/TileAdjacencyManager.luau`
 
-Phase 1 accepts adjacency at lines 1241-1255 after `_classifyCandidatePair` returns a classification. We need to validate the crossing endpoints before accepting.
+**Why this is safe:** The `_classifyCandidatePair()` function already validates strait geometry thoroughly: water gap ≤ 5 studs, no cliff failures, consecutive-miss pattern consistent with water, ground ratio checks, no intervening tiles. The `validateProofEndpoints` void-ratio check adds no value for straits (the path IS over water) and its endpoint-hit check fails for tiny tiles. For non-strait (land) classifications, `validateProofEndpoints` continues to run exactly as before — no change to land adjacency behavior.
 
-- [ ] **Step 1: Add validation gate and endpoint rejection counter**
+- [ ] **Step 2a: Fix Phase 1 init — add strait skip to condition**
 
-First, add an `endpoint` counter to the `rejected` table at line 1210. Change:
-```luau
-	local rejected = { distance = 0, unwalkable = 0 }
-```
-to:
-```luau
-	local rejected = { distance = 0, unwalkable = 0, endpoint = 0 }
-```
-
-Then, replace lines 1241-1262 (the full `if classification and crossing then ... else ... end` block) with:
+Read `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/TileAdjacencyManager.luau` and find this exact code inside the `calculateAdjacenciesFromFootprints` function (around line 1321):
 
 ```luau
-								if classification and crossing then
-									-- Evidence gate: validate proof endpoints hit the correct tiles
-									local epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
-									if epValid then
-										local proofMode = (classification == "strait") and "strait" or "raster"
-
-										table.insert(AdjacentTiles[tileA], tileB)
-										if not AdjacentTiles[tileB] then AdjacentTiles[tileB] = {} end
-										table.insert(AdjacentTiles[tileB], tileA)
-
-										if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
-										if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
-										AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
-										AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
-
-										if proofMode == "strait" then
-											narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
-										end
-									else
-										rejected.endpoint = rejected.endpoint + 1
-										if DEBUG_REJECTED_ADJACENCY then
-											print(string.format("[TileAdjacencyManager] Raster pair rejected (endpoint validation): %s <-> %s (%s)",
-												tileA.Name, tileB.Name, epReason or "unknown"))
-										end
+									if edgeDist > 0 then
+										epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
 									end
-								else
-									rejected.unwalkable = rejected.unwalkable + 1
-									if DEBUG_REJECTED_ADJACENCY then
-										print(string.format("[TileAdjacencyManager] Raster pair rejected (no land crossing; no narrow strait): %s <-> %s (edgeDist: %.1f)",
-											tileA.Name, tileB.Name, edgeDist))
+```
+
+Using the Edit tool, replace those 3 lines with:
+
+```luau
+									-- Skip endpoint validation for straits: _classifyCandidatePair
+									-- already validated the crossing geometry with multiple raycasts.
+									-- validateProofEndpoints void-ratio check rejects straits because
+									-- the path between edge points crosses water by definition.
+									if edgeDist > 0 and classification ~= "strait" then
+										epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
 									end
-								end
 ```
 
-**Important:** This replaces the entire `if classification ... else ... end` block (lines 1241-1262). The existing `else` branch for `rejected.unwalkable` (lines 1256-1262) is preserved in the replacement.
+**What changed:** Added `and classification ~= "strait"` to the `if` condition. When `_classifyCandidatePair` returns `"strait"`, `epValid` stays `true` (its initial value from line ~1319) and endpoint validation is skipped.
 
-Finally, update the stats print at line 1286 to include the endpoint counter. Change:
-```luau
-	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, narrow-strait=%d)",
-		totalConnections, avgConnections, rejected.distance, rejected.unwalkable, narrowStraitAcceptedCount))
-```
-to:
-```luau
-	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
-		totalConnections, avgConnections, rejected.distance, rejected.unwalkable, rejected.endpoint, narrowStraitAcceptedCount))
-```
+- [ ] **Step 2b: Fix Phase 2 init — wrap validation in strait check**
 
-- [ ] **Step 2: Start the game and check Phase 1 output**
-
-Start the game. In the console output, look for:
-```
-[TileAdjacencyManager] Rasterization adjacency complete: X connections ...
-```
-Verify the `endpoint=` counter is present and shows rejections. The total connection count should be lower than the previous ~1694.
-
-- [ ] **Step 3: Commit**
-
-```
-git add -A && git commit -m "fix(adjacency): wire endpoint validation into Phase 1 raster adjacency"
-```
-
----
-
-### Task 4: Wire the validation gate into Phase 2 (calculateExtendedAdjacencies)
-
-**Files:**
-- Modify: `ServerScriptService.TileAdjacencyManager:1315-1431` — add endpoint rejection counter and wrap acceptance
-
-- [ ] **Step 1: Add endpoint counter and validation gate**
-
-Add `endpoint = 0` to the `rejectedReasons` table at line 1315-1318. Change:
-```luau
-	local rejectedReasons = {
-		intervening = 0,
-		unwalkable = 0,
-	}
-```
-to:
-```luau
-	local rejectedReasons = {
-		intervening = 0,
-		unwalkable = 0,
-		endpoint = 0,
-	}
-```
-
-Then, wrap the acceptance block at lines 1390-1410. Replace:
-```luau
-			local classification, crossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
-			if classification and crossing then
-				local proofMode = (classification == "strait") and "strait" or "raster"
-				shouldConnect = true
-
-				if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
-				if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
-				AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
-				AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
-
-				if proofMode == "strait" then
-					narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
-					if DEBUG_EXTENDED_ADJACENCY or DEBUG_REJECTED_ADJACENCY then
-						local gapText = crossing.waterGapStuds and string.format("%.1f", crossing.waterGapStuds) or "?"
-						print(string.format("[TileAdjacencyManager] Narrow-strait adjacency: %s <-> %s (segment: %.1f, water gap: %s)",
-							tileA.Name, tileB.Name, crossing.distance, gapText))
-					end
-				end
-			else
-				rejectedCount = rejectedCount + 1
-				rejectedReasons.unwalkable = rejectedReasons.unwalkable + 1
-			end
-```
-
-with:
+In the same file, find this exact code inside the `calculateExtendedAdjacencies` function (around line 1481):
 
 ```luau
-			local classification, crossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and crossing then
 				-- Evidence gate: validate proof endpoints hit the correct tiles
 				local epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
 				if epValid then
-					local proofMode = (classification == "strait") and "strait" or "raster"
-					shouldConnect = true
+```
 
-					if not AdjacencyProof[tileA] then AdjacencyProof[tileA] = {} end
-					if not AdjacencyProof[tileB] then AdjacencyProof[tileB] = {} end
-					AdjacencyProof[tileA][tileB] = { mode = proofMode, pointA = crossing.pointA, pointB = crossing.pointB, distance = crossing.distance }
-					AdjacencyProof[tileB][tileA] = { mode = proofMode, pointA = crossing.pointB, pointB = crossing.pointA, distance = crossing.distance }
+Using the Edit tool, replace those 4 lines with:
 
-					if proofMode == "strait" then
-						narrowStraitAcceptedCount = narrowStraitAcceptedCount + 1
-						if DEBUG_EXTENDED_ADJACENCY or DEBUG_REJECTED_ADJACENCY then
-							local gapText = crossing.waterGapStuds and string.format("%.1f", crossing.waterGapStuds) or "?"
-							print(string.format("[TileAdjacencyManager] Narrow-strait adjacency: %s <-> %s (segment: %.1f, water gap: %s)",
-								tileA.Name, tileB.Name, crossing.distance, gapText))
-						end
-					end
-				else
-					rejectedCount = rejectedCount + 1
-					rejectedReasons.endpoint = rejectedReasons.endpoint + 1
-					if DEBUG_REJECTED_ADJACENCY then
-						print(string.format("[TileAdjacencyManager] Extended rejected (endpoint validation): %s <-> %s (%s)",
-							tileA.Name, tileB.Name, epReason or "unknown"))
-					end
+```luau
+			if classification and crossing then
+				-- Evidence gate: validate proof endpoints hit the correct tiles.
+				-- Skip for strait classifications — path crosses water by definition,
+				-- and _classifyCandidatePair already validated the crossing geometry.
+				local epValid = true
+				local epReason = nil
+				if classification ~= "strait" then
+					epValid, epReason = validateProofEndpoints(tileA, tileB, crossing.pointA, crossing.pointB)
 				end
-			else
-				rejectedCount = rejectedCount + 1
-				rejectedReasons.unwalkable = rejectedReasons.unwalkable + 1
-			end
+				if epValid then
 ```
 
-Update the stats print at line 1429 to include `endpoint`. Change:
-```luau
-	print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, narrow-strait=%d)",
-		extendedCount, rejectedCount,
-		rejectedReasons.intervening, rejectedReasons.unwalkable, narrowStraitAcceptedCount))
-```
-to:
-```luau
-	print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
-		extendedCount, rejectedCount,
-		rejectedReasons.intervening, rejectedReasons.unwalkable, rejectedReasons.endpoint, narrowStraitAcceptedCount))
-```
+**What changed:** Instead of always calling `validateProofEndpoints`, it is now wrapped in `if classification ~= "strait"`. For strait pairs, `epValid` defaults to `true` and `epReason` defaults to `nil`, so the pair proceeds to registration. For non-strait (land) pairs, behavior is identical to before.
 
-- [ ] **Step 2: Start the game and check Phase 2 output**
+- [ ] **Step 2c: Fix runtime repair — wrap validation in strait check**
 
-Start the game. In the console output, look for:
-```
-[TileAdjacencyManager] Extended adjacency: added X connections, rejected Y (intervening=..., unwalkable=..., endpoint=..., narrow-strait=...)
-```
-Verify `endpoint=` shows rejections. The extended adjacency count should be noticeably lower.
-
-- [ ] **Step 3: Commit**
-
-```
-git add -A && git commit -m "fix(adjacency): wire endpoint validation into Phase 2 extended adjacency"
-```
-
----
-
-### Task 5: Wire the validation gate into tryRepairAdjacencyPair
-
-**Files:**
-- Modify: `ServerScriptService.TileAdjacencyManager:2356-2380`
-
-The runtime repair function must also validate endpoints, otherwise a runtime repair could re-introduce a false adjacency that the init pipeline correctly rejected.
-
-- [ ] **Step 1: Add validation to both repair paths**
-
-Replace lines 2356-2380 (from the Phase 1 parity raster check through the final `ensureAdjacencyAndProof` call):
+In the same file, find this exact code inside the `tryRepairAdjacencyPair` function (around line 2478):
 
 ```luau
-	-- Phase 1 parity: raster-adjacent with walkability
-	if sharesRasterNeighborCell(tileA, tileB) and rasterEdgeDistance <= MAX_RASTER_ADJACENCY_DISTANCE then
-		local bestCrossing = _getBestWalkableBorderCrossing(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
-		if bestCrossing then
-			local epValid = validateProofEndpoints(tileA, tileB, bestCrossing.pointA, bestCrossing.pointB)
-			if epValid then
-				crossing = bestCrossing
-				mode = "raster"
-			end
-		end
-	end
-
-	-- Phase 2 parity: extended (intervening check + evidence-first classification)
-	if not crossing and rasterEdgeDistance > 0 and rasterEdgeDistance <= NARROW_STRAIT_THRESHOLD then
-		local hasIntervening = hasInterveningTileBetween(tileA, tileB, lookup)
-		if not hasIntervening then
-			local classification, classifyCrossing = _classifyCandidatePair(tileA, tileB, DEFAULT_CANDIDATE_K, "raster")
 			if classification and classifyCrossing then
 				local epValid = validateProofEndpoints(tileA, tileB, classifyCrossing.pointA, classifyCrossing.pointB)
 				if epValid then
-					crossing = classifyCrossing
-					mode = (classification == "strait") and "strait" or "raster"
+```
+
+Using the Edit tool, replace those 3 lines with:
+
+```luau
+			if classification and classifyCrossing then
+				-- Skip endpoint validation for straits — water crossing by definition
+				local epValid = true
+				if classification ~= "strait" then
+					epValid = validateProofEndpoints(tileA, tileB, classifyCrossing.pointA, classifyCrossing.pointB)
 				end
-			end
-		end
-	end
-
-	if not crossing or not mode then
-		return false
-	end
-
-	return ensureAdjacencyAndProof(tileA, tileB, mode, crossing)
+				if epValid then
 ```
 
-- [ ] **Step 2: Verify parse — Start → Stop game**
+**What changed:** Same pattern as Step 2b. Strait-classified pairs skip `validateProofEndpoints` in the runtime repair path.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 2d: Verify all changes — search for validateProofEndpoints calls**
 
-```
-git add -A && git commit -m "fix(adjacency): wire endpoint validation into tryRepairAdjacencyPair"
-```
+Read back each of the three modified sections. Then search the entire file for all calls to `validateProofEndpoints` to confirm:
+
+1. **Phase 1 init** (`calculateAdjacenciesFromFootprints`): Condition is now `if edgeDist > 0 and classification ~= "strait" then` ✓
+2. **Phase 2 init** (`calculateExtendedAdjacencies`): Wrapped in `if classification ~= "strait" then` ✓
+3. **tryRepairAdjacencyPair Phase 2**: Wrapped in `if classification ~= "strait" then` ✓
+4. **tryRepairAdjacencyPair Phase 1 parity** (around line 2463): Should be UNCHANGED — this path uses `_getBestWalkableBorderCrossing` (land-only, no classification), so the strait skip does not apply here. Verify it still reads `epValid = validateProofEndpoints(tileA, tileB, bestCrossing.pointA, bestCrossing.pointB)` without any strait condition.
 
 ---
 
-### Task 6: Run the map-wide adjacency audit
+### Task 3: Validate arrival pathfinding stays within tile boundaries
 
-**Files:** None (runtime diagnostic only)
+**Bug fixed:** Sweden — NPCs walk through neighboring tiles' territory during arrival pathfinding because PathfindingService routes through the global NavMesh.
 
-This is the acceptance test. Run the same audit from our investigation to measure improvement.
+**Files:**
+- Modify: `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau`
 
-- [ ] **Step 1: Start the game and run the audit script**
+**Why this is safe:** `TileAdjacencyManager.isPositionOnTile()` checks the tile's oriented bounding box (OBB), which is generous — only clearly off-tile waypoints are rejected. The fallback (cell-based BFS via `TileAdjacencyManager.findCellPath`) uses A* through the tile's raster footprint cells, which is guaranteed to stay within the tile. If BFS also fails, the existing fallback inserts no intermediates and the gap-crossing teleport warps the NPC directly to the tile center — the safest outcome.
 
-Execute this Luau in the command bar or via MCP `execute_luau`:
+- [ ] **Step 1: Read the file and find the insertion point**
+
+Read `/Users/maximushanna/Documents/Re-creation of Conquer Europe/src/shared/NPCMovementSystem.luau` starting around line 928. Find the arrival pathfinding section that looks like this:
 
 ```luau
-local TAM = require(game.ServerScriptService.TileAdjacencyManager)
-local europeMap = workspace:FindFirstChild("EuropeMap")
+				local arrivalSafeCenter = getTileSpawnPosition(currTile)
 
-local falseAdj = 0
-local trueAdj = 0
-local checked = {}
+				-- Strategy 1: PathfindingService
+				local arrivalPath = computeWalkablePath(lastWP.position, arrivalSafeCenter)
 
-local params = RaycastParams.new()
-params.FilterType = Enum.RaycastFilterType.Include
-params.FilterDescendantsInstances = {europeMap}
+				if #arrivalPath > 0 then
+```
 
-for _, country in ipairs(europeMap:GetChildren()) do
-	if not country:IsA("Model") then continue end
-	for _, tile in ipairs(country:GetChildren()) do
-		if not tile:IsA("BasePart") then continue end
-		local ok, adj = pcall(TAM.getAdjacentTiles, tile)
-		if not ok or type(adj) ~= "table" then continue end
-		for _, neighbor in ipairs(adj) do
-			local pairKey = tile.Name < neighbor.Name
-				and (tile.Name .. "|" .. neighbor.Name)
-				or (neighbor.Name .. "|" .. tile.Name)
-			if checked[pairKey] then continue end
-			checked[pairKey] = true
-			local ok2, proof = pcall(TAM.getAdjacencyProof, tile, neighbor)
-			if not ok2 or not proof or not proof.pointA or not proof.pointB then continue end
-			local midX = (proof.pointA.X + proof.pointB.X) / 2
-			local midZ = (proof.pointA.Z + proof.pointB.Z) / 2
-			local ray = workspace:Raycast(Vector3.new(midX, 20, midZ), Vector3.new(0, -40, 0), params)
-			local isFalse = false
-			if ray then
-				if ray.Instance ~= tile and ray.Instance ~= neighbor then
-					isFalse = true
+Note the exact position: the `computeWalkablePath` call, then a blank line, then `if #arrivalPath > 0 then`.
+
+- [ ] **Step 2: Insert tile boundary validation between path computation and the existing if-check**
+
+Using the Edit tool, find the exact string:
+
+```luau
+				local arrivalPath = computeWalkablePath(lastWP.position, arrivalSafeCenter)
+
+				if #arrivalPath > 0 then
+```
+
+Replace it with:
+
+```luau
+				local arrivalPath = computeWalkablePath(lastWP.position, arrivalSafeCenter)
+
+				-- Validate arrival path stays within tile boundaries.
+				-- PathfindingService uses the global NavMesh and can route through
+				-- neighboring tiles. If any waypoint is off-tile, discard the path
+				-- and fall back to cell-based BFS (constrained to raster footprint).
+				if #arrivalPath > 0 then
+					for _, pfPos in ipairs(arrivalPath) do
+						if not TileAdjacencyManager.isPositionOnTile(currTile, pfPos) then
+							if DEBUG then
+								print(string.format(
+									"[NPCMovement:Waypoints] Arrival path on %s crosses tile boundary at (%.1f, %.1f, %.1f), falling back to cell-based BFS",
+									currTile.Name, pfPos.X, pfPos.Y, pfPos.Z))
+							end
+							arrivalPath = {}
+							break
+						end
+					end
 				end
-			else
-				local rayA = workspace:Raycast(Vector3.new(proof.pointA.X, 20, proof.pointA.Z), Vector3.new(0, -40, 0), params)
-				local rayB = workspace:Raycast(Vector3.new(proof.pointB.X, 20, proof.pointB.Z), Vector3.new(0, -40, 0), params)
-				local hitA = rayA and (rayA.Instance == tile or rayA.Instance == neighbor)
-				local hitB = rayB and (rayB.Instance == tile or rayB.Instance == neighbor)
-				if not hitA and not hitB then isFalse = true end
-			end
-			if isFalse then falseAdj += 1 else trueAdj += 1 end
-		end
-	end
-end
 
-local total = falseAdj + trueAdj
-return string.format("AUDIT: %d total, %d true (%.1f%%), %d false (%.1f%%)",
-	total, trueAdj, trueAdj/total*100, falseAdj, falseAdj/total*100)
+				if #arrivalPath > 0 then
 ```
 
-- [ ] **Step 2: Verify results**
+**What changed:** A new validation block is inserted between the `computeWalkablePath` call and the original `if #arrivalPath > 0 then` check. For each PathfindingService waypoint, it checks if the XZ position is inside the destination tile's OBB using `TileAdjacencyManager.isPositionOnTile(currTile, pfPos)`. If ANY waypoint is outside the tile, the entire `arrivalPath` is cleared (`arrivalPath = {}`), which causes the original `if #arrivalPath > 0` to fall through to the `else` branch that tries cell-based BFS.
 
-**Expected (before):** 1674 total, 1434 true (85.7%), 240 false (14.3%)
+- [ ] **Step 3: Verify the edit**
 
-**Expected (after):** False adjacencies should drop to <30 (under 2%). The total connection count will also drop because the endpoint gate rejects bad pairs.
+Read back lines ~928-960 of the modified file. The code flow should now be:
+1. `computeWalkablePath` → `arrivalPath`
+2. **NEW:** Validation loop — check each waypoint against `isPositionOnTile`, clear array if any fails
+3. **EXISTING:** `if #arrivalPath > 0 then` → insert pathfind waypoints into enriched waypoints
+4. **EXISTING:** `else` → try cell-based BFS via `TileAdjacencyManager.findCellPath`
 
-If false adjacencies are still above 5%, investigate which pairs are slipping through and consider whether `VOID_RATIO_REJECTION_THRESHOLD` (0.6) needs tightening.
-
-- [ ] **Step 3: Spot-check Denmark specifically**
-
-Run this focused check on Denmark, the worst offender:
-
-```luau
-local TAM = require(game.ServerScriptService.TileAdjacencyManager)
-local dk = workspace.EuropeMap.Denmark
-local result = ""
-for _, tile in ipairs(dk:GetChildren()) do
-	if not tile:IsA("BasePart") then continue end
-	local ok, adj = pcall(TAM.getAdjacentTiles, tile)
-	if ok and type(adj) == "table" then
-		local names = {}
-		for _, n in ipairs(adj) do table.insert(names, n.Name) end
-		result ..= tile.Name .. ": " .. #adj .. " -> " .. table.concat(names, ", ") .. "\n"
-	end
-end
-return result
-```
-
-Verify:
-- Region Midtjylland should NOT be adjacent to Sorø, Kalundborg, Odsherred, or Holbæk (those are on Zealand, across the Great Belt)
-- Lolland Kommune should NOT be adjacent to Mecklenburg-Vorpommern or Schleswig-Holstein (unless via STRAIT_CONNECTIONS)
-- Bornholms Kommune should still have 0 adjacencies (isolated island — expected)
-
-- [ ] **Step 4: Commit any adjustments, or confirm success**
-
-If all checks pass, no code changes needed. If thresholds need tuning, adjust `VOID_RATIO_REJECTION_THRESHOLD` or `ENDPOINT_PROXIMITY_FALLBACK` and re-run.
-
-```
-git add -A && git commit -m "test(adjacency): verify v28 evidence gate reduces false adjacencies"
-```
+Verify that the EXISTING `if #arrivalPath > 0 then` block and its `else` branch (cell-based BFS) and inner `else` branch ("WARNING: No arrival path found") are ALL still present and unchanged.
 
 ---
 
-### Task 7: Run the game and verify NPC movement
+### Task 4: In-game verification
 
-**Files:** None (gameplay verification)
+**Files:** None (gameplay testing only)
 
-- [ ] **Step 1: Start a full play session**
+- [ ] **Step 1: Start the game in Roblox Studio Play mode**
 
-Start the game and let NPCs run for 30-60 seconds. Watch the console for:
-- `[NPCMovementSystem]` errors about invalid tiles or fall recovery
-- `[TileAdjacencyManager]` warnings about endpoint validation failures
+- [ ] **Step 2: Test Denmark fix (Task 1) — NPC should NOT fall off the map**
 
-- [ ] **Step 2: Verify no NPCs fall off the map in Denmark/Switzerland**
+1. Select a country that owns Schleswig-Holstein (Germany) or is at war with Denmark
+2. Buy an Attacker NPC on Schleswig-Holstein
+3. Click on Lolland Kommune (Denmark island south of Schleswig-Holstein) to move the NPC
+4. **PASS:** NPC walks horizontally to the tile edge, gets teleported across the gap to Lolland's center in under 2 seconds. Console does NOT show `[NPCMovement:GroundCheck] Near waypoint but no ground within 20 studs`.
+5. **FAIL:** NPC visibly falls off the tile edge or console shows ground-check warnings → verify Step 2 of Task 1 was applied correctly (the `if isFinalTileDest` block must be fully removed).
 
-Navigate to Denmark in-game. Watch NPCs moving between tiles. They should follow land paths and not teleport across water between islands.
+- [ ] **Step 3: Test Greece fix (Task 2) — movement should succeed, not fail with "not adjacent"**
 
-- [ ] **Step 3: Verify explicit straits still work**
+1. Select Greece as your country
+2. Buy an Attacker NPC on Κεντρική Μακεδονία (Central Macedonia, the large green/colored tile)
+3. Click on Όρος Άθως (Mount Athos — the tiny peninsula south-southeast of Macedonia)
+4. **PASS:** Movement succeeds. The NPC moves to Όρος Άθως. Console shows successful movement logs.
+5. **FAIL:** Console shows "Movement failed: Target tile (Όρος Άθως) is not adjacent" → check the TileAdjacencyManager init output for `Narrow-strait adjacency: Κεντρική Μακεδονία <-> Όρος Άθως`. If this line is missing, the Phase 2 `classification ~= "strait"` change (Step 2b) was not applied correctly.
 
-Check that the Schleswig-Holstein ↔ Lolland Kommune explicit strait (from `STRAIT_CONNECTIONS`) still functions. NPCs should be able to cross this strait since it's explicitly declared and bypasses the automatic pipeline.
+- [ ] **Step 4: Test Sweden fix (Task 3) — NPC should stay within destination tile**
 
-- [ ] **Step 4: Final commit**
+1. Select Sweden as your country
+2. Buy an Attacker NPC on Södermanlands län
+3. Click on Västmanlands län (the tile to the north/northwest) to move the NPC
+4. **PASS:** Console shows `[NPCMovement:Waypoints] Arrival path on Västmanlands län crosses tile boundary` followed by cell-based BFS usage. NPC moves within Västmanlands län's territory — does NOT walk south through Södermanlands län or other tiles.
+5. **FAIL:** NPC still walks through other tiles' territory → verify the validation block (Step 2 of Task 3) was inserted BEFORE the original `if #arrivalPath > 0 then`, not after it.
 
-```
-git add -A && git commit -m "v28: evidence-validated adjacency pipeline — 240 false adjacencies eliminated"
-```
+- [ ] **Step 5: Regression check — verify normal adjacent tile movement still works**
+
+Move NPCs between 3-4 normal adjacent land tiles that have always worked (e.g., France↔Germany border tiles, or any other well-connected tiles). Verify:
+- Movement succeeds without errors
+- NPCs walk smoothly between tiles
+- No new console errors or warnings
+- The TileAdjacencyManager init log still shows a reasonable number of connections (should be within ±5 of the previous count; the narrow-strait count may increase by 1-5, which is expected)
+
+---
+
+## Regression Safety Notes
+
+### Task 1 — Y-flattening
+- **No regression risk:** The final tile-center waypoint was ALREADY Y-flattened (the `if isFinalTileDest` branch). This change extends the same behavior to all intermediate waypoints. Roblox humanoid physics handles elevation changes (stepping up curbs, descending gentle slopes) regardless of the MoveTo Y target.
+- **Edge case to watch:** If any tile has internal ramps or stairs requiring active climbing, the humanoid might walk past instead of ascending. This is extremely unlikely for a flat Europe map game.
+
+### Task 2 — Strait validation skip
+- **No regression to land adjacencies:** The `classification ~= "strait"` check only affects pairs classified as `"strait"` by `_classifyCandidatePair`. All `"land"` classified pairs still go through `validateProofEndpoints` exactly as before.
+- **Expected adjacency increase:** The narrow-strait connection count in the Phase 2 init log may increase by ~1-5 connections. These are legitimate adjacent tiles that were incorrectly rejected by the void-ratio check. This is the intended fix.
+- **Why skipping is safe for straits:** `_classifyCandidatePair` already validates: water gap ≤ 5 studs, no cliff failures, multiple raycasts confirming land-water-land pattern, no intervening tiles (checked before classification). This is more thorough than `validateProofEndpoints`.
+
+### Task 3 — Off-tile pathfinding validation
+- **No regression to normal tiles:** For tiles where PathfindingService generates on-tile paths, the validation loop passes without clearing `arrivalPath`, and behavior is identical to before.
+- **Trade-off for affected tiles:** Some arrival paths that previously used PathfindingService will now use cell-based BFS. BFS paths are grid-aligned (less smooth) but guaranteed to stay within the tile. Correctness (staying in-tile) is more important than smoothness.
+- **The OBB check is generous:** `isPositionOnTile` uses the tile's full oriented bounding box, which is typically larger than the actual tile mesh. Only clearly off-tile waypoints (like the Sweden case at Z=302.7 vs tile Z-range [305.6, 319.9]) are caught.
