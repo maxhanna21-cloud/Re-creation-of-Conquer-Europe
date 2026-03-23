@@ -24,6 +24,7 @@ local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 30
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
 local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent", 10)
 local BreakAllianceEvent = ReplicatedStorage:WaitForChild("BreakAllianceEvent", 10)
+local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
 if not DiplomacyRequest then
 	warn("[DiplomacyGui] DiplomacyRequest RemoteEvent not found!")
@@ -49,6 +50,11 @@ local breakAllianceBtn = warPanel:WaitForChild("BreakAlliance", 10)
 local messageLabel = popup:WaitForChild("Message", 10)
 local acceptBtn = popup:WaitForChild("ButtonContainer", 10).AcceptButton
 local declineBtn = popup:WaitForChild("ButtonContainer", 10).DeclineButton
+
+-- ReminderPopup Elements
+local reminderPopup = gui:WaitForChild("ReminderPopup", 10)
+local reminderMessage = reminderPopup:WaitForChild("Message", 10)
+local reminderOkayBtn = reminderPopup:WaitForChild("ButtonContainer", 10):WaitForChild("OkayButton", 10)
 
 -- STATE VARIABLE (Prevents multiple clicks stacking up)
 local currentConnection = nil
@@ -173,4 +179,70 @@ DiplomacyRequest.OnClientEvent:Connect(function(senderName, requestType, request
 
 	-- FIX v2: Send response back to server via DiplomacyResponse RemoteEvent
 	DiplomacyResponse:FireServer(requestId, choice)
+end)
+
+---------------------------------------------------------
+-- PART 3: REMINDER POPUP (War declared / Alliance broken)
+---------------------------------------------------------
+-- Queue so that rapid-fire reminders show one at a time instead of
+-- stomping each other.  Each entry is { message, textColor }.
+local reminderQueue = {}
+local reminderActive = false
+
+local function processReminderQueue()
+	if reminderActive or #reminderQueue == 0 then return end
+	reminderActive = true
+
+	local entry = table.remove(reminderQueue, 1)
+	reminderMessage.Text = entry.message
+	reminderMessage.TextColor3 = entry.color
+	reminderPopup.Visible = true
+
+	-- Wait for the player to dismiss, or bail if the GUI gets destroyed
+	-- (e.g. character reset with ResetOnSpawn = true removes the ScreenGui)
+	local dismissed = false
+	local conn = reminderOkayBtn.MouseButton1Click:Connect(function()
+		dismissed = true
+	end)
+
+	while not dismissed and reminderPopup.Parent do
+		task.wait(0.1)
+	end
+
+	conn:Disconnect()
+	-- Guard: the popup may have been destroyed while we were waiting
+	if reminderPopup.Parent then
+		reminderPopup.Visible = false
+	end
+	reminderActive = false
+
+	-- Show the next queued reminder, if any
+	if #reminderQueue > 0 then
+		task.defer(processReminderQueue)
+	end
+end
+
+DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType)
+	local message, color
+
+	if eventType == "War" then
+		message = "⚔️ " .. aggressorCountry .. " has declared war on you!"
+		color = Color3.fromRGB(255, 80, 80)
+	elseif eventType == "BreakAlliance" then
+		message = "💔 " .. aggressorCountry .. " has broken their alliance with you!"
+		color = Color3.fromRGB(255, 180, 50)
+	elseif eventType == "AllianceAccepted" then
+		message = "🤝 " .. aggressorCountry .. " has accepted your alliance!"
+		color = Color3.fromRGB(100, 255, 100)
+	elseif eventType == "PeaceAccepted" then
+		message = "🕊️ " .. aggressorCountry .. " has signed your peace treaty!"
+		color = Color3.fromRGB(100, 200, 255)
+	else
+		-- Unknown type — log and ignore rather than show a blank popup
+		warn("[DiplomacyGui] Unknown reminder type: " .. tostring(eventType))
+		return
+	end
+
+	table.insert(reminderQueue, { message = message, color = color })
+	task.defer(processReminderQueue)
 end)

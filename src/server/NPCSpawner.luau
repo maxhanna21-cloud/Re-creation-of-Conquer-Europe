@@ -14,6 +14,13 @@ local CountryNPCRegistry = require(game.ServerScriptService:WaitForChild("Countr
 
 local NPC_TAG = "RegisteredNPC"
 
+-- =============================================
+-- CONFIG
+-- =============================================
+-- Set to true to paint each NPC's body parts with their country's tile color.
+-- Set to false to leave NPCs as the default template appearance.
+local NPC_COUNTRY_COLORS = true
+
 local NPCSpawner = {}
 
 local function setNPCCollisionGroup(npcModel)
@@ -46,7 +53,9 @@ function NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, ownerPlaye
 
 	local npcClone = npcTemplate:Clone()
 	setNPCCollisionGroup(npcClone)
-	setNPCBodyColor(npcClone, countryName)
+	if NPC_COUNTRY_COLORS then
+		setNPCBodyColor(npcClone, countryName)
+	end
 
 	local role = (npcType == "DefenderNPC") and "Defender" or "Attacker"
 

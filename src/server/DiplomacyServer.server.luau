@@ -19,6 +19,7 @@ local BreakAllianceEvent = ReplicatedStorage:WaitForChild("BreakAllianceEvent", 
 local GlobalNotificationEvent = ReplicatedStorage:WaitForChild("GlobalNotificationEvent", 10)
 local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 10)
 local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 10)
+local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
 -- HELPER: Find which country a player currently owns
 local function getPlayerCountry(player)
@@ -116,6 +117,12 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 	print("⚔️ WAR: " .. playerCountry .. " vs " .. targetCountryName)
 	local msg = "⚠️ WAR: " .. playerCountry .. " has declared war on " .. targetCountryName .. "!"
 	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 80, 80))
+
+	-- Personally remind the target country's owner via ReminderPopup
+	local targetOwner = getCountryOwner(targetCountryName)
+	if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
+		DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "War")
+	end
 end)
 
 ---------------------------------------------------------
@@ -156,11 +163,26 @@ BreakAllianceEvent.OnServerEvent:Connect(function(player, targetCountryName)
 	print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName)
 	local msg = "💔 " .. playerCountry .. " has broken their alliance with " .. targetCountryName .. "!"
 	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 100, 100))
+
+	-- Personally remind the target country's owner via ReminderPopup
+	if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
+		DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "BreakAlliance")
+	end
 end)
 
 ---------------------------------------------------------
 -- PART 2: PEACE & ALLIANCE LOGIC (Request System)
 ---------------------------------------------------------
+
+-- Monotonically incrementing counter for request IDs.
+-- Replaces tostring(tick()) which has a narrow collision window when two
+-- requests arrive within the same server frame (identical float timestamp).
+local nextRequestId = 0
+local function generateRequestId()
+	nextRequestId += 1
+	return tostring(nextRequestId)
+end
+
 local function processRequest(senderPlayer, targetCountryName, requestType)
 	local senderCountry = getPlayerCountry(senderPlayer)
 
@@ -222,7 +244,7 @@ local function processRequest(senderPlayer, targetCountryName, requestType)
 
 	-- FIX: Use fire-and-response pattern instead of InvokeClient
 	-- Store the pending request to handle the response
-	local requestId = tostring(tick())
+	local requestId = generateRequestId()
 	ServerState.setPendingDiplomacyRequest(requestId, {
 		senderPlayer = senderPlayer,
 		receiverPlayer = receiverPlayer,
@@ -280,6 +302,9 @@ DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
 		if requestType == "Alliance" then
 			DiplomacyManager.formAlliance(senderCountry, targetCountryName)
 			GlobalNotificationEvent:FireAllClients("🤝 ALLIANCE: " .. senderCountry .. " and " .. targetCountryName .. " are now allies!", Color3.fromRGB(100, 255, 100))
+
+			-- Personally remind the sender that their alliance was accepted
+			DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "AllianceAccepted")
 		elseif requestType == "Peace" then
 			DiplomacyManager.makePeace(senderCountry, targetCountryName)
 			-- FIX: Annex occupied tiles instead of releasing them
@@ -296,6 +321,9 @@ DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
 			end
 
 			GlobalNotificationEvent:FireAllClients("🕊️ PEACE: " .. senderCountry .. " and " .. targetCountryName .. " have signed a treaty. " .. annexMsg, Color3.fromRGB(100, 200, 255))
+
+			-- Personally remind the sender that their peace offer was accepted
+			DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "PeaceAccepted")
 		end
 	else
 		GlobalNotificationEvent:FireClient(senderPlayer, "❌ " .. targetCountryName .. " rejected your " .. requestType .. " request.", Color3.fromRGB(255, 200, 0))

@@ -1447,19 +1447,38 @@ local function monitorMovement(npcModel, isRetreat)
 
 		-- Tile capture / capital conquest logic
 		if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
-			TileOwnershipManager.captureTile(targetTilePart, owner)
-			local actualCapital = TileManager.getCountryCapital(tileCountry)
-			if actualCapital and targetTilePart == actualCapital then
-				local currentOwner = ServerState.resolveCountryOwner(tileCountry)
-				if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
-					safeCapitalCapture(tileCountry, owner)
-				elseif ServerState.isCountryUnowned(tileCountry) then
-					safeCapitalCapture(tileCountry, owner)
-				else
-					if DEBUG then
-						print(string.format("[NPCMovement] Captured %s's capital, but %s is already conquered (resolved owner: %s)",
-							tileCountry, tileCountry, tostring(currentOwner or "nil")))
+			-- FIX: War may have ended while the NPC was in transit (e.g. peace signed mid-move).
+			-- Only capture if the NPC's country is still actively at war with the tile's country.
+			-- Without this check, an Attacker that arrives after peace illegally changes tile
+			-- ownership and leaves the server in an inconsistent diplomatic/ownership state.
+			local stillAtWar = playerCountry ~= nil
+				and DiplomacyManager.areCountriesAtWar(playerCountry, tileCountry)
+
+			if stillAtWar then
+				TileOwnershipManager.captureTile(targetTilePart, owner)
+				local actualCapital = TileManager.getCountryCapital(tileCountry)
+				if actualCapital and targetTilePart == actualCapital then
+					local currentOwner = ServerState.resolveCountryOwner(tileCountry)
+					if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
+						safeCapitalCapture(tileCountry, owner)
+					elseif ServerState.isCountryUnowned(tileCountry) then
+						safeCapitalCapture(tileCountry, owner)
+					else
+						if DEBUG then
+							print(string.format("[NPCMovement] Captured %s's capital, but %s is already conquered (resolved owner: %s)",
+								tileCountry, tileCountry, tostring(currentOwner or "nil")))
+						end
 					end
+				end
+			else
+				-- Peace (or some other diplomatic change) ended the war before arrival.
+				-- The NPC stands on the tile without capturing it; the player can order it
+				-- to retreat manually, or it will engage again if war is re-declared.
+				if DEBUG then
+					print(string.format(
+						"[NPCMovement] %s arrived at %s tile but war with %s ended mid-transit — skipping capture",
+						npcModel.Name, tileCountry, tileCountry
+					))
 				end
 			end
 		elseif tileCountry and tileCountry == playerCountry then

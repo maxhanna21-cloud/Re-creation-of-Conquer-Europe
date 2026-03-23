@@ -60,6 +60,7 @@ countryScreen.Enabled = false
 
 local buttonConnections = {}
 local isOpening = false -- Guard to prevent overlapping polling loops
+local retryNow  = false -- Set true by InitializationComplete to short-circuit the retry sleep
 
 -- =============================================
 -- BUILD COUNTRY LIST UI
@@ -75,7 +76,15 @@ local function buildCountryList(countries)
 
 	buttonConnections = {}
 
-	for i, countryName in ipairs(countries) do
+	-- Sort a shallow copy so the server's original table is never mutated.
+	-- Case-insensitive so "Austria" always sorts before "Bosnia" regardless
+	-- of how the server capitalises country names.
+	local sorted = table.move(countries, 1, #countries, 1, {})
+	table.sort(sorted, function(a, b)
+		return string.lower(a) < string.lower(b)
+	end)
+
+	for i, countryName in ipairs(sorted) do
 		local btn = ButtonTemplate:Clone()
 		btn.Name = countryName
 		btn.Text = countryName
@@ -122,9 +131,21 @@ local function tryOpenMenu()
 			end
 
 			-- Wait before retrying; bail if the script's parent is being destroyed
-			-- (e.g., ScreenGui removed on death with ResetOnSpawn)
+			-- (e.g., ScreenGui removed on death with ResetOnSpawn).
+			-- Short-polls in 0.1s ticks so InitializationComplete can wake us
+			-- immediately instead of waiting the full 2s safety interval.
 			if not countryScreen.Parent then return end
-			task.wait(2)
+			-- If InitializationComplete already fired while InvokeServer was in flight,
+			-- skip the sleep entirely so we don't waste up to 2 seconds consuming a
+			-- signal that arrived before we had a chance to check it.
+			if not retryNow then
+				local elapsed = 0
+				while elapsed < 2 and not retryNow do
+					task.wait(0.1)
+					elapsed += 0.1
+				end
+			end
+			retryNow = false -- consume the signal after the wait (or skip)
 		end
 	end)
 
@@ -148,6 +169,7 @@ task.defer(tryOpenMenu)
 --      • For each late joiner on PlayerAdded
 --      • For each respawn where the player doesn't own a country (CharacterAdded)
 InitializationComplete.OnClientEvent:Connect(function()
+	retryNow = true -- wake the retry loop immediately if it's sleeping
 	if not isOpening then
 		tryOpenMenu()
 	end
