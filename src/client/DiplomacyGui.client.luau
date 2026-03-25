@@ -1,4 +1,5 @@
 -- LocalScript inside DiplomacyGui
+local DEBUG = false
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -14,11 +15,11 @@ gui.Enabled = false -- Keep it off until we join
 
 JoinSuccess.Event:Connect(function()
 	gui.Enabled = true -- Turn on the war/alliance buttons
-	print("Diplomacy GUI Activated!")
+	if DEBUG then print("Diplomacy GUI Activated!") end
 end)
 
 -- 2. GET REMOTES
--- FIX v3: Wait longer for server-created RemoteEvents
+-- Wait longer for server-created RemoteEvents
 local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 30)
 local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 30)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
@@ -59,7 +60,7 @@ local reminderOkayBtn = reminderPopup:WaitForChild("ButtonContainer", 10):WaitFo
 -- STATE VARIABLE (Prevents multiple clicks stacking up)
 local currentConnection = nil
 
--- FIX: Returns the effective owner of a tile.
+-- Returns the effective owner of a tile.
 -- OwnerCountry is set on BOTH capture and annexation (server-side).
 -- BasePart attributes replicate to clients automatically.
 local function getCountryFromPart(part)
@@ -87,29 +88,29 @@ local function startMapSelection(actionType, specificEvent)
 	-- If we were already selecting something, stop that first
 	if currentConnection then currentConnection:Disconnect() end
 
-	print("Select a country on the map for: " .. actionType)
+	if DEBUG then print("Select a country on the map for: " .. actionType) end
 
 	currentConnection = Mouse.Button1Down:Connect(function()
 		local target = Mouse.Target
 
-		-- FIX: Use robust country detection that handles nested parts
+		-- Use robust country detection that handles nested parts
 		local targetCountry = getCountryFromPart(target)
 		if targetCountry then
 			if actionType == "WAR" then
 				specificEvent:FireServer(targetCountry)
-				print("Sent War Declaration: " .. targetCountry)
+				if DEBUG then print("Sent War Declaration: " .. targetCountry) end
 
 			elseif actionType == "ALLIANCE" then
 				specificEvent:FireServer(targetCountry, "Alliance")
-				print("Sent Alliance Request: " .. targetCountry)
+				if DEBUG then print("Sent Alliance Request: " .. targetCountry) end
 
 			elseif actionType == "PEACE" then
 				specificEvent:FireServer(targetCountry, "Peace")
-				print("Sent Peace Offer: " .. targetCountry)
+				if DEBUG then print("Sent Peace Offer: " .. targetCountry) end
 
 			elseif actionType == "BREAKALLIANCE" then
 				specificEvent:FireServer(targetCountry)
-				print("Sent Break Alliance: " .. targetCountry)
+				if DEBUG then print("Sent Break Alliance: " .. targetCountry) end
 			end
 
 			-- Stop listening after one click
@@ -142,10 +143,10 @@ breakAllianceBtn.MouseButton1Click:Connect(function()
 end)
 
 ---------------------------------------------------------
--- PART 2: POPUP LISTENER (Your Request Logic) - FIXED v2
+-- PART 2: POPUP LISTENER (Your Request Logic)
 ---------------------------------------------------------
 
--- FIX v2: Changed from OnClientInvoke to OnClientEvent + DiplomacyResponse
+-- Changed from OnClientInvoke to OnClientEvent + DiplomacyResponse
 -- This prevents the "OnFireClient can only be used on the server" error
 DiplomacyRequest.OnClientEvent:Connect(function(senderName, requestType, requestId)
 	-- Update the UI text
@@ -167,18 +168,22 @@ DiplomacyRequest.OnClientEvent:Connect(function(senderName, requestType, request
 	conn1 = acceptBtn.MouseButton1Click:Connect(function() choice = true end)
 	conn2 = declineBtn.MouseButton1Click:Connect(function() choice = false end)
 
-	-- Wait here until player clicks
-	while choice == nil do
+	-- Wait here until player clicks or popup is destroyed
+	while choice == nil and popup.Parent do
 		task.wait(0.1)
 	end
 
 	-- Cleanup
 	conn1:Disconnect()
 	conn2:Disconnect()
-	popup.Visible = false
+	if popup.Parent then
+		popup.Visible = false
+	end
 
-	-- FIX v2: Send response back to server via DiplomacyResponse RemoteEvent
-	DiplomacyResponse:FireServer(requestId, choice)
+	-- Send response back to server via DiplomacyResponse RemoteEvent
+	if choice ~= nil then
+		DiplomacyResponse:FireServer(requestId, choice)
+	end
 end)
 
 ---------------------------------------------------------

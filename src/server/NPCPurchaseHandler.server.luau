@@ -1,7 +1,9 @@
--- NPCPurchaseHandler (MANPOWER VERSION) - FIXED v3
+-- NPCPurchaseHandler (MANPOWER VERSION)
 -- NPCs now cost Manpower instead of Coins
--- FIX v2: Added rate limiting cooldown to prevent spam
--- FIX v3: Added CollectionService tagging for diagnostics tracking
+-- Added rate limiting cooldown to prevent spam
+-- Added CollectionService tagging for diagnostics tracking
+
+local DEBUG = false
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local BuyNPCEvent = ReplicatedStorage:WaitForChild("BuyNPCEvent", 10)
@@ -75,7 +77,7 @@ BuyNPCEvent.OnServerEvent:Connect(function(player, npcType)
 			error("Failed to spawn NPC")
 		end
 
-		print(player.Name .. " bought a " .. npcType .. " for " .. cost .. " manpower")
+		if DEBUG then print(player.Name .. " bought a " .. npcType .. " for " .. cost .. " manpower") end
 	end)
 
 	-- ALWAYS release lock

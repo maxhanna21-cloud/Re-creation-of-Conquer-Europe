@@ -16,6 +16,10 @@ function CountryNPCRegistry.unregister(countryName, npcModel)
 	local set = CountryNPCIndex[countryName]
 	if set then
 		set[npcModel] = nil
+		-- Release the country table entirely once empty to prevent unbounded growth
+		if next(set) == nil then
+			CountryNPCIndex[countryName] = nil
+		end
 	end
 end
 
@@ -24,7 +28,10 @@ function CountryNPCRegistry.getNPCs(countryName)
 	if not set then return {} end
 	local npcs = {}
 	for npc in pairs(set) do
-		table.insert(npcs, npc)
+		-- Only include NPCs still present in the data model (guards the Died → Debris window)
+		if npc.Parent ~= nil then
+			table.insert(npcs, npc)
+		end
 	end
 	return npcs
 end

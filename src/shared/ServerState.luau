@@ -1,4 +1,4 @@
--- ServerState (ModuleScript in ServerScriptService) - UPDATED v3
+-- ServerState (ModuleScript in ServerScriptService)
 -- Centralized registry for shared server data
 -- Now includes CountryCoins, CountryManpower, AND OccupiedTerritories
 

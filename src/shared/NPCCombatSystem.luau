@@ -1,8 +1,10 @@
--- Module: NPCCombatSystem (COUNTRY PERSISTENCE VERSION) - FIXED v4
+-- Module: NPCCombatSystem (COUNTRY PERSISTENCE VERSION)
 -- NPCs can now be transferred between players when countries change hands
 -- Country-owned NPCs (no active player) remain idle until claimed
--- FIX v3: Combat now requires tile adjacency - NPCs can only attack enemies on adjacent tiles
--- FIX v4: Now uses DiplomacyManager.canAttack() which checks both war AND alliance status
+-- Combat requires tile adjacency - NPCs can only attack enemies on adjacent tiles
+-- Uses DiplomacyManager.canAttack() which checks both war AND alliance status
+-- Maid-owned lifecycle signals, idempotent registerNPC, ordered unregisterNPC,
+-- NPCMovementSystem.OnOwnerChanged wired into transferOwnership
 
 local PathfindingService = game:GetService("PathfindingService")
 local Debris = game:GetService("Debris")
@@ -19,6 +21,7 @@ local function getTileAdjacencyManager()
 	end
 	return TileAdjacencyManager
 end
+
 -- Lazy-load TileOwnershipManager to avoid circular dependency
 local TileOwnershipManager = nil
 local function getTileOwnershipManager()
@@ -26,6 +29,15 @@ local function getTileOwnershipManager()
 		TileOwnershipManager = require(game.ServerScriptService:WaitForChild("TileOwnershipManager", 10))
 	end
 	return TileOwnershipManager
+end
+
+-- Lazy-load NPCMovementSystem to avoid circular dependency
+local NPCMovementSystem = nil
+local function getNPCMovementSystem()
+	if not NPCMovementSystem then
+		NPCMovementSystem = require(game.ServerScriptService:WaitForChild("NPCMovementSystem", 10))
+	end
+	return NPCMovementSystem
 end
 
 -- Config
@@ -44,7 +56,7 @@ SERVER_OWNER.Parent = game:GetService("ReplicatedStorage")
 -- Internal tables
 local npcOwners = {}
 local npcRoles = {}
-local combatLoops = {}
+local combatLoops = {}   -- [npcModel] = token (unique table reference per loop instance)
 local npcCooldown = {}
 local defenderAttackers = {}  -- Tracks who is attacking each Defender
 local attackerThreats = {}    -- Tracks who is attacking each Attacker (for auto-retaliation)
@@ -56,7 +68,44 @@ local npcInCombat = {}  -- npcModel -> bool: tracks active combat state for Heal
 -- manualTargets[npcModel] = { targetModel1, targetModel2, ... }
 local manualTargets = {}
 
+-- Per-NPC runtime state bag, owns all lifecycle signals via the Maid.
+-- npcRuntime[npcModel] = { maid = Maid }
+local npcRuntime = {}
+
+---------------------------------------------------
+-- Private: Lightweight Maid / Janitor
+-- Owns per-NPC signals and cleanup callbacks.
+-- DoCleaning() disconnects all connections, calls all callbacks, then clears the task list.
+---------------------------------------------------
+
+local function newMaid()
+	local maid = { _tasks = {} }
+
+	function maid:Give(task)
+		table.insert(self._tasks, task)
+		return task
+	end
+
+	function maid:DoCleaning()
+		for _, task in ipairs(self._tasks) do
+			if typeof(task) == "RBXScriptConnection" then
+				task:Disconnect()
+			elseif typeof(task) == "function" then
+				task()
+			elseif typeof(task) == "Instance" then
+				task:Destroy()
+			end
+		end
+		table.clear(self._tasks)
+	end
+
+	return maid
+end
+
+---------------------------------------------------
 -- Utilities
+---------------------------------------------------
+
 local function getRootPart(model)
 	if not model then return nil end
 	return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model.PrimaryPart
@@ -81,15 +130,16 @@ local function cleanupDebugParts(modelName)
 	end
 end
 
-local function setupDeathCleanup(npcModel)
+-- Register Humanoid.Died cleanup through the NPC's maid so there is no hidden ownership.
+local function setupDeathCleanup(npcModel, maid)
 	local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
 
-	humanoid.Died:Once(function()
+	maid:Give(humanoid.Died:Once(function()
 		Combat.clearAllManualTargets(npcModel)
 		Combat.unregisterNPC(npcModel)
 		Debris:AddItem(npcModel, 0.5)
-	end)
+	end))
 end
 
 -- Enable or disable the Health regeneration script inside an NPC model
@@ -225,34 +275,42 @@ local function hasActivePlayerOwner(npcModel)
 	return currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") and currentOwner.Parent
 end
 
--- NEW: Check if two NPCs are on adjacent tiles
+-- Check if two NPCs are on adjacent tiles
 local function areNPCsOnAdjacentTiles(npcA, npcB)
 	local TAM = getTileAdjacencyManager()
 	return TAM.canNPCsInteract(npcA, npcB)
 end
 
--- Combat loop for ATTACKERS (now multi-target with split damage + auto-retaliation + adjacency check)
-local function startAttackerCombatLoop(npcModel, getAllTargets)
+---------------------------------------------------
+-- Combat Loops
+-- Each loop instance is identified by a unique token stored in combatLoops[npcModel].
+-- The loop exits when the token changes (re-registration) or when the NPC dies/is removed.
+---------------------------------------------------
+
+-- Shared combat loop for both Attackers and Defenders (multi-target with split damage + adjacency check).
+-- beamColor distinguishes the role visually (red for Attackers, blue for Defenders).
+local function startCombatLoop(npcModel, getAllTargets, beamColor)
 	if not npcModel then return end
 	if combatLoops[npcModel] then return end
 
-	combatLoops[npcModel] = true
+	-- Use a unique table reference as a generation token.
+	-- When re-registration nils combatLoops[npcModel], this loop detects the token mismatch and exits.
+	local token = {}
+	combatLoops[npcModel] = token
 
 	task.spawn(function()
 		local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-		local beamColor = Color3.fromRGB(255, 0, 0) -- Red for Attackers
 
-		while combatLoops[npcModel] and npcModel.Parent and humanoid and humanoid.Health > 0 do
+		while combatLoops[npcModel] == token and npcModel.Parent and humanoid and humanoid.Health > 0 do
 			local now = os.clock()
 
-			local allTargets = getAllTargets() -- Returns ALL valid target humanoids
+			local allTargets = getAllTargets()
 
 			-- Sync Health script with current combat state
 			updateCombatHealthState(npcModel, #allTargets > 0)
 
 			-- Only go idle if country-owned AND no targets/threats
 			if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
-				-- No active player owner AND no threats - NPC is idle
 				local root = getRootPart(npcModel)
 				if root then
 					humanoid:MoveTo(root.Position)
@@ -274,10 +332,10 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 						local targetRoot = getRootPart(firstTarget.Parent)
 						if targetRoot then
 							local targetPos = targetRoot.Position
-							local attackerPos = npcRoot.Position
+							local selfPos = npcRoot.Position
 							local lookAtCFrame = CFrame.lookAt(
-								attackerPos,
-								Vector3.new(targetPos.X, attackerPos.Y, targetPos.Z)
+								selfPos,
+								Vector3.new(targetPos.X, selfPos.Y, targetPos.Z)
 							)
 							npcRoot.CFrame = CFrame.new(npcRoot.CFrame.Position) * (lookAtCFrame - lookAtCFrame.Position)
 						end
@@ -310,93 +368,22 @@ local function startAttackerCombatLoop(npcModel, getAllTargets)
 			task.wait(LOOP_WAIT)
 		end
 
-		-- Only unregister if the NPC is actually being destroyed
-		if not npcModel.Parent then
+		-- Only unregister if we are still the active loop instance and the NPC is gone.
+		-- Token mismatch means we were superseded by a re-registration — exit silently.
+		if combatLoops[npcModel] == token and not npcModel.Parent then
 			Combat.unregisterNPC(npcModel)
 		end
 	end)
 end
 
--- Combat loop for DEFENDERS (multi-target with split damage - auto retaliation + adjacency check)
+-- Thin wrapper: starts the combat loop with red beams for Attackers.
+local function startAttackerCombatLoop(npcModel, getAllTargets)
+	startCombatLoop(npcModel, getAllTargets, Color3.fromRGB(255, 0, 0))
+end
+
+-- Thin wrapper: starts the combat loop with blue beams for Defenders.
 local function startDefenderCombatLoop(npcModel, getAllTargets)
-	if not npcModel then return end
-	if combatLoops[npcModel] then return end
-
-	combatLoops[npcModel] = true
-
-	task.spawn(function()
-		local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-		local beamColor = Color3.fromRGB(0, 150, 255) -- Blue for Defenders
-
-		while combatLoops[npcModel] and npcModel.Parent and humanoid and humanoid.Health > 0 do
-			local now = os.clock()
-
-			local allTargets = getAllTargets()
-
-			-- Sync Health script with current combat state
-			updateCombatHealthState(npcModel, #allTargets > 0)
-
-			-- Only go idle if country-owned AND no threats
-			if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
-				-- No active player owner AND no threats - NPC is idle
-				local root = getRootPart(npcModel)
-				if root then
-					humanoid:MoveTo(root.Position)
-				end
-				task.wait(LOOP_WAIT)
-				continue
-			end
-
-			if #allTargets > 0 then
-				local npcRoot = getRootPart(npcModel)
-
-				if npcRoot then
-					humanoid:MoveTo(npcRoot.Position)
-
-					local firstTarget = allTargets[1]
-					if firstTarget and firstTarget.Parent then
-						local targetRoot = getRootPart(firstTarget.Parent)
-						if targetRoot then
-							local targetPos = targetRoot.Position
-							local defenderPos = npcRoot.Position
-							local lookAtCFrame = CFrame.lookAt(
-								defenderPos,
-								Vector3.new(targetPos.X, defenderPos.Y, targetPos.Z)
-							)
-							npcRoot.CFrame = CFrame.new(npcRoot.CFrame.Position) * (lookAtCFrame - lookAtCFrame.Position)
-						end
-					end
-
-					if #allTargets > 0 then
-						local lastShot = npcCooldown[npcModel] or 0
-						if now - lastShot >= SHOOT_INTERVAL then
-							fireMultiLaser(npcModel, allTargets, beamColor)
-							npcCooldown[npcModel] = now
-						end
-					end
-				end
-			else
-				if DEBUG then
-					local targetKey = npcModel.Name .. "_Target"
-					if debugParts[targetKey] then
-						debugParts[targetKey]:Destroy()
-						debugParts[targetKey] = nil
-					end
-				end
-				local root = getRootPart(npcModel)
-				if root then
-					humanoid:MoveTo(root.Position)
-				end
-			end
-
-			task.wait(LOOP_WAIT)
-		end
-
-		-- Only unregister if the NPC is actually being destroyed
-		if not npcModel.Parent then
-			Combat.unregisterNPC(npcModel)
-		end
-	end)
+	startCombatLoop(npcModel, getAllTargets, Color3.fromRGB(0, 150, 255))
 end
 
 -- Public API
@@ -405,7 +392,8 @@ function Combat.getServerOwner()
 	return SERVER_OWNER
 end
 
--- Transfer ownership of an NPC to a new player (or nil for country-owned)
+-- Transfer ownership of an NPC to a new player (or nil for country-owned).
+-- Resets movement state via NPCMovementSystem.OnOwnerChanged.
 function Combat.transferOwnership(npcModel, newOwner)
 	if not npcModel then return false end
 
@@ -443,6 +431,13 @@ function Combat.transferOwnership(npcModel, newOwner)
 				table.remove(threats, i)
 			end
 		end
+	end
+
+	-- Reset movement state after ownership change so the NPC cannot retain:
+	-- active movement monitor, stale reservation, retreat state, or stale IsMoving.
+	local moveSystem = getNPCMovementSystem()
+	if moveSystem and moveSystem.OnOwnerChanged then
+		moveSystem.OnOwnerChanged(npcModel)
 	end
 
 	if DEBUG then
@@ -561,24 +556,43 @@ function Combat.clearManualTarget(attackerModel)
 	Combat.clearAllManualTargets(attackerModel)
 end
 
+-- Register an NPC with the combat system.
+-- Idempotent: calling this on an already-registered NPC cleans the old maid first,
+-- then creates a fresh maid and re-registers all signals. No duplicate callbacks.
 function Combat.registerNPC(npcModel, ownerPlayer, role)
 	if not npcModel or not role then return end
-	if combatLoops[npcModel] then return end
 
-	npcOwners[npcModel] = ownerPlayer
-	npcRoles[npcModel] = role
+	-- Idempotency: if already registered, clean the old lifecycle signals.
+	-- This clears old Destroying and Died connections but does NOT nil the combat tables —
+	-- the NPC is alive and should retain its external targeting state.
+	if npcRuntime[npcModel] then
+		npcRuntime[npcModel].maid:DoCleaning()
+		npcRuntime[npcModel] = nil
+		-- Nil the loop token so startAttackerCombatLoop / startDefenderCombatLoop can run fresh.
+		-- The old loop will detect the token mismatch on its next iteration and exit cleanly.
+		combatLoops[npcModel] = nil
+	end
 
-	npcModel.Destroying:Connect(function()
+	-- Create fresh maid and runtime bag
+	local maid = newMaid()
+	npcRuntime[npcModel] = { maid = maid }
+
+	-- Register Destroying through maid (replaces bare .Destroying:Connect)
+	maid:Give(npcModel.Destroying:Connect(function()
 		Combat.clearAllManualTargets(npcModel)
 		Combat.unregisterNPC(npcModel)
-	end)
+	end))
 
-	setupDeathCleanup(npcModel)
+	-- Register Humanoid.Died through maid (replaces setupDeathCleanup's hidden ownership)
+	setupDeathCleanup(npcModel, maid)
+
+	-- Update owner/role tables
+	npcOwners[npcModel] = ownerPlayer
+	npcRoles[npcModel] = role
 
 	if role == "Attacker" then
 		-- Attackers use multi-target combat with manually assigned targets + auto-retaliation
 		startAttackerCombatLoop(npcModel, function()
-			local npcOwner = Combat.getOwner(npcModel)
 			local allValidTargets = {}
 
 			-- Get all manual targets
@@ -657,7 +671,6 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 	else -- Defender
 		-- Defenders use multi-target combat with auto-retaliation
 		startDefenderCombatLoop(npcModel, function()
-			local defenderOwner = Combat.getOwner(npcModel)
 			local allValidTargets = {}
 
 			local attackers = defenderAttackers[npcModel] or {}
@@ -683,16 +696,37 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 		end)
 	end
 
-	local ownerLabel = ownerPlayer and ownerPlayer.Name or "Country-owned"
-	print("Registered NPC:", npcModel.Name, "| Role:", role, "| Owner:", ownerLabel)
+	if DEBUG then
+		local ownerLabel = ownerPlayer and ownerPlayer.Name or "Country-owned"
+		print("Registered NPC:", npcModel.Name, "| Role:", role, "| Owner:", ownerLabel)
+	end
 end
 
+-- Unregister an NPC from the combat system.
+-- Cleanup order is mandatory:
+--   Step 1: fetch npcRuntime
+--   Step 2: call maid:DoCleaning() BEFORE clearing tables (callbacks may read context)
+--   Step 3: nil npcRuntime entry
+--   Step 4: clear all cross-NPC target/threat references
+--   Step 5: nil all per-NPC combat state tables
+-- Idempotent: second call on already-unregistered NPC is safe.
 function Combat.unregisterNPC(npcModel)
 	if not npcModel then return end
 
 	cleanupDebugParts(npcModel.Name)
 
-	-- Remove this NPC from all other NPCs' target lists
+	-- Step 1: fetch runtime state
+	local runtime = npcRuntime[npcModel]
+
+	-- Step 2: clean maid before clearing tables so any callbacks in DoCleaning can still read state
+	if runtime then
+		runtime.maid:DoCleaning()
+	end
+
+	-- Step 3: nil the runtime entry
+	npcRuntime[npcModel] = nil
+
+	-- Step 4: Remove this NPC from all other NPCs' target/threat lists
 	for otherNPC, targets in pairs(manualTargets) do
 		for i = #targets, 1, -1 do
 			if targets[i] == npcModel then
@@ -701,7 +735,6 @@ function Combat.unregisterNPC(npcModel)
 		end
 	end
 
-	-- Remove from defender attacker lists
 	for defender, attackers in pairs(defenderAttackers) do
 		for i = #attackers, 1, -1 do
 			if attackers[i] == npcModel then
@@ -710,7 +743,6 @@ function Combat.unregisterNPC(npcModel)
 		end
 	end
 
-	-- Remove from attacker threat lists
 	for attacker, threats in pairs(attackerThreats) do
 		for i = #threats, 1, -1 do
 			if threats[i] == npcModel then
@@ -719,6 +751,7 @@ function Combat.unregisterNPC(npcModel)
 		end
 	end
 
+	-- Step 5: clear all per-NPC combat state tables
 	manualTargets[npcModel] = nil
 	npcOwners[npcModel] = nil
 	npcRoles[npcModel] = nil

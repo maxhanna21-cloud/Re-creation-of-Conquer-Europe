@@ -1,4 +1,4 @@
--- TileAdjacencyManager (ModuleScript in ServerScriptService) - v27 EVIDENCE-FIRST PIPELINE
+-- TileAdjacencyManager (ModuleScript in ServerScriptService) - EVIDENCE-FIRST PIPELINE
 -- Two-phase adjacency: Phase 1 raster, Phase 2 extended. Both use evidence-first classification.
 -- Distance creates candidacy; raycast evidence determines land vs strait vs reject.
 --   1. Try walkability (land crossing)
@@ -25,7 +25,7 @@ end
 
 -- Configuration
 local RASTER_CELL_SIZE = 2          -- Grid cell size in studs (smaller = more precise, slower init)
--- FIX v19: Diagonal raster neighbors are the root cause of false adjacencies.
+-- Diagonal raster neighbors are the root cause of false adjacencies.
 -- With RASTER_CELL_SIZE=2, diagonal cell-center distance = sqrt(2)*2 = 2.828 studs —
 -- exactly the crossing distance in every bad Italy/Switzerland log. Switching to
 -- 4-cardinal-only eliminates these false edges. Extended adjacency (Phase 2, threshold=3)
@@ -34,7 +34,7 @@ local ADJACENCY_ALLOW_DIAGONAL = false
 local DEBUG = false
 local BATCH_YIELD_AFTER = 80       -- yield after this many tiles while rasterizing (set 0 to disable)
 
--- FIX v9.5: Maximum distance for rasterization adjacencies
+-- Maximum distance for rasterization adjacencies
 -- Even if cells are grid neighbors, tiles must be within this edge distance to be adjacent
 -- Derived from RASTER_CELL_SIZE: diagonal cell neighbors are sqrt(2)*cell apart (~2.8 at cell=2).
 -- A 3x multiple (6 studs) covers all real neighbors; clamp(2x,4x) keeps it cell-proportional.
@@ -119,11 +119,11 @@ local STRAIT_CONNECTIONS = {
 	-- ================================================================
 }
 
--- local VALIDATE_EXTENDED_ONLY = true     -- FIX v9.2: Only validate EXTENDED adjacencies, trust rasterization
+-- local VALIDATE_EXTENDED_ONLY = true     -- Only validate EXTENDED adjacencies, trust rasterization
 local DEBUG_EXTENDED_ADJACENCY = false  -- enable to see which pairs get extended adjacency
-local DEBUG_REJECTED_ADJACENCY = true   -- enable to see which adjacencies are rejected
+local DEBUG_REJECTED_ADJACENCY = false   -- enable to see which adjacencies are rejected
 
--- FIX v9.3: Stricter water detection thresholds
+-- Stricter water detection thresholds
 local GROUND_RATIO_THRESHOLD = 0.85     -- Require 85% ground coverage (up from 60%)
 local MAX_CONSECUTIVE_MISSES = 1        -- If 2+ consecutive points miss ground, it's a water gap
 
@@ -142,7 +142,7 @@ local AllTilesList = {}    -- flat array of all tile parts
 local TileFootprint = {}   -- TileFootprint[tile] = { ["cx,cz"] = true, ... }
 local CellToTile = {}      -- CellToTile["cx,cz"] = tile (first tile found at this cell) - optional
 local TileSafeCenter = {}  -- TileSafeCenter[tile] = Vector3 (rasterization centroid, safe from edges)
-local CellToTilesMap = {}  -- FIX v12: Cell -> list of tiles, populated during adjacency calc, used by extended adjacency
+local CellToTilesMap = {}  -- Cell -> list of tiles, populated during adjacency calc, used by extended adjacency
 local _overlapMidpointLogged: {[string]: boolean} = {}  -- dedupe table: log overlapping-tile pairs once per adjacency build
 local AmbiguousPositionalBucketCount = 0
 local REPAIR_COOLDOWN_SECONDS = 30
@@ -250,7 +250,7 @@ local function calculateEdgeDistance(tileA, tileB)
 	return math.sqrt(gapX * gapX + gapZ * gapZ)
 end
 
--- FIX v21: True edge-touch predicate (not just "AABB gap ~0").
+-- True edge-touch predicate (not just "AABB gap ~0").
 -- Returns true only when two tiles share a real edge contact: one axis has gap <= eps
 -- AND the other axis has meaningful overlap (>= minOverlap studs).  This rejects:
 --   • corner-touch (gap ~0 in both axes but no shared edge length)
@@ -322,7 +322,7 @@ local function findClosestEdgePointsBBox(tileA, tileB)
 	return bestPointA, bestPointB, math.sqrt(bestDistSq)
 end
 
--- FIX v10: Find closest edge points using raster footprints (actual tile surface)
+-- Find closest edge points using raster footprints (actual tile surface)
 -- Bounding box edges can be far from the actual tile surface on rotated/irregular tiles.
 -- This function finds the closest pair of raster cell centers between two tiles,
 -- giving accurate edge-crossing points on real walkable surface.
@@ -411,7 +411,7 @@ local function findClosestEdgePoints(tileA, tileB)
 		return findClosestEdgePointsBBox(tileA, tileB)
 	end
 
-	-- FIX v25: Shift from cell centers to cell edges (toward the opposing tile).
+	-- Shift from cell centers to cell edges (toward the opposing tile).
 	-- Cell centers are RASTER_CELL_SIZE/2 inward from the true edge, inflating all
 	-- distances by up to 1 full cell size. For cardinal-neighbor cells (center dist = 2),
 	-- shifting each point 1 stud toward the other collapses the distance to 0 (touching).
@@ -429,15 +429,15 @@ local function findClosestEdgePoints(tileA, tileB)
 	-- Recompute distance after edge correction
 	bestDistSq = (bestCellB.x - bestCellA.x)^2 + (bestCellB.z - bestCellA.z)^2
 
-	-- FIX v15: Check if tiles are ACTUALLY far apart despite close boundary cells
+	-- Check if tiles are ACTUALLY far apart despite close boundary cells
 	-- (overlapping boundary cells but distant tile centers = false adjacency)
 	local rawCellDist = math.sqrt(bestDistSq)
 	local tileDelta = tileB.Position - tileA.Position
 	local actualTileDistance = math.sqrt(tileDelta.X * tileDelta.X + tileDelta.Z * tileDelta.Z)
 
-	-- FIX v16: Only enter the v15 branch when tiles are NOT physically touching (aabbDist > 0).
+	-- Only enter the distance-check branch when tiles are NOT physically touching (aabbDist > 0).
 	-- When aabbDist == 0, the tiles share a real border and the closest boundary cells are
-	-- legitimately adjacent — the v15 branch would incorrectly route them to BBox fallback,
+	-- legitimately adjacent — the distance-check branch would incorrectly route them to BBox fallback,
 	-- landing samples inside a third tile and causing walkability to fail.
 	local _aabbDistV15 = calculateEdgeDistance(tileA, tileB)
 	if rawCellDist < 0.5 and actualTileDistance > 10 and _aabbDistV15 > 0 then
@@ -653,7 +653,7 @@ local function _findCandidateEdgePoints(tileA, tileB, k)
 		return _findCandidateEdgePointsBBox(tileA, tileB, k)
 	end
 
-	-- FIX v15: Check for overlapping boundary cells on distant tiles
+	-- Check for overlapping boundary cells on distant tiles
 	local minDistSq = math.huge
 	for i = 1, heapSize do
 		if heap[i].distSq < minDistSq then
@@ -664,7 +664,7 @@ local function _findCandidateEdgePoints(tileA, tileB, k)
 	local tileDelta = tileB.Position - tileA.Position
 	local actualTileDistance = math.sqrt(tileDelta.X * tileDelta.X + tileDelta.Z * tileDelta.Z)
 
-	-- FIX v16: Only enter the v15 branch when tiles are NOT physically touching (aabbDist > 0).
+	-- Only enter the distance-check branch when tiles are NOT physically touching (aabbDist > 0).
 	-- When aabbDist == 0, the tiles share a real border and the closest boundary cells are
 	-- legitimately adjacent — skipping to BBox would pick corner samples inside a third tile.
 	local _aabbDistV15 = calculateEdgeDistance(tileA, tileB)
@@ -683,7 +683,7 @@ local function _findCandidateEdgePoints(tileA, tileB, k)
 	local candidates = {}
 	for i = 1, heapSize do
 		local entry = heap[i]
-		-- FIX v25: Shift from cell centers to cell edges (toward opposing tile)
+		-- Shift from cell centers to cell edges (toward opposing tile)
 		local cAx, cAz = entry.cellA.x, entry.cellA.z
 		local cBx, cBz = entry.cellB.x, entry.cellB.z
 		local cdx = cBx - cAx
@@ -800,7 +800,7 @@ end
 -- Forward declarations (defined later but called from the adjacency pipeline)
 local hasInterveningTileBetween
 
--- FIX v18.1: Added MAX_STEP_HEIGHT to strictly prevent cliffs from passing as walkable
+-- Added MAX_STEP_HEIGHT to strictly prevent cliffs from passing as walkable
 local function isPathWalkable(tileA, tileB, opts)
 	opts = opts or {}
 	local mode = opts.mode or "raster"
@@ -851,7 +851,7 @@ local function isPathWalkable(tileA, tileB, opts)
 
 	-- Strict Step Height Check Constants
 	local MAX_STEP_HEIGHT = 3.5 -- Allows walking up hills but blocks sheer cliffs
-	-- FIX v21: Track whether the PREVIOUS sample was a hit.  Only compare Y heights
+	-- Track whether the PREVIOUS sample was a hit.  Only compare Y heights
 	-- between consecutive hits.  The old code compared across gaps (miss runs),
 	-- which could falsely detect a "cliff" when samples crossed a small void and
 	-- landed on ground at a different height on the other side.
@@ -1273,7 +1273,7 @@ local function calculateAdjacenciesFromFootprints()
 		end
 	end
 
-	-- FIX v12: Store for use by extended adjacency calculations
+	-- Store for use by extended adjacency calculations
 	CellToTilesMap = CellToTilesLocal
 
 	-- Find adjacencies
@@ -1303,7 +1303,7 @@ local function calculateAdjacenciesFromFootprints()
 								if not pairsSeen[tileB] then pairsSeen[tileB] = {} end
 								pairsSeen[tileB][tileA] = true
 
-								-- FIX v9.5/v18: Validate actual edge distance before marking as adjacent
+								-- Validate actual edge distance before marking as adjacent
 								-- Use unified getRasterEdge helper for atomic (pointA, pointB, distance)
 								local _ptA, _ptB, edgeDist = getRasterEdge(tileA, tileB)
 								if edgeDist <= MAX_RASTER_ADJACENCY_DISTANCE then
@@ -1377,22 +1377,26 @@ local function calculateAdjacenciesFromFootprints()
 	totalConnections = totalConnections / 2
 
 	local avgConnections = (totalConnections * 2) / math.max(1, #AllTilesList)
-	print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
-		totalConnections, avgConnections, rejected.distance, rejected.unwalkable, rejected.endpoint, narrowStraitAcceptedCount))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Rasterization adjacency complete: %d connections, avg %.1f per tile (rejected: distance=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
+			totalConnections, avgConnections, rejected.distance, rejected.unwalkable, rejected.endpoint, narrowStraitAcceptedCount))
+	end
 
 	-- Top-5 tiles by neighbor count (outlier detection — tiles with unexpectedly many neighbors are suspicious)
-	local tilesByDegree = {}
-	for tile, neighbors in pairs(AdjacentTiles) do
-		table.insert(tilesByDegree, { name = tile.Name, degree = #neighbors })
-	end
-	table.sort(tilesByDegree, function(a, b) return a.degree > b.degree end)
-	local topN = math.min(5, #tilesByDegree)
-	if topN > 0 then
-		local parts = {}
-		for i = 1, topN do
-			table.insert(parts, tilesByDegree[i].name .. "(" .. tilesByDegree[i].degree .. ")")
+	if DEBUG then
+		local tilesByDegree = {}
+		for tile, neighbors in pairs(AdjacentTiles) do
+			table.insert(tilesByDegree, { name = tile.Name, degree = #neighbors })
 		end
-		print("[TileAdjacencyManager] Top-" .. topN .. " tiles by neighbor count: " .. table.concat(parts, ", "))
+		table.sort(tilesByDegree, function(a, b) return a.degree > b.degree end)
+		local topN = math.min(5, #tilesByDegree)
+		if topN > 0 then
+			local parts = {}
+			for i = 1, topN do
+				table.insert(parts, tilesByDegree[i].name .. "(" .. tilesByDegree[i].degree .. ")")
+			end
+			print("[TileAdjacencyManager] Top-" .. topN .. " tiles by neighbor count: " .. table.concat(parts, ", "))
+		end
 	end
 end
 
@@ -1400,7 +1404,7 @@ end
 -- try walkability first, then narrow-strait detection if walkability fails)
 local function calculateExtendedAdjacencies()
 	if EXTENDED_ADJACENCY_THRESHOLD <= 0 and NARROW_STRAIT_THRESHOLD <= 0 then
-		print("[TileAdjacencyManager] Extended adjacency disabled (thresholds <= 0)")
+		if DEBUG then print("[TileAdjacencyManager] Extended adjacency disabled (thresholds <= 0)") end
 		return
 	end
 
@@ -1538,9 +1542,11 @@ local function calculateExtendedAdjacencies()
 		end
 	end
 
-	print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
-		extendedCount, rejectedCount,
-		rejectedReasons.intervening, rejectedReasons.unwalkable, rejectedReasons.endpoint, narrowStraitAcceptedCount))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Extended adjacency: added %d connections, rejected %d (intervening=%d, unwalkable=%d, endpoint=%d, narrow-strait=%d)",
+			extendedCount, rejectedCount,
+			rejectedReasons.intervening, rejectedReasons.unwalkable, rejectedReasons.endpoint, narrowStraitAcceptedCount))
+	end
 end
 
 ---------------------------------------------------
@@ -1701,13 +1707,15 @@ local function calculateSafeCenters()
 		end
 	end
 
-	print(string.format("[TileAdjacencyManager] Safe centers calculated for %d tiles (%d used interior cells, %d needed surface fallback)",
-		#AllTilesList, interiorUsedCount, fallbackCount))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Safe centers calculated for %d tiles (%d used interior cells, %d needed surface fallback)",
+			#AllTilesList, interiorUsedCount, fallbackCount))
 
-	if #problemTiles > 0 then
-		print("[TileAdjacencyManager] WARNING: " .. #problemTiles .. " tiles may have problematic safe centers:")
-		for _, problem in ipairs(problemTiles) do
-			print("  - " .. problem.name .. " (" .. problem.reason .. ")")
+		if #problemTiles > 0 then
+			print("[TileAdjacencyManager] WARNING: " .. #problemTiles .. " tiles may have problematic safe centers:")
+			for _, problem in ipairs(problemTiles) do
+				print("  - " .. problem.name .. " (" .. problem.reason .. ")")
+			end
 		end
 	end
 end
@@ -1775,8 +1783,10 @@ local function scanAllTiles()
 		end
 	end
 	AmbiguousPositionalBucketCount = ambiguousBuckets
-	print(string.format("[TileAdjacencyManager] Scanned %d tiles across %d countries — all TileIds unique. Positional buckets: %d total, %d ambiguous (>1 tile per key)",
-		#AllTilesList, #EUROPE_MAP:GetChildren(), totalBuckets, ambiguousBuckets))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Scanned %d tiles across %d countries — all TileIds unique. Positional buckets: %d total, %d ambiguous (>1 tile per key)",
+			#AllTilesList, #EUROPE_MAP:GetChildren(), totalBuckets, ambiguousBuckets))
+	end
 end
 
 local function rasterizeAllTiles()
@@ -1798,7 +1808,7 @@ local function rasterizeAllTiles()
 				.. " (Size: " .. tostring(tile.Size) .. ")")
 		end
 
-		if idx % 200 == 0 or DEBUG then
+		if DEBUG and (idx % 200 == 0) then
 			print(string.format("[TileAdjacencyManager] Rasterized %d/%d tiles (%d cells so far)...",
 				idx, #AllTilesList, totalCells))
 		end
@@ -1809,8 +1819,10 @@ local function rasterizeAllTiles()
 		end
 	end
 
-	print(string.format("[TileAdjacencyManager] Rasterization complete: %d total cells (avg %.1f per tile)",
-		totalCells, totalCells / math.max(1, #AllTilesList)))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Rasterization complete: %d total cells (avg %.1f per tile)",
+			totalCells, totalCells / math.max(1, #AllTilesList)))
+	end
 end
 
 ---------------------------------------------------
@@ -2149,6 +2161,7 @@ end
 
 -- Debug info
 function TileAdjacencyManager.debugAdjacency(tileA, tileB)
+	if not DEBUG then return end
 	if not tileA or not tileB then
 		print("[DEBUG] One or both tiles are nil")
 		return
@@ -2164,7 +2177,7 @@ function TileAdjacencyManager.debugAdjacency(tileA, tileB)
 
 	local centerDist = ((tileA.Position - tileB.Position) * Vector3.new(1, 0, 1)).Magnitude
 
-	print("=== ADJACENCY DEBUG (v9.3 Water Fix) ===")
+	print("=== ADJACENCY DEBUG ===")
 	print("Tile A:", tileA.Name, "Country:", TileAdjacencyManager.getTileCountry(tileA), "Cells:", cellCountA)
 	print("Tile B:", tileB.Name, "Country:", TileAdjacencyManager.getTileCountry(tileB), "Cells:", cellCountB)
 	print("Center distance:", string.format("%.2f", centerDist))
@@ -2194,7 +2207,7 @@ function TileAdjacencyManager.getBestWalkableBorderCrossing(tileA, tileB, k, mod
 	return _getBestWalkableBorderCrossing(tileA, tileB, k, mode)
 end
 
--- FIX v10: Find the nearest point on a tile's actual surface to a target XZ position.
+-- Find the nearest point on a tile's actual surface to a target XZ position.
 -- Used to validate/correct edge crossing waypoints that may land off-tile on irregular shapes.
 -- Returns a corrected Vector3 on the tile surface, or nil if no surface found.
 function TileAdjacencyManager.findNearestSurfacePoint(tile, targetPoint)
@@ -2553,7 +2566,7 @@ local function applyExplicitStraitConnections()
 
 			if alreadyAdj then
 				-- Pair was found geometrically — no action needed, but log so it's visible.
-				print(string.format("[TileAdjacencyManager] Explicit strait (already adjacent, skipping): %s <-> %s", nameA, nameB))
+				if DEBUG then print(string.format("[TileAdjacencyManager] Explicit strait (already adjacent, skipping): %s <-> %s", nameA, nameB)) end
 			else
 				-- Force-register the adjacency (bidirectional).
 				AdjacentTiles[tileA] = AdjacentTiles[tileA] or {}
@@ -2586,13 +2599,15 @@ local function applyExplicitStraitConnections()
 				}
 
 				addedCount = addedCount + 1
-				print(string.format("[TileAdjacencyManager] Explicit strait registered: %s <-> %s (bbox dist=%.2f studs)", nameA, nameB, dist))
+				if DEBUG then print(string.format("[TileAdjacencyManager] Explicit strait registered: %s <-> %s (bbox dist=%.2f studs)", nameA, nameB, dist)) end
 			end
 		end
 	end
 
-	print(string.format("[TileAdjacencyManager] Explicit strait connections: %d new pair(s) registered (%d total declared)",
-		addedCount, #STRAIT_CONNECTIONS))
+	if DEBUG then
+		print(string.format("[TileAdjacencyManager] Explicit strait connections: %d new pair(s) registered (%d total declared)",
+			addedCount, #STRAIT_CONNECTIONS))
+	end
 end
 
 function TileAdjacencyManager.recalculate()
@@ -2603,13 +2618,13 @@ function TileAdjacencyManager.recalculate()
 	calculateSafeCenters()
 end
 
--- FIX v18: Export isPathWalkable for use in NPCMovementSystem
+-- Export isPathWalkable for use in NPCMovementSystem
 -- Now uses opts table for unambiguous parameters
 function TileAdjacencyManager.isPathWalkable(tileA, tileB, opts)
 	return isPathWalkable(tileA, tileB, opts)
 end
 
--- FIX v18: Export getAdjacencyProof for use in NPCMovementSystem
+-- Export getAdjacencyProof for use in NPCMovementSystem
 -- Returns adjacency proof for a tile pair, or nil if not adjacent
 -- Returns: { mode: "raster"|"strait"|"aabb"(legacy), pointA: Vector3, pointB: Vector3, distance: number } or nil
 function TileAdjacencyManager.getAdjacencyProof(tileA, tileB)

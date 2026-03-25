@@ -1,5 +1,5 @@
--- Clean NPC Diagnostics (COUNTRY PERSISTENCE VERSION) - FIXED v2
--- FIX: Uses CollectionService tags instead of iterating all workspace children
+-- Clean NPC Diagnostics (COUNTRY PERSISTENCE VERSION)
+-- Uses CollectionService tags instead of iterating all workspace children
 -- Now understands country-owned NPCs as a valid state
 
 local Combat = require(game.ServerScriptService:WaitForChild("NPCCombatSystem", 10))
@@ -7,6 +7,7 @@ local ServerState = require(game.ServerScriptService:WaitForChild("ServerState",
 local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
 
+local DEBUG = false
 local NPC_TAG = "RegisteredNPC" -- Tag applied to all NPCs
 
 local CHECK_INTERVAL = 10
@@ -37,19 +38,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
 		local idleCount = 0
 		local issues = 0
 
-		-- FIX: Use CollectionService to get only tagged NPCs
-		local taggedNPCs = CollectionService:GetTagged(NPC_TAG)
-
-		-- If no tagged NPCs, fall back to scanning workspace (backwards compatibility)
-		local npcsToCheck = taggedNPCs
-		if #npcsToCheck == 0 then
-			npcsToCheck = {}
-			for _, model in ipairs(workspace:GetChildren()) do
-				if model:IsA("Model") and model:FindFirstChild("Humanoid") and model:FindFirstChild("NPCOwner") then
-					table.insert(npcsToCheck, model)
-				end
-			end
-		end
+		-- Use CollectionService tags — authoritative NPC source
+		local npcsToCheck = CollectionService:GetTagged(NPC_TAG)
 
 		for _, model in ipairs(npcsToCheck) do
 			-- Validate model still exists and is an NPC
@@ -108,11 +98,11 @@ RunService.Heartbeat:Connect(function(deltaTime)
 			end
 		end
 
-		if totalCount > 0 then
-			print(string.format("--- DIAGNOSTICS: %d Total NPCs | %d Active | %d Country-Owned (Idle) | %d Issues ---", 
+		if DEBUG then
+			print(string.format("--- DIAGNOSTICS: %d Total NPCs | %d Active | %d Country-Owned (Idle) | %d Issues ---",
 				totalCount, activeCount, idleCount, issues))
 		end
 	end
 end)
 
-print("[NPCDiagnostics] Initialized - Use _G.TagNPCForDiagnostics(npc) to register NPCs for tracking")
+if DEBUG then print("[NPCDiagnostics] Initialized - Use _G.TagNPCForDiagnostics(npc) to register NPCs for tracking") end

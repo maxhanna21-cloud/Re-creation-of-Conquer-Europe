@@ -1,10 +1,10 @@
--- NPCMovementSystem (ModuleScript in ServerScriptService) - PATCHED v3
+-- NPCMovementSystem (ModuleScript in ServerScriptService)
 -- Backwards-compatible with your original API
 -- Added: teleport throttle, stuck detection + retry/backoff, OnOwnerChanged, safe-center validation
--- FIX v7: Edge detection during movement (hasGroundAhead) + path corridor correction to prevent map fall-off
--- FIX v8: Pathfinding now validates intermediate tiles for diplomacy and occupation
---         NPCs cannot path through enemy territory without war declared
---         NPCs cannot path through tiles occupied by other NPCs
+-- Edge detection during movement (hasGroundAhead) + path corridor correction to prevent map fall-off
+-- Pathfinding now validates intermediate tiles for diplomacy and occupation
+-- NPCs cannot path through enemy territory without war declared
+-- NPCs cannot path through tiles occupied by other NPCs
 
 local RunService = game:GetService("RunService")
 -- local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -44,12 +44,12 @@ local function getDependencies()
 end
 
 -- Configuration
-local DEBUG = true
+local DEBUG = false
 local ARRIVAL_THRESHOLD = 3      -- How close NPC must be to destination (XZ)
 local GROUND_CHECK_INTERVAL = 0.1 -- How often to check if NPC is on valid ground (faster = catches falls sooner)
 local MAP_MIN_Y = -500 -- INCREASED: Ensure this is lower than your lowest province
 local FALL_Y_THRESHOLD = -5      -- If NPC's Y velocity is below this, they are falling
-local IDLE_DRIFT_THRESHOLD = 2   -- FIX v6: Max studs an idle NPC can drift from tile center before being snapped back
+local IDLE_DRIFT_THRESHOLD = 2   -- Max studs an idle NPC can drift from tile center before being snapped back
 
 -- New configs
 local TELEPORT_MIN_INTERVAL = 1.0   -- seconds between teleports for same NPC
@@ -62,8 +62,8 @@ local SAFE_CENTER_GROUND_TOLERANCE = 100 -- INCREASED: Allows NPCs to "see" the 
 local MOVEMENT_PATH_DRIFT_MAX = 5        -- max studs NPC can drift from origin-to-target line before correction
 local EDGE_ARRIVAL_THRESHOLD = 2         -- tighter arrival threshold for edge-crossing waypoints (studs)
 local FINAL_TILE_ARRIVAL_THRESHOLD = 1.0 -- XZ-only threshold for the very last tile-centre waypoint (no MoveToFinished)
-local MAX_FALL_RECOVERIES = 3            -- FIX v9: max consecutive fall recoveries before aborting movement
-local FALL_RECOVERY_RESET_TIME = 5.0     -- FIX v9: seconds of no falls before counter resets
+local MAX_FALL_RECOVERIES = 3            -- max consecutive fall recoveries before aborting movement
+local FALL_RECOVERY_RESET_TIME = 5.0     -- seconds of no falls before counter resets
 
 -- Movement state tracking
 -- movementStates[npcModel] = { state = "Idle"/"Moving"/"Retreating", lastTeleport = number, stuckSince = number, lastSamplePos = Vector3, lastSampleTime = number, moveAttempts = int }
@@ -131,7 +131,7 @@ local function makeDebugPart(name, pos, size, color, life)
 end
 
 ---------------------------------------------------
--- FIX v4: Ground/Boundary Validation (extended)
+-- Ground/Boundary Validation (extended)
 ---------------------------------------------------
 
 local function isOnValidGround(npcModel)
@@ -157,7 +157,7 @@ local function isOnValidGround(npcModel)
 		return true
 	end
 
-	-- FIX v21 (hardened): If the NPC is actively moving near a waypoint, use a
+	-- If the NPC is actively moving near a waypoint, use a
 	-- RELAXED ground check (20-stud drop) instead of blindly returning true.
 	-- Edge waypoints sit at mesh-edge height (often Y=4.6) while tile interiors
 	-- are at Y=7.6+.  Walking downhill creates velocity that triggers
@@ -223,7 +223,7 @@ local function isOnValidGround(npcModel)
 	end
 
 	-- NPC is falling AND there's no tile below (checked all the way to MAP_MIN_Y)
-	-- FIX v21 (hardened): Only auto-true when the NPC is ACTUALLY in a gap-crossing
+	-- Only auto-true when the NPC is ACTUALLY in a gap-crossing
 	-- segment (departure-edge → arrival-edge on a DIFFERENT tile).  This is the
 	-- teleport corridor where no ground is expected.  Merely being "near an edge
 	-- waypoint" is not sufficient — the NPC could be falling off a map edge.
@@ -296,7 +296,7 @@ local function hasGroundAhead(npcModel, humanoid, distance)
 	return true
 end
 
--- FIX v8: Helper function to check if NPC can PASS THROUGH a tile (not capture, just traverse)
+-- Helper function to check if NPC can PASS THROUGH a tile (not capture, just traverse)
 -- This is more lenient than canMoveToTile since we allow passage through allied territory
 local function canPassThroughTile(owner, role, tilePart, playerCountry)
 	getDependencies()
@@ -304,14 +304,12 @@ local function canPassThroughTile(owner, role, tilePart, playerCountry)
 	if not tilePart then return false end
 
 	local tileCountry = TileAdjacencyManager.getTileCountry(tilePart)
-	local tileKey = TileManager.getTileKeyFromPart(tilePart)
 
-	-- Check tile occupation first - cannot pass through ANY occupied tiles
-	if tileKey then
-		local occupant = TileManager.getTileOccupant(tileKey)
-		if occupant then
-			return false -- Tile is occupied, block pathfinding through it
-		end
+	-- Check tile occupation first - cannot pass through ANY occupied tiles.
+	-- tilePart is already available here; resolve TileId directly (no key roundtrip).
+	local passCheckTileId = TileAdjacencyManager.getTileId(tilePart)
+	if TileManager.isTileOccupiedById(passCheckTileId) then
+		return false -- Tile is occupied, block pathfinding through it
 	end
 
 	-- Own territory - always allowed
@@ -335,7 +333,7 @@ local function canPassThroughTile(owner, role, tilePart, playerCountry)
 			if conquerorCountry == playerCountry then
 				return true
 			end
-			-- FIX v9: Handle conquered territory owned by someone else
+			-- Handle conquered territory owned by someone else
 			-- Check if allied with the conqueror
 			if DiplomacyManager.areCountriesAllied(playerCountry, conquerorCountry) then
 				return true
@@ -351,7 +349,7 @@ local function canPassThroughTile(owner, role, tilePart, playerCountry)
 			return true
 		end
 
-		-- Allied territory - allow passage (FIX v8: allies can pass through each other's territory)
+		-- Allied territory - allow passage (allies can pass through each other's territory)
 		if typeof(tileOwner) == "Instance" and tileOwner:IsA("Player") then
 			if DiplomacyManager.areAllied(owner, tileOwner) then
 				return true
@@ -381,7 +379,7 @@ local function canPassThroughTile(owner, role, tilePart, playerCountry)
 	return true
 end
 
--- FIX v8: Smart pathfinding through adjacent tiles WITH diplomacy validation
+-- Smart pathfinding through adjacent tiles WITH diplomacy validation
 -- Finds a safe route from source to destination using the adjacency graph
 -- Returns: list of tile parts to visit in order (shortest path)
 -- Now validates each intermediate tile for diplomacy and occupation
@@ -414,7 +412,7 @@ local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner
 			if neighbors and #neighbors > 0 then
 				for _, neighbor in ipairs(neighbors) do
 					if not visited[neighbor] then
-						-- FIX v18: Check if this edge is excluded (failed walkability this move)
+						-- Check if this edge is excluded (failed walkability this move)
 							local keyA = TileAdjacencyManager.getTileId(current)
 							local keyB = TileAdjacencyManager.getTileId(neighbor)
 						local isExcluded = false
@@ -436,7 +434,7 @@ local function findTilePath(sourceTilePart, destinationTilePart, maxDepth, owner
 							continue
 						end
 
-						-- FIX v8: Validate if we can pass through this tile
+						-- Validate if we can pass through this tile
 						-- For intermediate tiles, check passage rules
 						-- For the final destination, we use the stricter canMoveToTile check later
 						local isDestination = (neighbor == destinationTilePart)
@@ -589,7 +587,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 		local prevTile = tilePath[i - 1]
 		local currTile = tilePath[i]
 
-		-- FIX v18: Validate the path using adjacency proof points (if available)
+		-- Validate the path using adjacency proof points (if available)
 		-- This ensures runtime validation uses THE SAME points and mode that created the adjacency
 		local proof = TileAdjacencyManager.getAdjacencyProof(prevTile, currTile)
 		local walkabilityFailed = false
@@ -673,7 +671,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 				pointB and string.format("(%.1f,%.1f,%.1f)", pointB.X, pointB.Y, pointB.Z) or "nil"))
 		end
 
-		-- FIX v15: Safety check - if edge points are nil, skip gap crossing entirely
+		-- Safety check - if edge points are nil, skip gap crossing entirely
 		if not pointA or not pointB then
 			if DEBUG then
 				warn(string.format("[NPCMovement:Waypoints] Edge points are nil for %s -> %s, skipping gap crossing (will use center-to-center)",
@@ -685,13 +683,13 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 		-- Gap crossing: edge distance > 0.1 studs (epsilon to ignore floating-point noise on touching tiles)
 		local isGapCrossing = pointA and pointB and edgeDist > 0.1
 
-		-- FIX v9: For small gaps (< 3 studs), use simple direct movement instead of PathfindingService
+		-- For small gaps (< 3 studs), use simple direct movement instead of PathfindingService
 		-- PathfindingService often creates overly complex paths that lead to falls
 		local isSmallGap = edgeDist and edgeDist < 3.0
 
 		if isGapCrossing and isSmallGap then
 			-- Simple approach for small gaps: just add edge points (tile center added below)
-			-- FIX v15: Use corrected Y from surface validation (pointA/pointB already corrected above at lines 556-565)
+			-- Use corrected Y from surface validation (pointA/pointB already corrected above)
 			-- This preserves actual ground height instead of generic safeCenterA.Y
 			local safeCenterA = getTileSpawnPosition(prevTile)
 			local safeCenterB = getTileSpawnPosition(currTile)
@@ -721,7 +719,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 			-- Note: tile center waypoint is added below (line ~779)
 
 		elseif isGapCrossing then
-			-- FIX v15: Use corrected Y from surface validation (pointA/pointB already corrected above at lines 556-565)
+			-- Use corrected Y from surface validation (pointA/pointB already corrected above)
 			-- This preserves actual ground height instead of generic safeCenterA.Y
 			local safeCenterA = getTileSpawnPosition(prevTile)
 			local safeCenterB = getTileSpawnPosition(currTile)
@@ -744,7 +742,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 				for _, pfPos in ipairs(pfIntermediates) do
 					table.insert(waypoints, {
 						type = "pathfind",
-						position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
+						position = pfPos,  -- Preserve PathfindingService Y (handles slopes/ramps)
 						tile = prevTile
 					})
 				end
@@ -776,7 +774,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 					for _, pfPos in ipairs(pfCrossing) do
 						table.insert(waypoints, {
 							type = "pathfind",
-							position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
+							position = pfPos,  -- Preserve PathfindingService Y (handles slopes/ramps)
 							tile = prevTile
 						})
 					end
@@ -799,7 +797,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 						for _, pfPos in ipairs(pfDirect) do
 							table.insert(waypoints, {
 								type = "pathfind",
-								position = pfPos,  -- FIX v15: Preserve PathfindingService Y (handles slopes/ramps)
+								position = pfPos,  -- Preserve PathfindingService Y (handles slopes/ramps)
 								tile = nil
 							})
 						end
@@ -816,7 +814,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 							for _, cellPos in ipairs(cellPath) do
 								table.insert(waypoints, {
 									type = "pathfind",
-									position = cellPos,  -- FIX v15: Preserve cell path Y (from tile surface raycast)
+									position = cellPos,  -- Preserve cell path Y (from tile surface raycast)
 									tile = prevTile
 								})
 							end
@@ -846,7 +844,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 								for _, cellPos in ipairs(cellPathB) do
 									table.insert(waypoints, {
 										type = "pathfind",
-										position = cellPos,  -- FIX v15: Preserve cell path Y (from tile surface raycast)
+										position = cellPos,  -- Preserve cell path Y (from tile surface raycast)
 										tile = prevTile
 									})
 								end
@@ -918,7 +916,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 			})
 		end
 
-		-- FIX v11: Arrival-tile pathfinding
+		-- Arrival-tile pathfinding
 		-- After crossing a gap, pathfind from the arrival edge to the tile center.
 		-- Straight-line edge->center can cross voids on irregularly-shaped tiles.
 		if #waypoints >= 2 then
@@ -1013,7 +1011,7 @@ local function buildEnrichedWaypoints(tilePath, excludedEdges)
 end
 
 -- Teleport with throttle and safe-center validation
--- FIX v9: Track consecutive falls and abort movement if too many
+-- Track consecutive falls and abort movement if too many
 local function teleportToSafeTile(npcModel)
 	getDependencies()
 
@@ -1029,7 +1027,7 @@ local function teleportToSafeTile(npcModel)
 		return false
 	end
 
-	-- FIX v9: Track consecutive fall recoveries
+	-- Track consecutive fall recoveries
 	state.fallRecoveries = state.fallRecoveries or 0
 	state.lastFallRecovery = state.lastFallRecovery or 0
 
@@ -1041,7 +1039,7 @@ local function teleportToSafeTile(npcModel)
 	state.fallRecoveries = state.fallRecoveries + 1
 	state.lastFallRecovery = now
 
-	-- FIX v9: If too many consecutive falls during movement, abort the movement
+	-- If too many consecutive falls during movement, abort the movement
 	-- Note: Can't call stopMovement() here due to function ordering, so we inline the critical parts
 	if state.fallRecoveries > MAX_FALL_RECOVERIES and state.state == "Moving" then
 		if DEBUG then
@@ -1148,7 +1146,7 @@ local function startGroundCheck(npcModel)
 			end
 			teleportToSafeTile(npcModel)
 		else
-			-- FIX v6: snap idle drifters
+			-- Snap idle drifters
 			local state = NPCMovementSystem.getMovementState(npcModel)
 			if state == "Idle" then
 				local root = getRootPart(npcModel)
@@ -1425,7 +1423,9 @@ local function monitorMovement(npcModel, isRetreat)
 		local playerCountry = owner and TileManager.getPlayerCountry(owner)
 
 		-- Occupancy check — is another NPC already here?
-		local currentOccupant = TileManager.getTileOccupant(targetTileKey)
+		-- targetTilePart is already available; resolve TileId directly (no key roundtrip).
+		local arrivalTileId = TileAdjacencyManager.getTileId(targetTilePart)
+		local currentOccupant = TileManager.getTileOccupantById(arrivalTileId)
 		local isOccupiedByOther = currentOccupant ~= nil and currentOccupant ~= npcModel
 
 		if isOccupiedByOther then
@@ -1434,13 +1434,15 @@ local function monitorMovement(npcModel, isRetreat)
 			return
 		end
 
-		-- Release old tile, claim new tile
+		-- Release old tile, claim new tile.
+		-- releaseTile is a compatibility shim (resolves tileKey → tileId internally).
+		-- occupyResolvedTile uses targetTilePart directly — no key roundtrip.
+		local npcCountry = npcModel:GetAttribute("Country")
 		if originTileKey then
-			TileManager.releaseTile(npcModel:GetAttribute("Country"), originTileKey)
+			TileManager.releaseTile(npcCountry, originTileKey)
 		end
-		TileManager.occupyTileGlobal(targetTileKey, npcModel)
+		TileManager.occupyResolvedTile(npcCountry, targetTilePart, npcModel)
 		npcModel:SetAttribute("TileKey", targetTileKey)
-		local arrivalTileId = TileAdjacencyManager.getTileId(targetTilePart)
 		if arrivalTileId then
 			npcModel:SetAttribute("CurrentTileId", arrivalTileId)
 		end
@@ -1512,12 +1514,8 @@ local function monitorMovement(npcModel, isRetreat)
 		return
 	end
 
-	-- STILL MOVING: Apply path correction to keep NPC on safe corridor
+	-- STILL MOVING: steer toward next waypoint
 	local effectiveTarget = waypointPos
-
-	if corridorOrigin then
-		effectiveTarget = getPathCorrectedPosition(npcModel, corridorOrigin, waypointPos)
-	end
 
 	-- NEW: Emergency Brake System
 	if not hasGroundAhead(npcModel, humanoid, 3.5) then
@@ -1649,7 +1647,7 @@ local function canMoveToTile(owner, role, targetTilePart, playerCountry)
 			if conquerorCountry == playerCountry then
 				return true, nil
 			end
-			-- FIX v9: Handle conquered territory owned by someone else
+			-- Handle conquered territory owned by someone else
 			-- Check if allied with the conqueror
 			if DiplomacyManager.areCountriesAllied(playerCountry, conquerorCountry) then
 				return true, nil
@@ -1763,7 +1761,7 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		-- targetTileResolutionMethod = "getTileFromKeyWithFallback"
 	end
 
-	-- FIX v10: Validate NPC is actually near its resolved tile (defense-in-depth for TileKey mismatch)
+	-- Validate NPC is actually near its resolved tile (defense-in-depth for TileKey mismatch)
 	if currentTilePart then
 		local root = getRootPart(npcModel)
 		if root then
@@ -1817,7 +1815,7 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		return false, "Cannot determine if tiles are adjacent - resolution failed"
 	end
 
-	-- FIX v10/v18: If tiles are directly adjacent, use direct 2-tile path (skip BFS)
+	-- If tiles are directly adjacent, use direct 2-tile path (skip BFS)
 	-- This prevents routing through intermediate tiles when the destination is right next door.
 	-- Diplomacy/occupancy for the destination is checked separately by canMoveToTile below.
 	local playerCountry = TileManager.getPlayerCountry(owner)
@@ -1862,14 +1860,16 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 		end
 	end
 
-	-- FIX v8: playerCountry already defined above for pathfinding
+	-- playerCountry already defined above for pathfinding
 	local canMove, moveError = canMoveToTile(owner, role, resolvedTargetTilePart, playerCountry)
 	if not canMove then
 		return false, moveError
 	end
 
-	-- Occupancy check
-	local currentOccupant = TileManager.getTileOccupant(targetTileKey)
+	-- Occupancy check.
+	-- resolvedTargetTilePart is already available; resolve TileId directly (no key roundtrip).
+	local startMoveTileId = TileAdjacencyManager.getTileId(resolvedTargetTilePart)
+	local currentOccupant = TileManager.getTileOccupantById(startMoveTileId)
 	if currentOccupant and currentOccupant ~= npcModel then
 		return false, "Tile is occupied by another NPC"
 	end
@@ -1915,7 +1915,7 @@ function NPCMovementSystem.startMovement(npcModel, targetTileKey, targetTilePart
 	movementStates[npcModel].lastSampleTime = os.clock()
 	movementStates[npcModel].stuckSince = nil
 	movementStates[npcModel].moveAttempts = 0
-	movementStates[npcModel].fallRecoveries = 0  -- FIX v9: Reset fall recovery counter on new movement
+	movementStates[npcModel].fallRecoveries = 0  -- Reset fall recovery counter on new movement
 
 	-- Mark as moving and disable the Health regeneration script for the duration
 	npcModel:SetAttribute("IsMoving", true)

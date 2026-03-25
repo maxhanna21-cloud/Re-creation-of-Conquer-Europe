@@ -1,9 +1,10 @@
--- DiplomacyServer - FIXED v3
--- FIX #1: Prevents duplicate war declarations
--- FIX #2: Better validation and error messages
--- FIX #3: Full conquest-chain resolution via ServerState.resolveTarget()
+-- DiplomacyServer
+-- Prevents duplicate war declarations
+-- Better validation and error messages
+-- Full conquest-chain resolution via ServerState.resolveTarget()
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DEBUG = false
 local ServerScriptService = game:GetService("ServerScriptService")
 local Players = game:GetService("Players")
 
@@ -101,7 +102,7 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 		return
 	end
 
-	-- FIX #1: Use the return value from declareWar to check for duplicates
+	-- Use the return value from declareWar to check for duplicates
 	local success, message = DiplomacyManager.declareWar(playerCountry, targetCountryName)
 
 	if not success then
@@ -114,7 +115,7 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
 	end
 
 	-- War declared successfully - notify everyone
-	print("⚔️ WAR: " .. playerCountry .. " vs " .. targetCountryName)
+	if DEBUG then print("⚔️ WAR: " .. playerCountry .. " vs " .. targetCountryName) end
 	local msg = "⚠️ WAR: " .. playerCountry .. " has declared war on " .. targetCountryName .. "!"
 	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 80, 80))
 
@@ -160,7 +161,7 @@ BreakAllianceEvent.OnServerEvent:Connect(function(player, targetCountryName)
 	DiplomacyManager.breakAlliance(playerCountry, targetCountryName)
 
 	-- Notify everyone
-	print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName)
+	if DEBUG then print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName) end
 	local msg = "💔 " .. playerCountry .. " has broken their alliance with " .. targetCountryName .. "!"
 	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 100, 100))
 
@@ -240,7 +241,7 @@ local function processRequest(senderPlayer, targetCountryName, requestType)
 		end
 	end
 
-	print("📨 Sending " .. requestType .. " request from " .. senderCountry .. " to " .. targetCountryName)
+	if DEBUG then print("📨 Sending " .. requestType .. " request from " .. senderCountry .. " to " .. targetCountryName) end
 
 	-- FIX: Use fire-and-response pattern instead of InvokeClient
 	-- Store the pending request to handle the response
@@ -294,7 +295,7 @@ DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
 
 	-- Check if sender is still in game
 	if not senderPlayer.Parent then
-		print("[DiplomacyServer] Sender " .. senderPlayer.Name .. " left the game before response was received.")
+		if DEBUG then print("[DiplomacyServer] Sender " .. senderPlayer.Name .. " left the game before response was received.") end
 		return
 	end
 

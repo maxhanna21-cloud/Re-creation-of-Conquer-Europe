@@ -1,6 +1,8 @@
--- CountryManager (ServerScriptService) - FIXED v5
--- FIX v5: Wars and occupied territory persist when player leaves
+-- CountryManager (ServerScriptService)
+-- Wars and occupied territory persist when player leaves
 -- New player inherits wars and occupied tiles
+
+local DEBUG = false
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -56,11 +58,14 @@ TileManager = require(game:GetService("ServerScriptService"):WaitForChild("TileM
 -- DiplomacyManager NOT cleared when player leaves (wars persist)
 local DiplomacyManager = require(game:GetService("ServerScriptService"):WaitForChild("DiplomacyManager", 10))
 local NPCSpawner = require(game:GetService("ServerScriptService"):WaitForChild("NPCSpawner", 10))
+local CountryNPCRegistry = require(game:GetService("ServerScriptService"):WaitForChild("CountryNPCRegistry", 10))
 local CountryClaimedEvent = ReplicatedStorage:FindFirstChild("CountryClaimedEvent")
 
--- Income Loop States
-local CoinLoopRunning = false
-local ManpowerLoopRunning = false
+-- Income Loop States (table so generic helper can index by string key)
+local loopRunning = {
+	CoinLoopRunning = false,
+	ManpowerLoopRunning = false,
+}
 
 -- Income Configuration
 local COIN_INTERVAL = 10
@@ -77,7 +82,7 @@ local playerClaiming = {}
 local playerClaimTime = {}
 
 ---------------------------------------------------
--- Manpower Calculation System (Optimized v6)
+-- Manpower Calculation System
 ---------------------------------------------------
 
 local function calculateStartingManpower(stats, globalMins, globalMaxes, weights)
@@ -154,8 +159,10 @@ local function calculateAllStartingManpower()
 	for countryName, stats in pairs(finalStats) do
 		local manpower = calculateStartingManpower(stats, globalMins, globalMaxes, weights)
 		startingManpower[countryName] = manpower
-		print(string.format("[CountryManager] %s Manpower: %d (Pop: %d, Tiles: %d, Area: %.0f)", 
-			countryName, manpower, stats.population, stats.tileCount, stats.totalArea))
+		if DEBUG then
+			print(string.format("[CountryManager] %s Manpower: %d (Pop: %d, Tiles: %d, Area: %.0f)",
+				countryName, manpower, stats.population, stats.tileCount, stats.totalArea))
+		end
 	end
 
 	return startingManpower
@@ -175,22 +182,9 @@ local function getCapitalCFrame(countryName)
 	return capitalPart.CFrame * CFrame.new(0, capitalPart.Size.Y/2 + 5, 0)
 end
 
-local function getCountryNPCs(countryName)
-	local npcs = {}
-	for _, child in ipairs(Workspace:GetChildren()) do
-		if child:IsA("Model") and child:FindFirstChild("Humanoid") and child:FindFirstChild("NPCOwner") then
-			local npcCountry = child:GetAttribute("Country")
-			if npcCountry == countryName then
-				table.insert(npcs, child)
-			end
-		end
-	end
-	return npcs
-end
-
 local function transferCountryNPCs(countryName, newOwner)
 	local Combat = require(game:GetService("ServerScriptService"):WaitForChild("NPCCombatSystem", 10))
-	local npcs = getCountryNPCs(countryName)
+	local npcs = CountryNPCRegistry.getNPCs(countryName)
 
 	for _, npc in ipairs(npcs) do
 		local ownerValue = npc:FindFirstChild("NPCOwner")
@@ -202,18 +196,22 @@ local function transferCountryNPCs(countryName, newOwner)
 			local role = Combat.getRole(npc)
 			if role then
 				Combat.transferOwnership(npc, newOwner)
-				print("[CountryManager] Transferred " .. npc.Name .. " to " .. newOwner.Name)
+				if DEBUG then
+					print("[CountryManager] Transferred " .. npc.Name .. " to " .. newOwner.Name)
+				end
 			end
 		else
 			Combat.transferOwnership(npc, nil)
-			print("[CountryManager] " .. npc.Name .. " now country-owned (no player)")
+			if DEBUG then
+				print("[CountryManager] " .. npc.Name .. " now country-owned (no player)")
+			end
 		end
 	end
 
 	return #npcs
 end
 
--- FIX v5: Release countries WITHOUT clearing diplomacy or occupied territories
+-- Release countries WITHOUT clearing diplomacy or occupied territories
 local function releasePlayerCountries(player, reason)
 	local releasedAny = false
 	for country, owner in pairs(CountryOwners) do
@@ -225,7 +223,9 @@ local function releasePlayerCountries(player, reason)
 			local coins = leaderstats and leaderstats:FindFirstChild("Coins")
 			if coins then
 				ServerState.setCountryCoins(country, math.floor(coins.Value))
-				print("[CountryManager] Saved " .. coins.Value .. " coins to " .. country)
+				if DEBUG then
+					print("[CountryManager] Saved " .. coins.Value .. " coins to " .. country)
+				end
 				coins.Value = 0
 			end
 
@@ -233,24 +233,30 @@ local function releasePlayerCountries(player, reason)
 			local manpower = leaderstats and leaderstats:FindFirstChild("Manpower")
 			if manpower then
 				ServerState.setCountryManpower(country, math.floor(manpower.Value))
-				print("[CountryManager] Saved " .. manpower.Value .. " manpower to " .. country)
+				if DEBUG then
+					print("[CountryManager] Saved " .. manpower.Value .. " manpower to " .. country)
+				end
 				manpower.Value = 0
 			end
 
 			-- Transfer NPCs to country ownership (no player)
 			local npcCount = transferCountryNPCs(country, nil)
-			print("[CountryManager] " .. country .. " now has " .. npcCount .. " NPCs waiting for next player")
+			if DEBUG then
+				print("[CountryManager] " .. country .. " now has " .. npcCount .. " NPCs waiting for next player")
+			end
 
-			-- FIX v5: Do NOT clear diplomacy - wars persist!
+			-- Do NOT clear diplomacy - wars persist!
 			-- DiplomacyManager.clearCountryDiplomacy(country) -- REMOVED
 
-			-- FIX v5: Do NOT release occupied territories - they persist!
+			-- Do NOT release occupied territories - they persist!
 			-- Occupied territories remain owned by the COUNTRY
 
 			-- Release the country (mark as Unowned but keep wars active)
 			CountryOwners[country] = "Unowned"
-			print("[CountryManager] " .. country .. " released - " .. player.Name .. " " .. reason)
-			print("[CountryManager] Wars and occupied territories for " .. country .. " remain active")
+			if DEBUG then
+				print("[CountryManager] " .. country .. " released - " .. player.Name .. " " .. reason)
+				print("[CountryManager] Wars and occupied territories for " .. country .. " remain active")
+			end
 
 			-- Clear TileManager cache for this player
 			TileManager.updatePlayerCountryCache(player, nil)
@@ -293,12 +299,19 @@ local function hasAnyOwnedCountries()
 	return false
 end
 
--- COIN INCOME LOOP
-local function startCoinIncomeLoop()
-	while CoinLoopRunning do
+-- Generic income loop helper (coin and manpower loops differ only in config)
+local function startIncomeLoop(config)
+	-- config.loopFlag: string key into loopRunning table
+	-- config.interval: number (seconds between ticks)
+	-- config.incomeAmount: number (amount added per tick)
+	-- config.statName: string ("Coins" or "Manpower")
+	-- config.statSetter: function(countryName, amount)
+	while loopRunning[config.loopFlag] do
 		if not hasAnyOwnedCountries() then
-			print("[CountryManager] No owned countries remaining. Stopping coin income loop.")
-			CoinLoopRunning = false
+			if DEBUG then
+				print("[CountryManager] No owned countries remaining. Stopping " .. config.statName .. " income loop.")
+			end
+			loopRunning[config.loopFlag] = false
 			break
 		end
 
@@ -321,74 +334,48 @@ local function startCoinIncomeLoop()
 			end
 
 			local claimTime = playerClaimTime[resolvedOwner]
-			if claimTime and (now - claimTime) < COIN_INTERVAL then
+			if claimTime and (now - claimTime) < config.interval then
 				continue
 			end
 
 			local leaderstats = resolvedOwner:FindFirstChild("leaderstats")
-			local coins = leaderstats and leaderstats:FindFirstChild("Coins")
+			local statObj = leaderstats and leaderstats:FindFirstChild(config.statName)
 
-			if coins then
-				local newAmount = math.floor(coins.Value) + BASE_COIN_INCOME
-				coins.Value = newAmount
+			if statObj then
+				local newAmount = math.floor(statObj.Value) + config.incomeAmount
+				statObj.Value = newAmount
 				-- Only mirror to country treasury for directly-owned countries
 				if isDirectlyOwned then
-					ServerState.setCountryCoins(countryName, newAmount)
+					config.statSetter(countryName, newAmount)
 				end
 			end
 		end
-		task.wait(COIN_INTERVAL)
+		task.wait(config.interval)
 	end
-	print("[CountryManager] Coin income loop stopped.")
+	if DEBUG then
+		print("[CountryManager] " .. config.statName .. " income loop stopped.")
+	end
 end
 
--- MANPOWER INCOME LOOP
+-- Thin wrappers preserve original function names for callers
+local function startCoinIncomeLoop()
+	startIncomeLoop({
+		loopFlag = "CoinLoopRunning",
+		interval = COIN_INTERVAL,
+		incomeAmount = BASE_COIN_INCOME,
+		statName = "Coins",
+		statSetter = ServerState.setCountryCoins,
+	})
+end
+
 local function startManpowerIncomeLoop()
-	while ManpowerLoopRunning do
-		if not hasAnyOwnedCountries() then
-			print("[CountryManager] No owned countries remaining. Stopping manpower income loop.")
-			ManpowerLoopRunning = false
-			break
-		end
-
-		local now = os.clock()
-
-		for countryName, ownerValue in pairs(CountryOwners) do
-			local resolvedOwner
-			local isDirectlyOwned = false
-
-			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") then
-				resolvedOwner = ownerValue
-				isDirectlyOwned = true
-			elseif type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
-				resolvedOwner = ServerState.resolveCountryOwner(countryName)
-			end
-
-			if not resolvedOwner or typeof(resolvedOwner) ~= "Instance"
-				or not resolvedOwner:IsA("Player") or not resolvedOwner.Parent then
-				continue
-			end
-
-			local claimTime = playerClaimTime[resolvedOwner]
-			if claimTime and (now - claimTime) < MANPOWER_INTERVAL then
-				continue
-			end
-
-			local leaderstats = resolvedOwner:FindFirstChild("leaderstats")
-			local manpower = leaderstats and leaderstats:FindFirstChild("Manpower")
-
-			if manpower then
-				local newAmount = math.floor(manpower.Value) + BASE_MANPOWER_INCOME
-				manpower.Value = newAmount
-				-- Only mirror to country treasury for directly-owned countries
-				if isDirectlyOwned then
-					ServerState.setCountryManpower(countryName, newAmount)
-				end
-			end
-		end
-		task.wait(MANPOWER_INTERVAL)
-	end
-	print("[CountryManager] Manpower income loop stopped.")
+	startIncomeLoop({
+		loopFlag = "ManpowerLoopRunning",
+		interval = MANPOWER_INTERVAL,
+		incomeAmount = BASE_MANPOWER_INCOME,
+		statName = "Manpower",
+		statSetter = ServerState.setCountryManpower,
+	})
 end
 
 local function onCharacterRemoving(player, character)
@@ -433,7 +420,9 @@ local function handleCountrySelection(player, countryName)
 		ServerState.setCountryOwners(CountryOwners)
 		claimedCountryName = countryName
 		claimSucceeded = true
-		print("[CountryManager] " .. player.Name .. " claimed " .. countryName)
+		if DEBUG then
+			print("[CountryManager] " .. player.Name .. " claimed " .. countryName)
+		end
 
 		if CountryClaimedEvent then
 			CountryClaimedEvent:FireAllClients(countryName, player.Name)
@@ -448,51 +437,57 @@ local function handleCountrySelection(player, countryName)
 			countryStat.Value = countryName
 		end
 
-		-- FIX v5: Inherit resources (coins saved when previous player left)
+		-- Inherit resources (coins saved when previous player left)
 		local coins = leaderstats and leaderstats:FindFirstChild("Coins")
 		if coins then
 			local countryCoins = ServerState.getCountryCoins(countryName)
 			coins.Value = countryCoins
-			print("[CountryManager] " .. player.Name .. " inherited " .. countryCoins .. " coins from " .. countryName)
+			if DEBUG then
+				print("[CountryManager] " .. player.Name .. " inherited " .. countryCoins .. " coins from " .. countryName)
+			end
 		end
 
 		local manpower = leaderstats and leaderstats:FindFirstChild("Manpower")
 		if manpower then
 			local countryManpower = ServerState.getCountryManpower(countryName)
 			manpower.Value = countryManpower
-			print("[CountryManager] " .. player.Name .. " inherited " .. countryManpower .. " manpower from " .. countryName)
+			if DEBUG then
+				print("[CountryManager] " .. player.Name .. " inherited " .. countryManpower .. " manpower from " .. countryName)
+			end
 		end
 
-		-- FIX v5: Transfer NPCs to new player (they inherit country's army)
+		-- Transfer NPCs to new player (they inherit country's army)
 		local npcCount = transferCountryNPCs(countryName, player)
-		if npcCount > 0 then
+		if npcCount > 0 and DEBUG then
 			print("[CountryManager] " .. player.Name .. " inherited " .. npcCount .. " NPCs from " .. countryName)
 		end
 
-		-- FIX v5: Notify about inherited wars
+		-- Notify about inherited wars
 		local enemies = DiplomacyManager.getEnemies(countryName)
 		if #enemies > 0 then
-			print("[CountryManager] " .. player.Name .. " inherits wars against: " .. table.concat(enemies, ", "))
+			if DEBUG then
+				print("[CountryManager] " .. player.Name .. " inherits wars against: " .. table.concat(enemies, ", "))
+			end
 			local GlobalNotificationEvent = ReplicatedStorage:FindFirstChild("GlobalNotificationEvent")
 			if GlobalNotificationEvent then
 				GlobalNotificationEvent:FireClient(player, "⚠️ You are at war with: " .. table.concat(enemies, ", "), Color3.fromRGB(255, 200, 100))
 			end
 		end
 
-		-- FIX v5: Notify about inherited occupied territory
+		-- Notify about inherited occupied territory
 		local TileOwnershipManager = require(game:GetService("ServerScriptService"):WaitForChild("TileOwnershipManager", 10))
 		local occupiedCount = TileOwnershipManager.getCountryOccupiedCount(countryName)
-		if occupiedCount > 0 then
+		if occupiedCount > 0 and DEBUG then
 			print("[CountryManager] " .. player.Name .. " inherits " .. occupiedCount .. " occupied tiles")
 		end
 
-		if not CoinLoopRunning then
-			CoinLoopRunning = true 
+		if not loopRunning.CoinLoopRunning then
+			loopRunning.CoinLoopRunning = true
 			task.spawn(startCoinIncomeLoop)
 		end
 
-		if not ManpowerLoopRunning then
-			ManpowerLoopRunning = true
+		if not loopRunning.ManpowerLoopRunning then
+			loopRunning.ManpowerLoopRunning = true
 			task.spawn(startManpowerIncomeLoop)
 		end
 
@@ -531,7 +526,9 @@ local function handleCountrySelection(player, countryName)
 			TileManager.updatePlayerCountryCache(player, nil)
 			warn("[CountryManager] Rolled back failed claim of " .. claimedCountryName)
 		end
-		print("[CountryManager] Country selection failed: " .. tostring(errorMsg))
+		if DEBUG then
+			print("[CountryManager] Country selection failed: " .. tostring(errorMsg))
+		end
 	end
 end
 
@@ -562,7 +559,9 @@ local function spawnStarterNPCs()
 		end
 
 		NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, nil) -- nil = country-owned
-		print("[CountryManager] Spawned starter " .. npcType .. " for " .. countryName .. " (manpower: " .. manpower .. ")")
+		if DEBUG then
+			print("[CountryManager] Spawned starter " .. npcType .. " for " .. countryName .. " (manpower: " .. manpower .. ")")
+		end
 	end
 end
 
@@ -648,4 +647,6 @@ end)
 initializeCountries()
 InitializationComplete:FireAllClients()
 
-print("DEBUG: Map setup complete. CountryOwners table populated.")
+if DEBUG then
+	print("DEBUG: Map setup complete. CountryOwners table populated.")
+end

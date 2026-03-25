@@ -1,9 +1,10 @@
--- LocalScript inside CountrySelectionScreen (Server-Authoritative v2)
--- FIX: No longer reads replicated Country stat to decide visibility.
+-- LocalScript inside CountrySelectionScreen (Server-Authoritative)
+-- No longer reads replicated Country stat to decide visibility.
 --      The server's GetAvailableCountries response is the single source of truth:
 --        • table  → list of available countries (show selection screen)
 --        • false  → player already owns a country (hide screen)
 --        • nil    → server not ready yet (retry)
+local DEBUG = false
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
@@ -211,4 +212,4 @@ CountryClaimedEvent.OnClientEvent:Connect(function(claimedCountry, claimingPlaye
 	end
 end)
 
-print("[CountrySelectionScreen] Server-authoritative logic initialized.")
+if DEBUG then print("[CountrySelectionScreen] Server-authoritative logic initialized.") end

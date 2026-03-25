@@ -1,13 +1,17 @@
--- TileManager (ModuleScript - ACTUAL TILES VERSION) - UPDATED v4
--- FIX: Now uses centralized TileKeyUtils for consistent tile key generation
+-- TileManager (ModuleScript)
+-- Now uses centralized TileKeyUtils for consistent tile key generation
 -- Added: Global tile occupation tracking for movement system
 -- Added: Helper functions for checking tile occupation by player
+-- TileId is 100% authoritative for all occupancy reads and writes.
+-- Positional key maps (GlobalOccupiedTiles, OccupiedTiles[country][key])
+-- are DEBUG mirrors only — never read by gameplay logic.
 
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
 local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 
 local TileManager = {}
+local DEBUG = false
 local ServerState = require(game:GetService("ServerScriptService"):WaitForChild("ServerState", 10))
 
 -- FIX: Use centralized tile key utility
@@ -33,14 +37,18 @@ end
 -- VALID TILES CACHE: { [countryName] = { Vector3, Vector3, ... } }
 local ValidTiles = {}
 
--- OCCUPIED TILES (by country): { [countryName] = { ["x,z"] = npcModel } }
+-- OCCUPIED TILES (by country): { [countryName] = { [tileId] = npcModel } }
+-- Now keyed by tileId (not positional tileKey).
 local OccupiedTiles = {}
 
--- NEW: GLOBAL TILE OCCUPATION (for movement system): { ["x,z"] = npcModel }
-local GlobalOccupiedTiles = {}
--- TileId-primary occupancy map (enabled conditionally when positional key ambiguity is high)
+-- DEBUG MIRROR — positional-key global table.
+-- MUST NOT be read by gameplay logic. Maintained only for debugging convenience.
+-- All occupancy reads must use GlobalOccupiedTilesById.
+local GlobalOccupiedTiles = {} -- DEBUG ONLY — not read by gameplay logic
+
+-- AUTHORITATIVE global occupancy map: { [tileId] = npcModel }
+-- This is the ONLY table that gameplay logic reads for occupancy.
 local GlobalOccupiedTilesById = {}
-local UseTileIdOccupancy = nil
 
 -- Tile statistics for manpower calculation
 -- { [countryName] = { tileCount = N, totalArea = X, avgArea = Y } }
@@ -69,32 +77,6 @@ end
 -- Get the tile key from a BasePart (tile)
 function TileManager.getTileKeyFromPart(tilePart)
 	return TileKeyUtils.getTileKeyFromPart(tilePart)
-end
-
-local function shouldUseTileIdOccupancy()
-	if UseTileIdOccupancy ~= nil then
-		return UseTileIdOccupancy
-	end
-
-	local tam = getTileAdjacencyManager()
-	local ambiguous = 0
-	if tam.getAmbiguousPositionalBucketCount then
-		ambiguous = tam.getAmbiguousPositionalBucketCount() or 0
-	end
-	UseTileIdOccupancy = ambiguous > 10
-	print(string.format("[TileManager] TileId occupancy gate: ambiguous positional buckets=%d -> %s",
-		ambiguous, UseTileIdOccupancy and "ENABLED" or "DISABLED"))
-	return UseTileIdOccupancy
-end
-
-local function getTileIdFromKey(tileKey)
-	if not tileKey then return nil end
-	local tam = getTileAdjacencyManager()
-	local tilePart = tam.getTileFromKey(tileKey)
-	if not tilePart then
-		tilePart = tam.getTileFromKeyWithFallback(tileKey)
-	end
-	return tam.getTileId(tilePart)
 end
 
 ---------------------------------------------------
@@ -141,9 +123,9 @@ local function scanCountryTiles(countryModel)
 		table.insert(ValidTiles[countryName], center)
 		validCount = 1
 		totalArea = 100 -- Default area for fallback
-		print(string.format("[TileManager] %s: Using center fallback (1 tile)", countryName))
+		if DEBUG then print(string.format("[TileManager] %s: Using center fallback (1 tile)", countryName)) end
 	else
-		print(string.format("[TileManager] %s: %d valid tiles found, total area: %.0f", countryName, validCount, totalArea))
+		if DEBUG then print(string.format("[TileManager] %s: %d valid tiles found, total area: %.0f", countryName, validCount, totalArea)) end
 	end
 
 	-- Store tile statistics
@@ -160,7 +142,7 @@ local function initializeAllCountries()
 			scanCountryTiles(countryModel)
 		end
 	end
-	print("[TileManager] All countries scanned.")
+	if DEBUG then print("[TileManager] All countries scanned.") end
 end
 
 ---------------------------------------------------
@@ -182,10 +164,10 @@ end
 function TileManager.updatePlayerCountryCache(player, countryName)
 	if countryName then
 		PlayerCountryCache[player] = countryName
-		print(string.format("[TileManager] Cache updated: %s -> %s", player.Name, countryName))
+		if DEBUG then print(string.format("[TileManager] Cache updated: %s -> %s", player.Name, countryName)) end
 	else
 		PlayerCountryCache[player] = nil
-		print(string.format("[TileManager] Cache cleared for: %s", player.Name))
+		if DEBUG then print(string.format("[TileManager] Cache cleared for: %s", player.Name)) end
 	end
 end
 
@@ -201,7 +183,7 @@ function TileManager.rebuildCache()
 			PlayerCountryCache[owner] = countryName
 		end
 	end
-	print("[TileManager] Cache rebuilt from ServerState")
+	if DEBUG then print("[TileManager] Cache rebuilt from ServerState") end
 end
 
 ---------------------------------------------------
@@ -215,13 +197,10 @@ function TileManager.getSpawnPosition(player)
 	local tiles = ValidTiles[countryName]
 	if not tiles or #tiles == 0 then return nil end
 
-	local occupied = OccupiedTiles[countryName]
-
 	local TOM = getTileOwnershipManager()
 	local TAM = getTileAdjacencyManager()
 
-	local function getSafeSpawnPos(tileKey, fallbackPos)
-		local tilePart = TAM.getTileFromKey(tileKey)
+	local function getSafeSpawnPos(tilePart, fallbackPos)
 		if tilePart then
 			local safeCenter = TAM.getSafeCenter(tilePart)
 			if safeCenter then return safeCenter end
@@ -229,8 +208,8 @@ function TileManager.getSpawnPosition(player)
 		return fallbackPos
 	end
 
-	local function isEnemyOccupied(tileKey)
-		local tilePart = TAM.getTileFromKey(tileKey)
+	-- Check if a tile is occupied by an enemy country (diplomatic occupation, not NPC occupancy)
+	local function isEnemyDiplomaticOccupied(tilePart)
 		if not tilePart then return false end
 		if TOM.isOccupied(tilePart) and not TOM.isOccupiedByCountry(tilePart, countryName) then
 			return true
@@ -241,22 +220,26 @@ function TileManager.getSpawnPosition(player)
 	-- Build unified pool of all available tiles (home + conquered)
 	local allCandidates = {}
 
-	-- Add home tiles
+	-- Add home tiles: filter out NPC-occupied tiles (by TileId) and enemy-occupied tiles
 	for _, tilePos in ipairs(tiles) do
-		local key = getTileKey(tilePos)
-		if not occupied[key] and not isEnemyOccupied(key) then
-			table.insert(allCandidates, { key = key, pos = tilePos })
+		local tileKey = getTileKey(tilePos)
+		local tilePart = TAM.getTileFromKey(tileKey)
+		local tileId = tilePart and TAM.getTileId(tilePart)
+		-- Skip tiles with standing NPCs (TileId-authoritative) or enemy diplomatic occupants
+		if not TileManager.isTileOccupiedById(tileId) and not isEnemyDiplomaticOccupied(tilePart) then
+			table.insert(allCandidates, { tilePart = tilePart, tileKey = tileKey, pos = tilePos })
 		end
 	end
 
-	-- Add conquered/occupied territory tiles
+	-- Add conquered/occupied territory tiles: filter by TileId occupancy
 	local conqueredTiles = TOM.getCountryOccupiedTiles(countryName)
 	for _, tilePart in ipairs(conqueredTiles) do
 		if tilePart and tilePart.Parent then
-			local spawnPos = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
-			local key = getTileKey(spawnPos)
-			if not GlobalOccupiedTiles[key] then
-				table.insert(allCandidates, { key = key, pos = spawnPos })
+			local tileId = TAM.getTileId(tilePart)
+			if not TileManager.isTileOccupiedById(tileId) then
+				local spawnPos = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
+				local tileKey = getTileKey(tilePart.Position)
+				table.insert(allCandidates, { tilePart = tilePart, tileKey = tileKey, pos = spawnPos })
 			end
 		end
 	end
@@ -273,114 +256,184 @@ function TileManager.getSpawnPosition(player)
 	end
 
 	local chosen = allCandidates[1]
-	return getSafeSpawnPos(chosen.key, chosen.pos), chosen.key
+	return getSafeSpawnPos(chosen.tilePart, chosen.pos), chosen.tileKey
 end
 
--- Occupy a tile within a country
+---------------------------------------------------
+-- Authoritative Occupancy API (TileId-based)
+-- These are the preferred low-level occupancy functions.
+-- All other occupancy functions must delegate to these.
+---------------------------------------------------
+
+-- PRIMARY: Occupy a tile using a pre-resolved tilePart.
+-- Always writes to GlobalOccupiedTilesById (authoritative) and OccupiedTiles[country] (by tileId).
+-- GlobalOccupiedTiles is updated as a DEBUG mirror only.
+function TileManager.occupyResolvedTile(countryName, tilePart, npcModel)
+	local TAM = getTileAdjacencyManager()
+	local tileId = TAM.getTileId(tilePart)
+	if not tileId then
+		warn("[TileManager] occupyResolvedTile: no TileId for part '" .. tilePart.Name .. "' — occupancy not registered")
+		return
+	end
+
+	-- Authoritative write
+	GlobalOccupiedTilesById[tileId] = npcModel
+
+	-- Country-local write (keyed by tileId, not positional key)
+	if countryName then
+		if not OccupiedTiles[countryName] then
+			OccupiedTiles[countryName] = {}
+		end
+		OccupiedTiles[countryName][tileId] = npcModel
+	end
+
+	-- DEBUG mirror: update positional-key map for tooling/inspection
+	GlobalOccupiedTiles[getTileKey(tilePart.Position)] = npcModel
+end
+
+-- PRIMARY: Release a tile using a pre-resolved tilePart.
+function TileManager.releaseResolvedTile(countryName, tilePart)
+	local TAM = getTileAdjacencyManager()
+	local tileId = TAM.getTileId(tilePart)
+	if not tileId then
+		warn("[TileManager] releaseResolvedTile: no TileId for part '" .. tilePart.Name .. "' — occupancy not cleared")
+		return
+	end
+
+	-- Authoritative clear
+	GlobalOccupiedTilesById[tileId] = nil
+
+	-- Country-local clear
+	if countryName and OccupiedTiles[countryName] then
+		OccupiedTiles[countryName][tileId] = nil
+	end
+
+	-- DEBUG mirror
+	GlobalOccupiedTiles[getTileKey(tilePart.Position)] = nil
+end
+
+-- Occupy a tile by tileId directly (lowest-level write, no resolution needed).
+function TileManager.occupyTileById(tileId, npcModel)
+	if not tileId then return end
+	GlobalOccupiedTilesById[tileId] = npcModel
+end
+
+-- Release a tile by tileId directly.
+function TileManager.releaseTileById(tileId)
+	if not tileId then return end
+	GlobalOccupiedTilesById[tileId] = nil
+end
+
+-- Get the NPC occupying a tile by tileId (authoritative read).
+function TileManager.getTileOccupantById(tileId)
+	if not tileId then return nil end
+	return GlobalOccupiedTilesById[tileId]
+end
+
+-- Check if a tile is occupied by tileId (authoritative read).
+function TileManager.isTileOccupiedById(tileId)
+	if not tileId then return false end
+	return GlobalOccupiedTilesById[tileId] ~= nil
+end
+
+---------------------------------------------------
+-- Compatibility Shims (tileKey-based)
+-- These resolve tilePart from the legacy tileKey and delegate to the
+-- TileId-authoritative functions above. Use only when tilePart is not already available.
+---------------------------------------------------
+
+-- Resolve tilePart from tileKey (tries primary lookup then fallback).
+local function resolveTilePartFromKey(tileKey)
+	local TAM = getTileAdjacencyManager()
+	local tilePart = TAM.getTileFromKey(tileKey)
+	if not tilePart and TAM.getTileFromKeyWithFallback then
+		tilePart = TAM.getTileFromKeyWithFallback(tileKey)
+	end
+	return tilePart
+end
+
+-- Compatibility shim: resolves tilePart from tileKey, then calls occupyResolvedTile.
+-- Prefer occupyResolvedTile when tilePart is already available.
 function TileManager.occupyTile(countryName, tileKey, npcModel)
-	if not OccupiedTiles[countryName] then
-		OccupiedTiles[countryName] = {}
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then
+		warn("[TileManager] occupyTile: could not resolve tilePart for key '" .. tostring(tileKey) .. "' — occupancy not registered")
+		return
 	end
-	OccupiedTiles[countryName][tileKey] = npcModel
-
-	-- Also update global tracking
-	GlobalOccupiedTiles[tileKey] = npcModel
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId then
-			GlobalOccupiedTilesById[tileId] = npcModel
-		end
-	end
+	TileManager.occupyResolvedTile(countryName, tilePart, npcModel)
 end
 
--- Release a tile within a country
+-- Compatibility shim: resolves tilePart from tileKey, then calls releaseResolvedTile.
+-- Prefer releaseResolvedTile when tilePart is already available.
 function TileManager.releaseTile(countryName, tileKey)
-	if OccupiedTiles[countryName] then
-		OccupiedTiles[countryName][tileKey] = nil
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then
+		warn("[TileManager] releaseTile: could not resolve tilePart for key '" .. tostring(tileKey) .. "' — occupancy not cleared")
+		return
 	end
-
-	-- Also update global tracking
-	GlobalOccupiedTiles[tileKey] = nil
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId then
-			GlobalOccupiedTilesById[tileId] = nil
-		end
-	end
+	TileManager.releaseResolvedTile(countryName, tilePart)
 end
 
 ---------------------------------------------------
 -- Global Tile Occupation (for movement system)
 ---------------------------------------------------
 
--- Occupy a tile globally (regardless of country)
+-- Occupy a tile globally (regardless of country).
+-- Compatibility shim: resolves tilePart and country from tileKey/npcModel, then calls occupyResolvedTile.
+-- Prefer occupyResolvedTile with an explicit countryName when possible.
 function TileManager.occupyTileGlobal(tileKey, npcModel)
-	GlobalOccupiedTiles[tileKey] = npcModel
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId then
-			GlobalOccupiedTilesById[tileId] = npcModel
-		end
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then
+		warn("[TileManager] occupyTileGlobal: could not resolve tilePart for key '" .. tostring(tileKey) .. "'")
+		return
 	end
-
-	-- Also try to update country-specific tracking if we can determine the country
 	local npcCountry = npcModel:GetAttribute("Country")
-	if npcCountry then
-		if not OccupiedTiles[npcCountry] then
-			OccupiedTiles[npcCountry] = {}
-		end
-		OccupiedTiles[npcCountry][tileKey] = npcModel
-	end
+	TileManager.occupyResolvedTile(npcCountry, tilePart, npcModel)
 end
 
--- Release a tile globally
+-- Release a tile globally.
+-- Compatibility shim: resolves tilePart and country, then calls releaseResolvedTile.
 function TileManager.releaseTileGlobal(tileKey)
-	local npcModel = GlobalOccupiedTiles[tileKey]
-	GlobalOccupiedTiles[tileKey] = nil
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId then
-			GlobalOccupiedTilesById[tileId] = nil
-		end
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then
+		-- Fallback: clear DEBUG mirror at least
+		GlobalOccupiedTiles[tileKey] = nil
+		warn("[TileManager] releaseTileGlobal: could not resolve tilePart for key '" .. tostring(tileKey) .. "'")
+		return
 	end
-
-	-- Also try to update country-specific tracking
-	if npcModel then
-		local npcCountry = npcModel:GetAttribute("Country")
-		if npcCountry and OccupiedTiles[npcCountry] then
-			OccupiedTiles[npcCountry][tileKey] = nil
-		end
-	end
+	-- Determine country from authoritative occupant
+	local TAM = getTileAdjacencyManager()
+	local tileId = TAM.getTileId(tilePart)
+	local npcModel = (tileId and GlobalOccupiedTilesById[tileId]) or GlobalOccupiedTiles[tileKey]
+	local npcCountry = npcModel and npcModel:GetAttribute("Country")
+	TileManager.releaseResolvedTile(npcCountry, tilePart)
 end
 
--- Check if a tile is occupied globally
+-- Check if a tile is occupied globally (TileId-authoritative).
+-- Compatibility shim for callers that only have a tileKey.
 function TileManager.isTileOccupied(tileKey)
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId and GlobalOccupiedTilesById[tileId] ~= nil then
-			return true
-		end
-	end
-	return GlobalOccupiedTiles[tileKey] ~= nil
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then return false end
+	local TAM = getTileAdjacencyManager()
+	local tileId = TAM.getTileId(tilePart)
+	return TileManager.isTileOccupiedById(tileId)
 end
 
--- Get the NPC occupying a tile
+-- Get the NPC occupying a tile (TileId-authoritative).
+-- Compatibility shim for callers that only have a tileKey.
 function TileManager.getTileOccupant(tileKey)
-	if shouldUseTileIdOccupancy() then
-		local tileId = getTileIdFromKey(tileKey)
-		if tileId and GlobalOccupiedTilesById[tileId] then
-			return GlobalOccupiedTilesById[tileId]
-		end
-	end
-	return GlobalOccupiedTiles[tileKey]
+	local tilePart = resolveTilePartFromKey(tileKey)
+	if not tilePart then return nil end
+	local TAM = getTileAdjacencyManager()
+	local tileId = TAM.getTileId(tilePart)
+	return TileManager.getTileOccupantById(tileId)
 end
 
--- Check if a tile is occupied by a specific player's NPC
+-- Check if a tile is occupied by a specific player's NPC (TileId-authoritative).
 function TileManager.isTileOccupiedByPlayer(tileKey, player)
 	local npc = TileManager.getTileOccupant(tileKey)
 	if not npc then return false end
 
-	-- Check if NPC is owned by this player
 	local ownerVal = npc:FindFirstChild("NPCOwner")
 	if ownerVal and ownerVal.Value == player then
 		return true
@@ -389,39 +442,22 @@ function TileManager.isTileOccupiedByPlayer(tileKey, player)
 	return false
 end
 
-function TileManager.occupyTileById(tileId, npcModel)
-	if not tileId then return end
-	GlobalOccupiedTilesById[tileId] = npcModel
-end
-
-function TileManager.releaseTileById(tileId)
-	if not tileId then return end
-	GlobalOccupiedTilesById[tileId] = nil
-end
-
-function TileManager.getTileOccupantById(tileId)
-	if not tileId then return nil end
-	return GlobalOccupiedTilesById[tileId]
-end
-
-function TileManager.isTileOccupiedById(tileId)
-	if not tileId then return false end
-	return GlobalOccupiedTilesById[tileId] ~= nil
-end
-
 ---------------------------------------------------
 -- Existing API
 ---------------------------------------------------
 
 function TileManager.getAvailableTileCount(countryName)
 	local tiles = ValidTiles[countryName]
-	local occupied = OccupiedTiles[countryName]
 	if not tiles then return 0 end
 
+	local TAM = getTileAdjacencyManager()
 	local available = 0
 	for _, tilePos in ipairs(tiles) do
-		local key = getTileKey(tilePos)
-		if not occupied or not occupied[key] then
+		local tileKey = getTileKey(tilePos)
+		local tilePart = TAM.getTileFromKey(tileKey)
+		local tileId = tilePart and TAM.getTileId(tilePart)
+		-- isTileOccupiedById returns false for nil tileId (counts unresolvable tiles as available)
+		if not TileManager.isTileOccupiedById(tileId) then
 			available += 1
 		end
 	end

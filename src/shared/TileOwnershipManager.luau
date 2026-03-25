@@ -1,7 +1,7 @@
--- TileOwnershipManager (ModuleScript in ServerScriptService) - FIXED v3
--- FIX v2: Capital capture guard
--- FIX v3: Occupation stored by COUNTRY (not player) - persists when players leave
---         Occupied territory counts as valid tile for the occupying country
+-- TileOwnershipManager (ModuleScript in ServerScriptService)
+-- Occupation stored by COUNTRY (not player) - persists when players leave
+-- Capital capture guard + conquered state check
+-- Single no-yield atomic ownership mutation path via state applicators
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
@@ -39,13 +39,13 @@ local function getDependencies()
 end
 
 -- Configuration
-local DEBUG = true
+local DEBUG = false
 local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 
 -- Store original tile colors
 local OriginalColors = {}
 
--- FIX v3: Track occupied territories by COUNTRY name (persists when player leaves)
+-- Track occupied territories by COUNTRY name (persists when player leaves)
 -- OccupiedTerritories[tilePart] = { occupyingCountry = "France", originalCountry = "Germany", originalColor = Color3 }
 local OccupiedTerritories = {}
 
@@ -80,7 +80,131 @@ local function scanCountryColors()
 		end
 	end
 
-	print("[TileOwnershipManager] Scanned country colors")
+	if DEBUG then print("[TileOwnershipManager] Scanned country colors") end
+end
+
+---------------------------------------------------
+-- Private: Color Resolution
+---------------------------------------------------
+
+-- Resolves the display color for a country.
+-- Checks CountryColors cache first, then falls back to sampling OriginalColors
+-- from the country's map Model. Caches the result on success.
+local function resolveCountryColor(countryName)
+	local color = CountryColors[countryName]
+	if color then return color end
+
+	-- Fallback: sample from direct children of country model
+	local countryModel = EUROPE_MAP:FindFirstChild(countryName)
+	if countryModel then
+		for _, child in ipairs(countryModel:GetChildren()) do
+			if child:IsA("BasePart") and OriginalColors[child] then
+				color = OriginalColors[child]
+				CountryColors[countryName] = color
+				return color
+			end
+		end
+	end
+
+	warn("[TileOwnership] resolveCountryColor: no color found for '" .. tostring(countryName) .. "'")
+	return nil
+end
+
+---------------------------------------------------
+-- Private: Low-Level State Helpers
+-- These are NOT public entry points — they are atomic building blocks only.
+-- Every write to visual, logical, and occupied state flows through exactly one
+-- of the three high-level applicators below, which call these helpers together
+-- with no yield between them.
+---------------------------------------------------
+
+-- Set tile color to the controlling country's color.
+-- Returns true on success, false if color could not be resolved (logs a warning).
+local function applyTileVisualOwner(tilePart, ownerCountryName)
+	local color = resolveCountryColor(ownerCountryName)
+	if not color then
+		warn("[TileOwnership] applyTileVisualOwner: no color for '" .. tostring(ownerCountryName) .. "' on tile " .. tilePart.Name)
+		return false
+	end
+	tilePart.Color = color
+	return true
+end
+
+-- Restore the tile to its original (pre-capture) visual state.
+local function applyTileOriginalVisual(tilePart, originalColor)
+	if not originalColor then
+		warn("[TileOwnership] applyTileOriginalVisual: originalColor is nil for tile " .. tilePart.Name)
+		return
+	end
+	tilePart.Color = originalColor
+end
+
+-- Set or clear the OwnerCountry attribute.
+-- Pass a non-empty string to assign; pass nil or "" to clear.
+local function setTileLogicalOwner(tilePart, ownerCountryNameOrNil)
+	if type(ownerCountryNameOrNil) == "string" and ownerCountryNameOrNil ~= "" then
+		tilePart:SetAttribute("OwnerCountry", ownerCountryNameOrNil)
+	else
+		tilePart:SetAttribute("OwnerCountry", nil)
+	end
+end
+
+-- Write the OccupiedTerritories record for a tile.
+local function setOccupiedRecord(tilePart, occupyingCountry, originalCountry, originalColor)
+	OccupiedTerritories[tilePart] = {
+		occupyingCountry = occupyingCountry,
+		originalCountry = originalCountry,
+		originalColor = originalColor,
+	}
+end
+
+-- Delete the OccupiedTerritories record for a tile.
+local function clearOccupiedRecord(tilePart)
+	OccupiedTerritories[tilePart] = nil
+end
+
+---------------------------------------------------
+-- Private: High-Level State Applicators
+-- These are the ONLY valid paths for changing tile ownership state.
+-- All three writes (visual, logical, occupied record) happen synchronously
+-- with no yield between them — this is the "atomic" guarantee.
+---------------------------------------------------
+
+-- Invariant A: Occupied but not annexed.
+-- After this call:
+--   OccupiedTerritories[tilePart] ~= nil
+--   OwnerCountry == occupyingCountry
+--   tilePart.Color == CountryColors[occupyingCountry]
+-- Returns false if the occupying country has no resolvable color (no state written).
+local function applyOccupiedState(tilePart, occupyingCountry, originalCountry, originalColor)
+	if not applyTileVisualOwner(tilePart, occupyingCountry) then return false end
+	setTileLogicalOwner(tilePart, occupyingCountry)
+	setOccupiedRecord(tilePart, occupyingCountry, originalCountry, originalColor)
+	return true
+end
+
+-- Invariant B: Annexed.
+-- After this call:
+--   OccupiedTerritories[tilePart] == nil
+--   OwnerCountry == annexingCountry
+--   tilePart.Color == CountryColors[annexingCountry]  (same color, tile was already colored for occupier)
+-- Returns false if the annexing country has no resolvable color (no state written).
+local function applyAnnexedState(tilePart, annexingCountry)
+	if not applyTileVisualOwner(tilePart, annexingCountry) then return false end
+	setTileLogicalOwner(tilePart, annexingCountry)
+	clearOccupiedRecord(tilePart)
+	return true
+end
+
+-- Invariant C/D: Reverted to geographic/original ownership.
+-- After this call:
+--   OccupiedTerritories[tilePart] == nil
+--   OwnerCountry == nil
+--   tilePart.Color == originalColor
+local function applyOriginalState(tilePart, originalColor)
+	applyTileOriginalVisual(tilePart, originalColor)
+	setTileLogicalOwner(tilePart, nil)
+	clearOccupiedRecord(tilePart)
 end
 
 ---------------------------------------------------
@@ -105,7 +229,7 @@ function TileOwnershipManager.getOriginalColor(tilePart)
 end
 
 ---------------------------------------------------
--- FIX v3: Country-based Occupation System
+-- Country-based Occupation System
 ---------------------------------------------------
 
 -- Check if a tile is occupied by a specific COUNTRY
@@ -146,7 +270,7 @@ function TileOwnershipManager.getOriginalCountry(tilePart)
 	return TileAdjacencyManager.getTileCountry(tilePart)
 end
 
--- FIX v3: Check if tile belongs to a country (own territory OR occupied by them)
+-- Check if tile belongs to a country (own territory OR occupied by them)
 function TileOwnershipManager.tileEffectivelyBelongsTo(tilePart, countryName)
 	getDependencies()
 
@@ -169,7 +293,7 @@ function TileOwnershipManager.tileEffectivelyBelongsTo(tilePart, countryName)
 	return TileOwnershipManager.isOccupiedByCountry(tilePart, countryName)
 end
 
--- FIX v3: Check if tile belongs to player's country
+-- Check if tile belongs to player's country
 function TileOwnershipManager.tileBelongsToPlayer(tilePart, player)
 	getDependencies()
 	if not player then return false end
@@ -180,7 +304,12 @@ function TileOwnershipManager.tileBelongsToPlayer(tilePart, player)
 	return TileOwnershipManager.tileEffectivelyBelongsTo(tilePart, playerCountry)
 end
 
--- FIX v3: Capture a tile (store by country, not player)
+---------------------------------------------------
+-- Public Mutation Functions
+-- All tile state changes flow through the state applicators above.
+---------------------------------------------------
+
+-- Capture a tile (store by country, not player)
 function TileOwnershipManager.captureTile(tilePart, player)
 	getDependencies()
 
@@ -201,22 +330,24 @@ function TileOwnershipManager.captureTile(tilePart, player)
 	end
 
 	-- RECLAIM: Tile is geographically ours but controlled by someone else (annexed).
-	-- Restore ownership and original appearance.
+	-- Restore to original geographic state (Invariant D).
 	-- Must come BEFORE isOccupiedByCountry to avoid early-return on residual entries.
 	if geographicCountry == playerCountry then
-		-- Set OwnerCountry to playerCountry (not nil) for consistency:
-		-- every tile that's been through capture/reclaim has an explicit attribute.
-		tilePart:SetAttribute("OwnerCountry", playerCountry)
 		local origColor = OriginalColors[tilePart]
-		if origColor then
-			tilePart.Color = origColor
+		if not origColor then
+			warn("[TileOwnership] captureTile reclaim: no original color for tile " .. tilePart.Name)
+			return false
 		end
-		OccupiedTerritories[tilePart] = nil
+
+		-- Invariant D: reclaimed original land relies on geography again.
+		-- OwnerCountry = nil, no occupied record, original color restored.
+		applyOriginalState(tilePart, origColor)
 
 		if DEBUG then
-			print("[TileOwnership] " .. playerCountry .. " reclaimed annexed tile (was owned by " .. effectiveOwner .. ")")
+			print("[TileOwnership] " .. playerCountry .. " reclaimed annexed tile (was owned by " .. tostring(effectiveOwner) .. ")")
 		end
 
+		-- Fire event AFTER all state writes are complete
 		local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 		if TileCapturedEvent then
 			TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
@@ -229,27 +360,8 @@ function TileOwnershipManager.captureTile(tilePart, player)
 		return false
 	end
 
-	-- Get occupying country's color
-	local occupyingColor = CountryColors[playerCountry]
-
-	-- FIX: Validate occupyingColor exists, fallback to OriginalColors sampling
-	local playerCountryModel = EUROPE_MAP:FindFirstChild(playerCountry)
-	if playerCountryModel then
-		for _, child in ipairs(playerCountryModel:GetChildren()) do   -- direct children only
-			if child:IsA("BasePart") and OriginalColors[child] then
-				occupyingColor = OriginalColors[child]
-				CountryColors[playerCountry] = occupyingColor
-				break
-			end
-		end
-	end
-	if not occupyingColor then
-		warn("[TileOwnership] No color found for " .. playerCountry .. " — capture aborted")
-		return false
-	end
-
-	-- Preserve original data if tile is already occupied by another country
-	-- This ensures peace treaties revert to the true original owner's color
+	-- Preserve original data if tile is already occupied by another country.
+	-- This ensures peace treaties revert to the true original owner's color.
 	local existingOccupation = OccupiedTerritories[tilePart]
 	local storedOriginalCountry, storedOriginalColor
 
@@ -261,23 +373,17 @@ function TileOwnershipManager.captureTile(tilePart, player)
 		storedOriginalColor = OriginalColors[tilePart] or tilePart.Color
 	end
 
-	OccupiedTerritories[tilePart] = {
-		occupyingCountry = playerCountry,
-		originalCountry = storedOriginalCountry,
-		originalColor = storedOriginalColor
-	}
-
-	-- Mark explicit ownership so queries don't rely on hierarchy
-	tilePart:SetAttribute("OwnerCountry", playerCountry)
-
-	-- Change tile color
-	tilePart.Color = occupyingColor
+	-- Invariant A: occupied state — all three writes happen together, no yield.
+	if not applyOccupiedState(tilePart, playerCountry, storedOriginalCountry, storedOriginalColor) then
+		-- applyOccupiedState already warned about missing color
+		return false
+	end
 
 	if DEBUG then
 		print("[TileOwnership] " .. playerCountry .. " captured tile in " .. (geographicCountry or "unknown"))
 	end
 
-	-- Fire event to notify clients
+	-- Fire event AFTER all state writes are complete
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 	if TileCapturedEvent then
 		TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
@@ -286,28 +392,23 @@ function TileOwnershipManager.captureTile(tilePart, player)
 	return true
 end
 
--- Release a captured tile (revert color)
+-- Release a captured tile (revert to geographic/original state)
 function TileOwnershipManager.releaseTile(tilePart)
 	local data = OccupiedTerritories[tilePart]
 	if not data then return false end
 
-	-- Capture originalCountry before clearing the record
 	local originalCountry = data.originalCountry
+	local originalColor = data.originalColor
 
-	-- Revert color
-	tilePart.Color = data.originalColor
-
-	-- Clear explicit ownership so tile reverts to its geographic country
-	tilePart:SetAttribute("OwnerCountry", nil)
-
-	-- Remove from tracking
-	OccupiedTerritories[tilePart] = nil
+	-- Invariant C: reverted to geographic owner — all three writes together, no yield.
+	applyOriginalState(tilePart, originalColor)
 
 	if DEBUG then
 		print("[TileOwnership] Released tile back to " .. (originalCountry or "unknown"))
 	end
 
-	-- Notify clients so they cancel any in-flight tween and start one to the correct color
+	-- Fire event AFTER all state writes are complete.
+	-- Notify clients so they cancel any in-flight tween and start one to the correct color.
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 	if TileCapturedEvent and originalCountry then
 		TileCapturedEvent:FireAllClients(tilePart, "", originalCountry)
@@ -316,7 +417,8 @@ function TileOwnershipManager.releaseTile(tilePart)
 	return true
 end
 
--- Reclaim a tile that was occupied by an enemy back to its original owner
+-- Reclaim a tile that was occupied by an enemy back to its original owner.
+-- BUG FIX: Previous version omitted the OwnerCountry clear, leaving the attribute stale.
 function TileOwnershipManager.reclaimTile(tilePart, player)
 	getDependencies()
 
@@ -333,13 +435,13 @@ function TileOwnershipManager.reclaimTile(tilePart, player)
 		return false
 	end
 
-	-- Revert tile color to the original color
-	tilePart.Color = data.originalColor
-
 	local occupyingCountry = data.occupyingCountry
+	local originalColor = data.originalColor
 
-	-- Remove from occupation tracking
-	OccupiedTerritories[tilePart] = nil
+	-- Invariant D: reclaimed original land relies on geography again.
+	-- BUG FIX: now explicitly clears OwnerCountry (was missing before).
+	-- OwnerCountry = nil, no occupied record, original color restored.
+	applyOriginalState(tilePart, originalColor)
 
 	if DEBUG then
 		print("[TileOwnership] " .. playerCountry .. " reclaimed tile from " .. occupyingCountry)
@@ -351,7 +453,7 @@ function TileOwnershipManager.reclaimTile(tilePart, player)
 		GlobalNotificationEvent:FireClient(player, "Territory reclaimed from " .. occupyingCountry .. "!", Color3.fromRGB(100, 255, 100))
 	end
 
-	-- Fire tile captured event for UI updates
+	-- Fire tile captured event AFTER all state writes are complete
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 	if TileCapturedEvent then
 		TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
@@ -360,7 +462,8 @@ function TileOwnershipManager.reclaimTile(tilePart, player)
 	return true
 end
 
--- Release all tiles occupied by a specific COUNTRY (used in peace treaties)
+-- Release all tiles occupied by a specific COUNTRY (used in peace treaties).
+-- BUG FIX: Previous version omitted the OwnerCountry clear on each released tile.
 function TileOwnershipManager.releaseCountryOccupiedTiles(countryName)
 	local releasedCount = 0
 
@@ -368,24 +471,28 @@ function TileOwnershipManager.releaseCountryOccupiedTiles(countryName)
 	local tilesToRelease = {}
 	for tilePart, data in pairs(OccupiedTerritories) do
 		if data.occupyingCountry == countryName then
-			table.insert(tilesToRelease, tilePart)
+			table.insert(tilesToRelease, { tilePart = tilePart, data = data })
 		end
 	end
 
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 
-	-- Now iterate over the collected keys to release tiles
-	for _, tilePart in ipairs(tilesToRelease) do
-		local data = OccupiedTerritories[tilePart]
-		if data and tilePart and tilePart.Parent then
-			tilePart.Color = data.originalColor
-			-- Notify clients so any in-flight capture tween is cancelled and
-			-- the tile tweens back to its original owner's color correctly
+	for _, entry in ipairs(tilesToRelease) do
+		local tilePart = entry.tilePart
+		local data = entry.data
+
+		if tilePart and tilePart.Parent then
+			-- Invariant C: all three writes together, no yield.
+			-- BUG FIX: now explicitly clears OwnerCountry (was missing before).
+			applyOriginalState(tilePart, data.originalColor)
+			-- Fire event AFTER state is fully applied
 			if TileCapturedEvent and data.originalCountry then
 				TileCapturedEvent:FireAllClients(tilePart, "", data.originalCountry)
 			end
+		else
+			-- Part was destroyed — clear the orphaned record to prevent memory leak
+			clearOccupiedRecord(tilePart)
 		end
-		OccupiedTerritories[tilePart] = nil
 		releasedCount = releasedCount + 1
 	end
 
@@ -418,8 +525,8 @@ function TileOwnershipManager.getCountryOccupiedCount(countryName)
 	return count
 end
 
--- Annex occupied tiles: convert occupied territory to core territory
--- Used when signing peace - occupied tiles become permanent part of the occupying country
+-- Annex occupied tiles: convert occupied territory to core territory.
+-- Used when signing peace — occupied tiles become permanent part of the occupying country.
 function TileOwnershipManager.annexOccupiedTiles(countryName)
 	local annexedCount = 0
 
@@ -427,29 +534,24 @@ function TileOwnershipManager.annexOccupiedTiles(countryName)
 	local tilesToAnnex = {}
 	for tilePart, data in pairs(OccupiedTerritories) do
 		if data.occupyingCountry == countryName then
-			table.insert(tilesToAnnex, {tile = tilePart, data = data})
+			table.insert(tilesToAnnex, { tile = tilePart, data = data })
 		end
 	end
 
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 
-	-- Convert each occupied tile to core territory
 	for _, entry in ipairs(tilesToAnnex) do
 		local tilePart = entry.tile
-		local data = entry.data
 
 		if tilePart and tilePart.Parent then
-			-- Keep tile in its original country Model (no re-parenting)
-			-- Record explicit ownership so queries don't rely on hierarchy
-			tilePart:SetAttribute("OwnerCountry", countryName)
-			-- Keep the current color (already the occupying country's color)
-			-- Remove from occupied territories table
-			OccupiedTerritories[tilePart] = nil
-			annexedCount = annexedCount + 1
-
-			-- Notify clients so the color tween fires correctly
-			if TileCapturedEvent then
-				TileCapturedEvent:FireAllClients(tilePart, "", countryName)
+			-- Invariant B: annexed — no occupied record, OwnerCountry set, color re-confirmed.
+			-- applyAnnexedState re-resolves the color (same as occupying color, effectively no-op visually).
+			if applyAnnexedState(tilePart, countryName) then
+				annexedCount = annexedCount + 1
+				-- Fire event AFTER all state writes are complete
+				if TileCapturedEvent then
+					TileCapturedEvent:FireAllClients(tilePart, "", countryName)
+				end
 			end
 		end
 	end
@@ -497,7 +599,7 @@ function TileOwnershipManager.captureCapital(losingCountryName, winningPlayer)
 		return false
 	end
 
-	-- FIX v4: Check if the country is already conquered
+	-- Check if the country is already conquered
 	local CountryOwners = ServerState.getCountryOwners()
 	local currentOwner = CountryOwners[losingCountryName]
 	if type(currentOwner) == "string" and currentOwner:find("Conquered_") then
@@ -512,7 +614,7 @@ function TileOwnershipManager.captureCapital(losingCountryName, winningPlayer)
 	local losingPlayer = currentOwner
 	local winningCountry = TileManager.getPlayerCountry(winningPlayer)
 
-	print("[TileOwnership] CAPITAL CAPTURED! " .. winningPlayer.Name .. " (" .. winningCountry .. ") conquered " .. losingCountryName)
+	if DEBUG then print("[TileOwnership] CAPITAL CAPTURED! " .. winningPlayer.Name .. " (" .. winningCountry .. ") conquered " .. losingCountryName) end
 
 	local GlobalNotificationEvent = ReplicatedStorage:FindFirstChild("GlobalNotificationEvent")
 	if GlobalNotificationEvent then
@@ -532,33 +634,12 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	getDependencies()
 
 	local winningCountry = TileManager.getPlayerCountry(winningPlayer)
-	local winningColor = CountryColors[winningCountry]
 
-	-- FIX: Validate winningColor exists, fallback to OriginalColors sampling
-	if not winningColor then
-		warn(string.format("[TileOwnership] CountryColors[%s] is nil, sampling from OriginalColors", winningCountry))
-		local winningCountryModel = EUROPE_MAP:FindFirstChild(winningCountry)
-		if winningCountryModel then
-			-- Find a tile in the winning country's Model and use its original color
-			for _, part in ipairs(winningCountryModel:GetDescendants()) do
-				if part:IsA("BasePart") and OriginalColors[part] then
-					winningColor = OriginalColors[part]
-					CountryColors[winningCountry] = winningColor  -- Update cache
-					break
-				end
-			end
-		end
-
-		if not winningColor then
-			warn(string.format("[TileOwnership] Could not determine color for %s, using default", winningCountry))
-			winningColor = Color3.fromRGB(100, 100, 100)  -- Fallback grey
-		end
-	end
-
-	-- Grab the event once; used in all recolor paths below
+	-- Grab the event once; used in all tile state paths below
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 
-	-- 1. TRANSFER TILES (skip third-party occupied tiles)
+	-- 1. TRANSFER TILES in the loser's own country model.
+	-- For each tile: decide final ownership state, then apply visual + attribute + record together.
 	local countryModel = EUROPE_MAP:FindFirstChild(losingCountryName)
 	if countryModel then
 		for _, part in ipairs(countryModel:GetDescendants()) do
@@ -579,31 +660,21 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 								part.Name, occupationData.occupyingCountry))
 						end
 					else
-						-- Loser or winner had it — transfer to winner
-						part.Color = winningColor
-						part:SetAttribute("OwnerCountry", winningCountry)
-						OccupiedTerritories[part] = {
-							occupyingCountry = winningCountry,
-							originalCountry = occupationData.originalCountry,
-							originalColor = occupationData.originalColor
-						}
-						if TileCapturedEvent then
-							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+						-- Loser or winner had it — transfer to winner (Invariant A: occupied state)
+						if applyOccupiedState(part, winningCountry, occupationData.originalCountry, occupationData.originalColor) then
+							if TileCapturedEvent then
+								TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+							end
 						end
 					end
 				else
-					-- Unoccupied core territory — winner takes it.
-					-- Capture color BEFORE recoloring to avoid originalColor bug.
-					local preColor = part.Color
-					part.Color = winningColor
-					part:SetAttribute("OwnerCountry", winningCountry)
-					OccupiedTerritories[part] = {
-						occupyingCountry = winningCountry,
-						originalCountry = losingCountryName,
-						originalColor = OriginalColors[part] or preColor
-					}
-					if TileCapturedEvent then
-						TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+					-- Unoccupied core territory — winner takes it (Invariant A: occupied state).
+					-- Capture origColor BEFORE applyOccupiedState changes part.Color.
+					local origColor = OriginalColors[part] or part.Color
+					if applyOccupiedState(part, winningCountry, losingCountryName, origColor) then
+						if TileCapturedEvent then
+							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+						end
 					end
 				end
 			end
@@ -611,8 +682,6 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	end
 
 	-- Third-party occupied tiles remain with their current occupier.
-	-- The winner gets unoccupied core territory (Phase 1) and the loser's foreign
-	-- conquests (Phase 3 below), but does NOT steal from other invaders.
 	if DEBUG then
 		local thirdPartyCount = 0
 		for _, data in pairs(OccupiedTerritories) do
@@ -650,14 +719,11 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 				if part:IsA("BasePart") and OriginalColors[part] then
 					local existingData = OccupiedTerritories[part]
 					if not existingData then
-						OccupiedTerritories[part] = {
-							occupyingCountry = winningCountry,
-							originalCountry = conqueredName,
-							originalColor = OriginalColors[part]
-						}
-						part.Color = winningColor
-						if TileCapturedEvent then
-							TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+						-- Orphaned tile — winner claims it (Invariant A)
+						if applyOccupiedState(part, winningCountry, conqueredName, OriginalColors[part]) then
+							if TileCapturedEvent then
+								TileCapturedEvent:FireAllClients(part, winningPlayer.Name, winningCountry)
+							end
 						end
 					end
 				end
@@ -665,37 +731,23 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 		end
 	end
 
-	-- FIX (Bug 2): Transfer ownership of occupied territories to the conquering country
-	-- CRITICAL: Do NOT re-parent tiles (keep geography immutable, only change ownership)
-	-- When conquering a country, all territories they controlled should transfer to the winner
-
-	-- Phase 1: Collect tiles to transfer (don't mutate OccupiedTerritories while iterating)
+	-- FIX (Bug 2): Transfer ownership of ALL occupied territories belonging to the loser
+	-- (tiles in other countries' models that the loser was occupying).
+	-- Collect BEFORE mutating OccupiedTerritories to avoid iteration issues.
 	local tilesToTransfer = {}
 	for tilePart, data in pairs(OccupiedTerritories) do
 		if data.occupyingCountry == losingCountryName then
-			table.insert(tilesToTransfer, {tilePart = tilePart, data = data})
+			table.insert(tilesToTransfer, { tilePart = tilePart, data = data })
 		end
 	end
 
-	-- Phase 2: Transfer ownership
 	for _, entry in ipairs(tilesToTransfer) do
 		local tilePart = entry.tilePart
 		local data = entry.data
 
 		if tilePart and tilePart.Parent then
-			-- Transfer ownership to the winning country
-			-- Update the occupation record: winner now occupies this tile (from its original owner)
-			OccupiedTerritories[tilePart] = {
-				occupyingCountry = winningCountry,
-				originalCountry = data.originalCountry,  -- Preserve original geographic owner
-				originalColor = data.originalColor       -- Preserve original color
-			}
-
-			-- Recolor to winner's color
-			if not winningColor then
-				warn(string.format("[TileOwnership] winningColor is nil when transferring %s tile, skipping color update", tilePart.Name))
-			else
-				tilePart.Color = winningColor
+			-- Transfer to winner (Invariant A: occupied state)
+			if applyOccupiedState(tilePart, winningCountry, data.originalCountry, data.originalColor) then
 				if TileCapturedEvent then
 					TileCapturedEvent:FireAllClients(tilePart, winningPlayer.Name, winningCountry)
 				end
@@ -708,8 +760,7 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 		end
 	end
 
-	-- Do NOT call releaseCountryOccupiedTiles() - that's for peace treaties, not conquests
-	-- OLD (Bug 2): TileOwnershipManager.releaseCountryOccupiedTiles(losingCountryName)
+	-- Do NOT call releaseCountryOccupiedTiles() — that's for peace treaties, not conquests
 
 	-- 2. TRANSFER RESOURCES
 	if losingPlayer and typeof(losingPlayer) == "Instance" and losingPlayer:IsA("Player") and losingPlayer.Parent then
@@ -735,7 +786,7 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 			warn("[TileOwnership] Could not transfer resources - leaderstats missing")
 		end
 	else
-		-- Country was unowned - transfer from ServerState
+		-- Country was unowned — transfer from ServerState
 		local countryCoins = ServerState.getCountryCoins(losingCountryName)
 		local countryManpower = ServerState.getCountryManpower(losingCountryName)
 
@@ -773,7 +824,7 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	CountryOwners[losingCountryName] = "Conquered_" .. winningCountry
 	ServerState.setCountryOwners(CountryOwners)
 
-	-- FIX v4: Clear all wars involving the conquered country
+	-- Clear all wars involving the conquered country
 	DiplomacyManager.clearAllWarsForCountry(losingCountryName)
 
 	-- 5. HANDLE LOSING PLAYER
@@ -807,7 +858,7 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 	-- DEBUG: Sanity check — detect tiles that should be owned but are missing OccupiedTerritories
 	if DEBUG then
 		local missingCount = 0
-		local allCountriesToCheck = {losingCountryName}
+		local allCountriesToCheck = { losingCountryName }
 		for cName, _ in pairs(conqueredByLoser) do
 			table.insert(allCountriesToCheck, cName)
 		end
@@ -829,7 +880,7 @@ function TileOwnershipManager.performCountryTakeover(losingCountryName, winningP
 		end
 	end
 
-	print("[TileOwnership] Country takeover complete: " .. losingCountryName .. " -> " .. winningCountry)
+	if DEBUG then print("[TileOwnership] Country takeover complete: " .. losingCountryName .. " -> " .. winningCountry) end
 end
 
 ---------------------------------------------------
@@ -838,8 +889,8 @@ end
 
 scanCountryColors()
 
--- FIX v3: Do NOT auto-release on player leave - territories persist!
+-- Do NOT auto-release on player leave - territories persist!
 
-print("[TileOwnershipManager] Initialization complete")
+if DEBUG then print("[TileOwnershipManager] Initialization complete") end
 
 return TileOwnershipManager

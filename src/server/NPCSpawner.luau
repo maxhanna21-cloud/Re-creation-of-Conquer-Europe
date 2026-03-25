@@ -69,14 +69,21 @@ function NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, ownerPlaye
 	npcClone:PivotTo(CFrame.new(spawnPos))
 	npcClone.Parent = workspace
 
-	-- Mark tile as occupied
-	TileManager.occupyTile(countryName, tileKey, npcClone)
+	-- Resolve spawn tile part early so we can use TileId-authoritative occupancy API
+	local spawnTilePart = TileAdjacencyManager.getTileFromKey(tileKey)
+
+	-- Mark tile as occupied using TileId-authoritative path when tilePart is available
+	if spawnTilePart then
+		TileManager.occupyResolvedTile(countryName, spawnTilePart, npcClone)
+	else
+		-- Fallback: compatibility shim resolves internally (warns if tileKey cannot resolve)
+		TileManager.occupyTile(countryName, tileKey, npcClone)
+	end
 
 	-- Store tile/country info for cleanup
 	npcClone:SetAttribute("TileKey", tileKey)
 	npcClone:SetAttribute("Country", countryName)
-	-- Fix C: Set CurrentTileId for reliable adjacency resolution (stable, unique tile identity)
-	local spawnTilePart = TileAdjacencyManager.getTileFromKey(tileKey)
+	-- Set CurrentTileId for reliable adjacency resolution (stable, unique tile identity)
 	if spawnTilePart then
 		local spawnTileId = TileAdjacencyManager.getTileId(spawnTilePart)
 		if spawnTileId then

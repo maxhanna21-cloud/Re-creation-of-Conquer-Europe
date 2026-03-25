@@ -1,9 +1,10 @@
--- DiplomacyManager - FIXED v4
--- FIX v3: Added duplicate war declaration prevention
--- FIX v4: Wars persist when players leave - new player inherits wars
---         Added country-level war checks for NPC combat
+-- DiplomacyManager
+-- Added duplicate war declaration prevention
+-- Wars persist when players leave - new player inherits wars
+-- Added country-level war checks for NPC combat
 
 local DiplomacyManager = {}
+local DEBUG = false
 local ServerState = require(game:GetService("ServerScriptService"):WaitForChild("ServerState", 10))
 
 -- Lazy load to avoid circular dependency
@@ -70,7 +71,7 @@ function DiplomacyManager.declareWar(attackerCountry, defenderCountry)
 	Wars[attackerCountry][defenderCountry] = true
 	Wars[defenderCountry][attackerCountry] = true
 
-	print("WAR DECLARED: " .. attackerCountry .. " vs " .. defenderCountry)
+	if DEBUG then print("WAR DECLARED: " .. attackerCountry .. " vs " .. defenderCountry) end
 	return true, "War declared"
 end
 
@@ -80,11 +81,11 @@ function DiplomacyManager.makePeace(countryA, countryB)
 
 	if Wars[countryA] then Wars[countryA][countryB] = nil end
 	if Wars[countryB] then Wars[countryB][countryA] = nil end
-	print("PEACE SIGNED: " .. countryA .. " and " .. countryB)
+	if DEBUG then print("PEACE SIGNED: " .. countryA .. " and " .. countryB) end
 	return true
 end
 
--- FIX v5: Clear all wars for a country (called when country is conquered)
+-- Clear all wars for a country (called when country is conquered)
 function DiplomacyManager.clearAllWarsForCountry(countryName)
 	if not countryName then return end
 
@@ -107,7 +108,7 @@ function DiplomacyManager.clearAllWarsForCountry(countryName)
 	-- Clear the conquered country's wars table
 	Wars[countryName] = {}
 
-	print("WARS CLEARED: " .. countryName .. " (was at war with " .. #enemies .. " countries)")
+	if DEBUG then print("WARS CLEARED: " .. countryName .. " (was at war with " .. #enemies .. " countries)") end
 end
 
 -- Get country from player OR from NPC's country attribute
@@ -145,7 +146,7 @@ function DiplomacyManager.areAtWar(playerA, playerB)
 	return DiplomacyManager.areCountriesAtWar(countryA, countryB)
 end
 
--- FIX v4: Check if an NPC's country is at war with another NPC's country
+-- Check if an NPC's country is at war with another NPC's country
 -- This works even when countries are unowned
 function DiplomacyManager.areNPCsAtWar(npcA, npcB)
 	if not npcA or not npcB then return false end
@@ -158,7 +159,7 @@ function DiplomacyManager.areNPCsAtWar(npcA, npcB)
 	return DiplomacyManager.areCountriesAtWar(countryA, countryB)
 end
 
--- FIX v4: Check if NPC can attack based on country-level diplomacy
+-- Check if NPC can attack based on country-level diplomacy
 function DiplomacyManager.canNPCAttack(attackerNPC, targetNPC)
 	if not attackerNPC or not targetNPC then return false end
 
@@ -194,7 +195,7 @@ function DiplomacyManager.formAlliance(countryA, countryB)
 
 	DiplomacyManager.makePeace(countryA, countryB)
 
-	print("ALLIANCE FORMED: " .. countryA .. " and " .. countryB)
+	if DEBUG then print("ALLIANCE FORMED: " .. countryA .. " and " .. countryB) end
 	return true
 end
 
@@ -202,7 +203,7 @@ end
 function DiplomacyManager.breakAlliance(countryA, countryB)
 	if Alliances[countryA] then Alliances[countryA][countryB] = nil end
 	if Alliances[countryB] then Alliances[countryB][countryA] = nil end
-	print("ALLIANCE BROKEN: " .. countryA .. " and " .. countryB)
+	if DEBUG then print("ALLIANCE BROKEN: " .. countryA .. " and " .. countryB) end
 end
 
 -- CHECK ALLIANCE
@@ -243,7 +244,7 @@ function DiplomacyManager.canAttack(attackerOwner, targetOwner)
 end
 
 -- Get all countries at war with a given country
--- FIX v5: Filter out conquered countries from the enemy list
+-- Filter out conquered countries from the enemy list
 function DiplomacyManager.getEnemies(countryName)
 	local enemies = {}
 	local CountryOwners = ServerState.getCountryOwners()
@@ -290,6 +291,7 @@ end
 
 -- Debug
 function DiplomacyManager.debugPrintWars()
+	if not DEBUG then return end
 	print("=== ACTIVE WARS ===")
 	local printed = {}
 	for countryA, enemies in pairs(Wars) do

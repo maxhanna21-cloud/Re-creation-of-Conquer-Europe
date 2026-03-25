@@ -1,6 +1,7 @@
--- Auto-Fix NPCs Script (COUNTRY PERSISTENCE VERSION) - FIXED
+-- Auto-Fix NPCs Script (COUNTRY PERSISTENCE VERSION)
 -- Handles country-owned NPCs that are waiting for a player to claim the country
--- FIX #2: Race condition fix - use transferOwnership instead of registerNPC when loop already running
+-- Race condition fix - use transferOwnership instead of registerNPC when loop already running
+local DEBUG = false
 local Combat = require(game.ServerScriptService:WaitForChild("NPCCombatSystem", 10))
 local ServerState = require(game.ServerScriptService:WaitForChild("ServerState", 10))
 local Players = game:GetService("Players")
@@ -37,7 +38,7 @@ local function fixNPC(npc)
 		if typeof(countryOwner) == "Instance" and countryOwner:IsA("Player") and countryOwner.Parent then
 			-- Country has an active player - make sure NPC is assigned to them
 			if owner ~= countryOwner then
-				print("[AUTO-FIX] Assigning " .. npc.Name .. " to country owner " .. countryOwner.Name)
+				if DEBUG then print("[AUTO-FIX] Assigning " .. npc.Name .. " to country owner " .. countryOwner.Name) end
 
 
 				-- Update the ObjectValue
@@ -53,7 +54,7 @@ local function fixNPC(npc)
 				end
 
 
-				-- FIX #2: Check loop status ONCE and act accordingly
+				-- Check loop status ONCE and act accordingly
 				-- Use transferOwnership if loop is running, registerNPC if not
 				if Combat.isLoopRunning(npc) then
 					Combat.transferOwnership(npc, countryOwner)
@@ -72,7 +73,7 @@ local function fixNPC(npc)
 				if ownerVal then
 					ownerVal.Value = nil
 				end
-				print("[AUTO-FIX] " .. npc.Name .. " set to country-owned (idle) for " .. npcCountry)
+				if DEBUG then print("[AUTO-FIX] " .. npc.Name .. " set to country-owned (idle) for " .. npcCountry) end
 			end
 			return
 		end
@@ -84,7 +85,7 @@ local function fixNPC(npc)
 		if not owner.Parent then
 			-- Owner left game and NPC has no country - this shouldn't happen normally
 			-- but clean it up just in case
-			print("[AUTO-FIX] Player owner left and NPC has no country. Cleaning up: " .. npc.Name)
+			if DEBUG then print("[AUTO-FIX] Player owner left and NPC has no country. Cleaning up: " .. npc.Name) end
 			Combat.unregisterNPC(npc)
 			npc:Destroy()
 			return
@@ -99,10 +100,10 @@ local function fixNPC(npc)
 		if ownerVal and ownerVal.Value then
 			if ownerVal.Value:IsA("Player") and ownerVal.Value.Parent then
 				ownerToRegister = ownerVal.Value
-				print("[AUTO-FIX] Restored owner from ObjectValue:", ownerToRegister.Name)
+				if DEBUG then print("[AUTO-FIX] Restored owner from ObjectValue:", ownerToRegister.Name) end
 			elseif ownerVal.Value == Combat.getServerOwner() then
 				ownerToRegister = ownerVal.Value
-				print("[AUTO-FIX] Restored ServerOwner from ObjectValue")
+				if DEBUG then print("[AUTO-FIX] Restored ServerOwner from ObjectValue") end
 			end
 		end
 	end
@@ -110,7 +111,7 @@ local function fixNPC(npc)
 
 	-- If still no owner and no country, this NPC is orphaned
 	if not ownerToRegister and not npcCountry then
-		print("[AUTO-FIX] Orphaned NPC with no owner or country: " .. npc.Name)
+		if DEBUG then print("[AUTO-FIX] Orphaned NPC with no owner or country: " .. npc.Name) end
 		-- Don't destroy - might be a bug. Just log it.
 		return
 	end
@@ -119,15 +120,15 @@ local function fixNPC(npc)
 	-- 4. ROLE CHECK (If role was not found, assign it based on name)
 	if not role then
 		role = (npc.Name:find("Defender")) and "Defender" or "Attacker"
-		print("[AUTO-FIX] Restored role based on name:", role)
+		if DEBUG then print("[AUTO-FIX] Restored role based on name:", role) end
 	end
 
 
 	-- 5. LOOP CHECK: If logic stopped and we have a valid owner, restart it
-	-- FIX #2: Only register if we have an owner AND loop is NOT running AND not already tracked
+	-- Only register if we have an owner AND loop is NOT running AND not already tracked
 	if ownerToRegister and not Combat.isLoopRunning(npc) and not Combat.getOwner(npc) then
 		Combat.registerNPC(npc, ownerToRegister, role)
-		print("[AUTO-FIX] Restarted combat loop for " .. npc.Name)
+		if DEBUG then print("[AUTO-FIX] Restarted combat loop for " .. npc.Name) end
 	end
 end
 

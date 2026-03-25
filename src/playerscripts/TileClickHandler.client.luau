@@ -6,6 +6,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
+local DEBUG = false
 local Player = Players.LocalPlayer
 local Mouse = Player:GetMouse()
 
@@ -70,4 +71,4 @@ Mouse.Button1Down:Connect(function()
 	end
 end)
 
-print("[TileClickHandler] Initialized - listening for tile clicks")
+if DEBUG then print("[TileClickHandler] Initialized - listening for tile clicks") end

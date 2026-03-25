@@ -1,5 +1,5 @@
--- NPCTargetingHandler (MULTI-TARGET + MOVEMENT VERSION) - FIXED v6
--- NEW v6: Added tile click detection for NPC movement system
+-- NPCTargetingHandler (MULTI-TARGET + MOVEMENT VERSION)
+-- Added tile click detection for NPC movement system
 -- Click NPC head = select for targeting
 -- With NPC selected: click enemy NPC head = attack, click tile = move
 
@@ -10,10 +10,15 @@ local DiplomacyManager = require(game.ServerScriptService:WaitForChild("Diplomac
 local NPCMovementSystem = require(game.ServerScriptService:WaitForChild("NPCMovementSystem", 10))
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
 local Workspace = game:GetService("Workspace")
 
+local NPC_TAG = "RegisteredNPC"
+
+local DEBUG = false
+
 local SelectionVisualEvent = ReplicatedStorage:WaitForChild("SelectionVisualEvent", 10)
-local NPCMoveToTileEvent = ReplicatedStorage:WaitForChild("NPCMoveToTileEvent", 10) -- NEW: Remote for tile clicks
+local NPCMoveToTileEvent = ReplicatedStorage:WaitForChild("NPCMoveToTileEvent", 10)
 
 local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 
@@ -64,11 +69,12 @@ local function getTileCountryModel(part)
 	return nil
 end
 
--- Helper: Find a living NPC occupying a tile
+-- Helper: Find a living NPC occupying a tile.
+-- Uses TileId-authoritative lookup directly (tilePart is already available from click handler).
 local function findNPCOnTile(tilePart)
-	local tileKey = TileManager.getTileKeyFromPart(tilePart)
-	if not tileKey then return nil end
-	local npc = TileManager.getTileOccupant(tileKey)
+	local tileId = TileAdjacencyManager.getTileId(tilePart)
+	if not tileId then return nil end
+	local npc = TileManager.getTileOccupantById(tileId)
 	if npc and npc.Parent and npc:FindFirstChildOfClass("Humanoid") then
 		local humanoid = npc:FindFirstChildOfClass("Humanoid")
 		if humanoid.Health > 0 then
@@ -84,7 +90,7 @@ local function clearSelection(player)
 	if currentSelection then
 		SelectionVisualEvent:FireClient(player, currentSelection, false)
 		selectedNPC[player] = nil
-		print(player.Name .. " deselected their unit")
+		if DEBUG then print(player.Name .. " deselected their unit") end
 	end
 end
 
@@ -92,13 +98,13 @@ local function handleFirstClick(player, npcModel)
 	local owner = Combat.getOwner(npcModel)
 
 	if not owner then
-		print(player.Name .. " cannot select NPC: No owner registered")
+		if DEBUG then print(player.Name .. " cannot select NPC: No owner registered") end
 		return
 	end
 
-	-- NEW: Check if NPC is retreating (can't be selected)
+	-- Check if NPC is retreating (can't be selected)
 	if NPCMovementSystem.isRetreating(npcModel) then
-		print(player.Name .. " cannot select NPC: Currently retreating")
+		if DEBUG then print(player.Name .. " cannot select NPC: Currently retreating") end
 		return
 	end
 
@@ -113,7 +119,7 @@ local function handleFirstClick(player, npcModel)
 
 		local targetCount = Combat.getManualTargetCount(npcModel)
 		local movementState = NPCMovementSystem.getMovementState(npcModel)
-		print(player.Name .. " selected: " .. npcModel.Name .. " (targeting " .. targetCount .. " enemies, state: " .. movementState .. ")")
+		if DEBUG then print(player.Name .. " selected: " .. npcModel.Name .. " (targeting " .. targetCount .. " enemies, state: " .. movementState .. ")") end
 
 		SelectionVisualEvent:FireClient(player, npcModel, true)
 	else
@@ -123,14 +129,14 @@ local function handleFirstClick(player, npcModel)
 		elseif typeof(owner) == "Instance" then
 			ownerName = owner.Name or "ServerOwned"
 		end
-		print(player.Name .. " cannot select NPC owned by: " .. ownerName)
+		if DEBUG then print(player.Name .. " cannot select NPC owned by: " .. ownerName) end
 	end
 end
 
 local function handleSecondClick(player, targetModel)
 	local attackerModel = selectedNPC[player]
 	if not attackerModel then
-		print(player.Name .. " needs to select an Attacker first.")
+		if DEBUG then print(player.Name .. " needs to select an Attacker first.") end
 		return
 	end
 
@@ -138,7 +144,7 @@ local function handleSecondClick(player, targetModel)
 
 	-- Only require attacker to have an owner
 	if not attackerOwner then
-		print("Cannot process attack: Your attacker has no owner")
+		if DEBUG then print("Cannot process attack: Your attacker has no owner") end
 		return
 	end
 
@@ -151,31 +157,31 @@ local function handleSecondClick(player, targetModel)
 		local attackerCountry = attackerModel:GetAttribute("Country")
 		local targetCountry = targetModel:GetAttribute("Country")
 		if attackerCountry == targetCountry then
-			print("Cannot attack: " .. targetModel.Name .. " is owned by you")
+			if DEBUG then print("Cannot attack: " .. targetModel.Name .. " is owned by you") end
 		elseif DiplomacyManager.areCountriesAllied(attackerCountry, targetCountry) then
-			print("Cannot attack: " .. targetModel.Name .. " belongs to an allied country")
+			if DEBUG then print("Cannot attack: " .. targetModel.Name .. " belongs to an allied country") end
 		else
-			print("Cannot attack: You are not at war with " .. targetModel.Name .. "'s country")
+			if DEBUG then print("Cannot attack: You are not at war with " .. targetModel.Name .. "'s country") end
 		end
 		return
 	end
 
 	-- Rule 2: Only Attackers can be manually directed
 	if attackerRole ~= "Attacker" then
-		print(attackerModel.Name .. " is a Defender and cannot be manually directed to attack.")
+		if DEBUG then print(attackerModel.Name .. " is a Defender and cannot be manually directed to attack.") end
 		clearSelection(player)
 		return
 	end
 
 	-- Rule 3: Tile adjacency check
 	if not TileAdjacencyManager.canNPCsInteract(attackerModel, targetModel) then
-		print("Cannot attack: " .. targetModel.Name .. " is not on an adjacent tile")
+		if DEBUG then print("Cannot attack: " .. targetModel.Name .. " is not on an adjacent tile") end
 		return
 	end
 
-	-- NEW: Check if target is retreating (invulnerable)
+	-- Check if target is retreating (invulnerable)
 	if NPCMovementSystem.isRetreating(targetModel) then
-		print("Cannot attack: " .. targetModel.Name .. " is retreating (invulnerable)")
+		if DEBUG then print("Cannot attack: " .. targetModel.Name .. " is retreating (invulnerable)") end
 		return
 	end
 
@@ -191,31 +197,31 @@ local function handleSecondClick(player, targetModel)
 		end
 
 		local targetCount = Combat.getManualTargetCount(attackerModel)
-		print(attackerModel.Name .. " now targeting " .. targetCount .. " enemy(s) (added " .. targetModel.Name .. ")")
+		if DEBUG then print(attackerModel.Name .. " now targeting " .. targetCount .. " enemy(s) (added " .. targetModel.Name .. ")") end
 	else
-		print(attackerModel.Name .. " is already targeting " .. targetModel.Name)
+		if DEBUG then print(attackerModel.Name .. " is already targeting " .. targetModel.Name) end
 	end
 
 	-- Always clear selection after assigning a target
 	clearSelection(player)
 end
 
--- NEW: Handle tile click for movement
+-- Handle tile click for movement
 local function handleTileClick(player, tilePart)
 	local npcModel = selectedNPC[player]
 	if not npcModel then
-		print(player.Name .. " needs to select an NPC first.")
+		if DEBUG then print(player.Name .. " needs to select an NPC first.") end
 		return
 	end
 
-	-- FIX: Check if target tile is directly adjacent before allowing movement
+	-- Check if target tile is directly adjacent before allowing movement
 	-- MUST verify adjacency - block movement if we can't determine current tile
 	local currentTileId = npcModel:GetAttribute("CurrentTileId")
 	local currentTilePart = currentTileId and TileAdjacencyManager.getTileFromId(currentTileId) or nil
 	if not currentTilePart then
 		local currentTileKey = npcModel:GetAttribute("TileKey")
 		if not currentTileKey then
-			print("Movement failed: NPC has no current tile")
+			if DEBUG then print("Movement failed: NPC has no current tile") end
 			clearSelection(player)
 			return
 		end
@@ -226,12 +232,12 @@ local function handleTileClick(player, tilePart)
 		end
 	end
 	if not currentTilePart then
-		print("Movement failed: Could not resolve NPC's current tile")
+		if DEBUG then print("Movement failed: Could not resolve NPC's current tile") end
 		clearSelection(player)
 		return
 	end
 
-	-- FIX v10: Validate NPC is actually near its resolved tile (prevents TileKey mismatch in small countries)
+	-- Validate NPC is actually near its resolved tile (prevents TileKey mismatch in small countries)
 	-- If the NPC's physical position is far from the resolved tile, re-resolve from actual position
 	local npcRoot = npcModel:FindFirstChild("HumanoidRootPart") or npcModel.PrimaryPart
 	if npcRoot and currentTilePart then
@@ -243,7 +249,7 @@ local function handleTileClick(player, tilePart)
 		if tileDistance > currentTilePart.Size.Magnitude / 2 + 5 then
 			local correctedTile = TileAdjacencyManager.getTileUnderPosition(npcRoot.Position)
 			if correctedTile then
-				print("[Movement] TileKey mismatch corrected: " .. currentTilePart.Name .. " -> " .. correctedTile.Name .. " (NPC was " .. math.floor(tileDistance) .. " studs from attributed tile)")
+				if DEBUG then print("[Movement] TileKey mismatch corrected: " .. currentTilePart.Name .. " -> " .. correctedTile.Name .. " (NPC was " .. math.floor(tileDistance) .. " studs from attributed tile)") end
 				currentTilePart = correctedTile
 				-- Update the NPC's TileKey to prevent future mismatches
 				local correctedKey = TileManager.getTileKeyFromPart(correctedTile)
@@ -259,36 +265,38 @@ local function handleTileClick(player, tilePart)
 		end
 	end
 
-	-- FIX v7: Add distance check as a safeguard against invalid tile resolution
+	-- Add distance check as a safeguard against invalid tile resolution
 	local distance = (currentTilePart.Position - tilePart.Position).Magnitude
 	if distance > 100 then -- Tiles should be within reasonable distance
-		print("[Movement] BLOCKED: Target tile too far (" .. math.floor(distance) .. " studs)")
+		if DEBUG then print("[Movement] BLOCKED: Target tile too far (" .. math.floor(distance) .. " studs)") end
 		clearSelection(player)
 		return
 	end
 
 	-- Debug logging to help diagnose adjacency issues
 	local isAdjacent = TileAdjacencyManager.areTilesAdjacent(currentTilePart, tilePart)
-	print("[Movement] " .. player.Name .. " moving from " .. currentTilePart.Name .. " to " .. tilePart.Name)
-	print("[Movement] Distance: " .. math.floor(distance) .. " studs | Adjacent: " .. tostring(isAdjacent))
+	if DEBUG then
+		print("[Movement] " .. player.Name .. " moving from " .. currentTilePart.Name .. " to " .. tilePart.Name)
+		print("[Movement] Distance: " .. math.floor(distance) .. " studs | Adjacent: " .. tostring(isAdjacent))
+	end
 
 	-- Check adjacency - must be directly adjacent (one tile away)
 	if not isAdjacent then
-		-- FIX v12.2: Full diagnostic when adjacency fails
+		-- Full diagnostic when adjacency fails
 		TileAdjacencyManager.diagnoseAdjacency(currentTilePart, tilePart)
 
 		local repaired = TileAdjacencyManager.tryRepairAdjacencyPair(currentTilePart, tilePart)
 		if repaired then
 			isAdjacent = TileAdjacencyManager.areTilesAdjacent(currentTilePart, tilePart)
 			if isAdjacent then
-				print(string.format("[Movement] Repaired adjacency at runtime: %s <-> %s", currentTilePart.Name, tilePart.Name))
+				if DEBUG then print(string.format("[Movement] Repaired adjacency at runtime: %s <-> %s", currentTilePart.Name, tilePart.Name)) end
 			end
 		else
-			print(string.format("[Movement] Runtime adjacency repair did not connect: %s <-> %s", currentTilePart.Name, tilePart.Name))
+			if DEBUG then print(string.format("[Movement] Runtime adjacency repair did not connect: %s <-> %s", currentTilePart.Name, tilePart.Name)) end
 		end
 
 		if not isAdjacent then
-			print("Movement failed: Target tile (" .. tilePart.Name .. ") is not adjacent to current tile (" .. currentTilePart.Name .. ")")
+			if DEBUG then print("Movement failed: Target tile (" .. tilePart.Name .. ") is not adjacent to current tile (" .. currentTilePart.Name .. ")") end
 			clearSelection(player)
 			return
 		end
@@ -298,14 +306,14 @@ local function handleTileClick(player, tilePart)
 	-- areTilesAdjacent() is a lookup-only check; the proof confirms a real walkable border.
 	local proof = TileAdjacencyManager.getAdjacencyProof(currentTilePart, tilePart)
 	if not proof then
-		print("[Movement] BLOCKED: No walkable crossing proof for " .. currentTilePart.Name .. " -> " .. tilePart.Name .. " (adjacency table false positive?)")
+		if DEBUG then print("[Movement] BLOCKED: No walkable crossing proof for " .. currentTilePart.Name .. " -> " .. tilePart.Name .. " (adjacency table false positive?)") end
 		clearSelection(player)
 		return
 	end
 
 	-- Block movement while the NPC is engaged in combat
 	if Combat.isInCombat(npcModel) then
-		print("[Movement] " .. npcModel.Name .. " cannot move: currently engaged in combat")
+		if DEBUG then print("[Movement] " .. npcModel.Name .. " cannot move: currently engaged in combat") end
 		clearSelection(player)
 		return
 	end
@@ -318,7 +326,7 @@ local function handleTileClick(player, tilePart)
 	-- Get tile key
 	local targetTileKey = TileManager.getTileKeyFromPart(tilePart)
 	if not targetTileKey then
-		print("Could not determine tile key for clicked part")
+		if DEBUG then print("Could not determine tile key for clicked part") end
 		clearSelection(player)
 		return
 	end
@@ -327,9 +335,9 @@ local function handleTileClick(player, tilePart)
 	local success, errorMsg = NPCMovementSystem.startMovement(npcModel, targetTileKey, tilePart)
 
 	if success then
-		print(npcModel.Name .. " moving to tile " .. targetTileKey)
+		if DEBUG then print(npcModel.Name .. " moving to tile " .. targetTileKey) end
 	else
-		print("Movement failed: " .. (errorMsg or "Unknown error"))
+		if DEBUG then print("Movement failed: " .. (errorMsg or "Unknown error")) end
 	end
 
 	-- Clear selection after issuing movement order
@@ -391,19 +399,14 @@ local function connectNPC(npcModel)
 	end)
 end
 
--- Initialize existing NPCs
-for _, child in ipairs(workspace:GetChildren()) do
-	if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then
-		connectNPC(child)
-	end
+-- Initialize existing registered NPCs
+for _, npcModel in ipairs(CollectionService:GetTagged(NPC_TAG)) do
+	connectNPC(npcModel)
 end
 
--- Connect new NPCs as they spawn
-workspace.ChildAdded:Connect(function(child)
-	if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then
-		task.wait(0.1)
-		connectNPC(child)
-	end
+-- Connect new NPCs when they receive the RegisteredNPC tag
+CollectionService:GetInstanceAddedSignal(NPC_TAG):Connect(function(npcModel)
+	connectNPC(npcModel)
 end)
 
 -- Clean up player state when they leave
@@ -413,15 +416,13 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 end)
 
--- Properly clean up NPC tracking and connections when destroyed
-workspace.ChildRemoved:Connect(function(child)
-	if connectedNPCs[child] then
-		disconnectNPC(child)
-	end
+-- Clean up NPC tracking when an NPC is unregistered or destroyed
+CollectionService:GetInstanceRemovedSignal(NPC_TAG):Connect(function(npcModel)
+	disconnectNPC(npcModel)
 
 	-- Also clear from any player's selection
 	for player, npc in pairs(selectedNPC) do
-		if npc == child then
+		if npc == npcModel then
 			selectedNPC[player] = nil
 		end
 	end

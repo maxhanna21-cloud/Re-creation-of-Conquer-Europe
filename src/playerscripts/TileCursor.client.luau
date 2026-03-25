@@ -1,4 +1,4 @@
--- TileCursor LocalScript - Merged v1
+-- TileCursor LocalScript
 -- Combines:
 --  - LRU caching & eviction (from v5)
 --  - Strict disabling of Highlight/SelectionBox when not in use (from v12)
@@ -15,7 +15,7 @@ local Mouse = Player:GetMouse()
 --------------------------------------------------------------------------------
 -- CONFIG
 --------------------------------------------------------------------------------
-local DEBUG_HOVER = true
+local DEBUG_HOVER = false
 local MAX_TILE_SIZE = 300
 local CACHE_MAX_SIZE = 500
 local CACHE_EVICT_COUNT = 250 -- how many oldest entries to evict when full
@@ -40,7 +40,7 @@ end
 
 -- Make a local clone so we can safely toggle/Destroy it without affecting other clients
 local Cursor = OriginalCursor:Clone()
-Cursor.Name = "LocalTileCursor_merged_v1"
+Cursor.Name = "LocalTileCursor"
 Cursor.Parent = Workspace
 
 -- Ensure cursor starts OFF (prevents highlight parent fallback)
@@ -301,4 +301,4 @@ end)
 setupCacheInvalidation()
 renderConn = RunService.RenderStepped:Connect(onRenderStepped)
 
-print("[TileCursor merged v1] Initialized. DEBUG_HOVER =", DEBUG_HOVER)
+if DEBUG_HOVER then print("[TileCursor] Initialized. DEBUG_HOVER =", DEBUG_HOVER) end
