@@ -39,8 +39,12 @@ end
 function CountryNPCRegistry.hasNPCs(countryName)
 	local set = CountryNPCIndex[countryName]
 	if not set then return false end
-	for _ in pairs(set) do
-		return true
+	-- FIX: Check npc.Parent ~= nil to skip dead NPCs in the Died → Debris window.
+	-- Matches the same guard used by getNPCs().
+	for npc in pairs(set) do
+		if npc.Parent ~= nil then
+			return true
+		end
 	end
 	return false
 end

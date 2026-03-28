@@ -2400,6 +2400,10 @@ function TileAdjacencyManager.findCellPath(tilePart, startPos, endPos)
 	return {}
 end
 
+function TileAdjacencyManager.getCountryTileParts(countryName)
+	return TileParts[countryName] or {}
+end
+
 function TileAdjacencyManager.getStats()
 	local total = 0
 	for _, neighbors in pairs(AdjacentTiles) do

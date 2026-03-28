@@ -1420,6 +1420,7 @@ local function monitorMovement(npcModel, isRetreat)
 		local originPosition = movement.originPosition
 		local targetTilePart = TileAdjacencyManager.getTileFromKey(targetTileKey)
 		local tileCountry = TileAdjacencyManager.getTileCountry(targetTilePart)
+		local tileEffectiveOwner = TileAdjacencyManager.getEffectiveOwner(targetTilePart)
 		local playerCountry = owner and TileManager.getPlayerCountry(owner)
 
 		-- Occupancy check — is another NPC already here?
@@ -1448,13 +1449,18 @@ local function monitorMovement(npcModel, isRetreat)
 		end
 
 		-- Tile capture / capital conquest logic
-		if tileCountry and tileCountry ~= playerCountry and role == "Attacker" then
+		-- Use tileEffectiveOwner (OwnerCountry attribute or geographic fallback) for the
+		-- "is this foreign?" and "are we at war?" checks. Using geographic tileCountry
+		-- would fail for conquered territories — e.g. France attacking Polish-occupied
+		-- Germany would check areCountriesAtWar("France", "Germany") instead of
+		-- ("France", "Poland"), silently skipping the capture.
+		if tileEffectiveOwner and tileEffectiveOwner ~= playerCountry and role == "Attacker" then
 			-- FIX: War may have ended while the NPC was in transit (e.g. peace signed mid-move).
-			-- Only capture if the NPC's country is still actively at war with the tile's country.
+			-- Only capture if the NPC's country is still actively at war with the tile's controller.
 			-- Without this check, an Attacker that arrives after peace illegally changes tile
 			-- ownership and leaves the server in an inconsistent diplomatic/ownership state.
 			local stillAtWar = playerCountry ~= nil
-				and DiplomacyManager.areCountriesAtWar(playerCountry, tileCountry)
+				and DiplomacyManager.areCountriesAtWar(playerCountry, tileEffectiveOwner)
 
 			if stillAtWar then
 				TileOwnershipManager.captureTile(targetTilePart, owner)
@@ -1478,8 +1484,8 @@ local function monitorMovement(npcModel, isRetreat)
 				-- to retreat manually, or it will engage again if war is re-declared.
 				if DEBUG then
 					print(string.format(
-						"[NPCMovement] %s arrived at %s tile but war with %s ended mid-transit — skipping capture",
-						npcModel.Name, tileCountry, tileCountry
+						"[NPCMovement] %s arrived at %s tile (controlled by %s) but war with %s ended mid-transit — skipping capture",
+						npcModel.Name, tileCountry, tostring(tileEffectiveOwner), tostring(tileEffectiveOwner)
 					))
 				end
 			end

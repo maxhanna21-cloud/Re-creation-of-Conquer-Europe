@@ -2,10 +2,16 @@
 -- Added duplicate war declaration prevention
 -- Wars persist when players leave - new player inherits wars
 -- Added country-level war checks for NPC combat
+-- NAPs are now timed truces: stored as os.clock() expiration timestamps
 
 local DiplomacyManager = {}
 local DEBUG = false
 local ServerState = require(game:GetService("ServerScriptService"):WaitForChild("ServerState", 10))
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Default NAP duration in seconds (5 minutes)
+local DEFAULT_NAP_DURATION = 300
 
 -- Lazy load to avoid circular dependency
 local TileManager = nil
@@ -18,8 +24,11 @@ end
 
 -- Data Structure:
 -- Wars["France"] = { ["Germany"] = true }
+-- Alliances["France"] = { ["Germany"] = true }
+-- NonAggressionPacts["France"] = { ["Germany"] = <os.clock() expiration timestamp> }
 local Wars = {}
 local Alliances = {}
+local NonAggressionPacts = {}
 
 function DiplomacyManager.initCountry(countryName)
 	if not Wars[countryName] then
@@ -27,6 +36,9 @@ function DiplomacyManager.initCountry(countryName)
 	end
 	if not Alliances[countryName] then
 		Alliances[countryName] = {}
+	end
+	if not NonAggressionPacts[countryName] then
+		NonAggressionPacts[countryName] = {}
 	end
 end
 
@@ -46,9 +58,54 @@ function DiplomacyManager.areCountriesAllied(countryA, countryB)
 	return (Alliances[countryA] and Alliances[countryA][countryB] == true) or false
 end
 
+-- Check if two COUNTRIES have a Non-Aggression Pact (timed truce)
+-- Returns true only if a pact exists AND has not yet expired
+function DiplomacyManager.hasNonAggressionPact(countryA, countryB)
+	if not countryA or not countryB then return false end
+	if countryA == countryB then return true end
+
+	local expiresAt = NonAggressionPacts[countryA] and NonAggressionPacts[countryA][countryB]
+	if type(expiresAt) == "number" and expiresAt > os.clock() then
+		return true
+	end
+
+	return false
+end
+
+-- Get the remaining time (in seconds) on a NAP between two countries
+-- Returns 0 if no active pact exists
+function DiplomacyManager.getNAPTimeRemaining(countryA, countryB)
+	if not countryA or not countryB then return 0 end
+	if countryA == countryB then return 0 end
+
+	local expiresAt = NonAggressionPacts[countryA] and NonAggressionPacts[countryA][countryB]
+	if type(expiresAt) == "number" then
+		local remaining = expiresAt - os.clock()
+		if remaining > 0 then
+			return remaining
+		end
+	end
+
+	return 0
+end
+
+-- Get the absolute expiration timestamp for a NAP (for sending to clients)
+-- Returns nil if no active pact exists
+function DiplomacyManager.getNAPExpiresAt(countryA, countryB)
+	if not countryA or not countryB then return nil end
+	if countryA == countryB then return nil end
+
+	local expiresAt = NonAggressionPacts[countryA] and NonAggressionPacts[countryA][countryB]
+	if type(expiresAt) == "number" and expiresAt > os.clock() then
+		return expiresAt
+	end
+
+	return nil
+end
+
 -- Declare War - Returns false if already at war
 function DiplomacyManager.declareWar(attackerCountry, defenderCountry)
-	if not attackerCountry or not defenderCountry then 
+	if not attackerCountry or not defenderCountry then
 		return false, "Invalid countries"
 	end
 
@@ -60,12 +117,22 @@ function DiplomacyManager.declareWar(attackerCountry, defenderCountry)
 		return false, "Already at war"
 	end
 
+	if DiplomacyManager.areCountriesAllied(attackerCountry, defenderCountry) then
+		return false, "You are allied. Break the alliance first."
+	end
+
+	if DiplomacyManager.hasNonAggressionPact(attackerCountry, defenderCountry) then
+		return false, "A Non-Aggression Pact is active. Break it first."
+	end
+
 	if not Wars[attackerCountry] then DiplomacyManager.initCountry(attackerCountry) end
 	if not Wars[defenderCountry] then DiplomacyManager.initCountry(defenderCountry) end
 
-	-- Break any existing alliance first
+	-- Break any existing alliance or NAP first (safeguard)
 	if Alliances[attackerCountry] then Alliances[attackerCountry][defenderCountry] = nil end
 	if Alliances[defenderCountry] then Alliances[defenderCountry][attackerCountry] = nil end
+	if NonAggressionPacts[attackerCountry] then NonAggressionPacts[attackerCountry][defenderCountry] = nil end
+	if NonAggressionPacts[defenderCountry] then NonAggressionPacts[defenderCountry][attackerCountry] = nil end
 
 	-- War is mutual
 	Wars[attackerCountry][defenderCountry] = true
@@ -111,6 +178,69 @@ function DiplomacyManager.clearAllWarsForCountry(countryName)
 	if DEBUG then print("WARS CLEARED: " .. countryName .. " (was at war with " .. #enemies .. " countries)") end
 end
 
+-- Clear all alliances for a country (called when country is conquered)
+function DiplomacyManager.clearAllAlliancesForCountry(countryName)
+	if not countryName then return end
+
+	local allies = {}
+	if Alliances[countryName] then
+		for ally, isAllied in pairs(Alliances[countryName]) do
+			if isAllied then
+				table.insert(allies, ally)
+			end
+		end
+	end
+
+	-- Remove bilateral alliance entries
+	for _, ally in ipairs(allies) do
+		if Alliances[ally] then
+			Alliances[ally][countryName] = nil
+		end
+	end
+
+	-- Clear the conquered country's alliances table
+	Alliances[countryName] = {}
+
+	if DEBUG then print("ALLIANCES CLEARED: " .. countryName .. " (was allied with " .. #allies .. " countries)") end
+end
+
+-- Clear all NAPs for a country (called when country is conquered)
+function DiplomacyManager.clearAllNAPsForCountry(countryName)
+	if not countryName then return end
+
+	local partners = {}
+	if NonAggressionPacts[countryName] then
+		for partner, expiresAt in pairs(NonAggressionPacts[countryName]) do
+			if type(expiresAt) == "number" then
+				table.insert(partners, partner)
+			end
+		end
+	end
+
+	-- Remove bilateral NAP entries
+	for _, partner in ipairs(partners) do
+		if NonAggressionPacts[partner] then
+			NonAggressionPacts[partner][countryName] = nil
+		end
+	end
+
+	-- Clear the conquered country's NAPs table
+	NonAggressionPacts[countryName] = {}
+
+	if DEBUG then print("NAPS CLEARED: " .. countryName .. " (had NAPs with " .. #partners .. " countries)") end
+end
+
+-- Clear ALL diplomacy for a country (wars, alliances, NAPs) — single call for conquest cleanup
+function DiplomacyManager.clearAllDiplomacyForCountry(countryName)
+	if not countryName then return end
+
+	DiplomacyManager.clearAllWarsForCountry(countryName)
+	DiplomacyManager.clearAllAlliancesForCountry(countryName)
+	DiplomacyManager.clearAllNAPsForCountry(countryName)
+
+	if DEBUG then print("ALL DIPLOMACY CLEARED: " .. countryName) end
+end
+
 -- Get country from player OR from NPC's country attribute
 local function getEntityCountry(entity)
 	if not entity then return nil end
@@ -128,8 +258,8 @@ end
 
 -- CHECK: Are these two players at war? (checks their countries)
 function DiplomacyManager.areAtWar(playerA, playerB)
-	if not playerA or not playerB then 
-		return false 
+	if not playerA or not playerB then
+		return false
 	end
 
 	if playerA == playerB then
@@ -139,7 +269,7 @@ function DiplomacyManager.areAtWar(playerA, playerB)
 	local countryA = getEntityCountry(playerA)
 	local countryB = getEntityCountry(playerB)
 
-	if not countryA or not countryB then 
+	if not countryA or not countryB then
 		return false
 	end
 
@@ -206,10 +336,38 @@ function DiplomacyManager.breakAlliance(countryA, countryB)
 	if DEBUG then print("ALLIANCE BROKEN: " .. countryA .. " and " .. countryB) end
 end
 
+-- FORM NON-AGGRESSION PACT (timed truce)
+-- duration: seconds until the pact expires (defaults to DEFAULT_NAP_DURATION)
+function DiplomacyManager.formNonAggressionPact(countryA, countryB, duration)
+	if not countryA or not countryB then return false end
+	if countryA == countryB then return false end
+
+	duration = duration or DEFAULT_NAP_DURATION
+	local expiresAt = os.clock() + duration
+
+	if not NonAggressionPacts[countryA] then NonAggressionPacts[countryA] = {} end
+	if not NonAggressionPacts[countryB] then NonAggressionPacts[countryB] = {} end
+
+	NonAggressionPacts[countryA][countryB] = expiresAt
+	NonAggressionPacts[countryB][countryA] = expiresAt
+
+	DiplomacyManager.makePeace(countryA, countryB)
+
+	if DEBUG then print("NAP FORMED: " .. countryA .. " and " .. countryB .. " (expires in " .. duration .. "s)") end
+	return true
+end
+
+-- BREAK NON-AGGRESSION PACT (manual break by a player)
+function DiplomacyManager.breakNonAggressionPact(countryA, countryB)
+	if NonAggressionPacts[countryA] then NonAggressionPacts[countryA][countryB] = nil end
+	if NonAggressionPacts[countryB] then NonAggressionPacts[countryB][countryA] = nil end
+	if DEBUG then print("NAP BROKEN: " .. countryA .. " and " .. countryB) end
+end
+
 -- CHECK ALLIANCE
 function DiplomacyManager.areAllied(playerA, playerB)
-	if not playerA or not playerB then 
-		return false 
+	if not playerA or not playerB then
+		return false
 	end
 
 	if playerA == playerB then
@@ -219,8 +377,8 @@ function DiplomacyManager.areAllied(playerA, playerB)
 	local countryA = getEntityCountry(playerA)
 	local countryB = getEntityCountry(playerB)
 
-	if not countryA or not countryB then 
-		return false 
+	if not countryA or not countryB then
+		return false
 	end
 
 	return DiplomacyManager.areCountriesAllied(countryA, countryB)
@@ -277,6 +435,20 @@ function DiplomacyManager.getAllies(countryName)
 	return allies
 end
 
+-- Get all countries with an active NAP with the given country
+function DiplomacyManager.getNAPPartners(countryName)
+	local partners = {}
+	local now = os.clock()
+	if NonAggressionPacts[countryName] then
+		for partner, expiresAt in pairs(NonAggressionPacts[countryName]) do
+			if type(expiresAt) == "number" and expiresAt > now then
+				table.insert(partners, partner)
+			end
+		end
+	end
+	return partners
+end
+
 -- Check if a country is at war with anyone
 function DiplomacyManager.isAtWarWithAnyone(countryName)
 	if Wars[countryName] then
@@ -306,6 +478,67 @@ function DiplomacyManager.debugPrintWars()
 		end
 	end
 	print("===================")
+end
+
+---------------------------------------------------------
+-- NAP EXPIRATION SWEEP (Server-side only)
+---------------------------------------------------------
+-- Runs every 5 seconds, checks all NAPs for expiration.
+-- Expired pacts are removed bilaterally and a global notification is fired.
+-- This only runs on the server (RunService:IsServer()).
+
+if RunService:IsServer() then
+	local NAP_SWEEP_INTERVAL = 5
+	local lastSweep = os.clock()
+
+	-- Callback for on-expiry notification (set by DiplomacyServer via setNAPExpiredCallback)
+	local napExpiredCallback = nil
+
+	function DiplomacyManager.setNAPExpiredCallback(callback)
+		napExpiredCallback = callback
+	end
+
+	local sweepConnection = RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+		if now - lastSweep < NAP_SWEEP_INTERVAL then
+			return
+		end
+		lastSweep = now
+
+		-- Collect expired pacts first, then remove (avoid mutating during iteration)
+		local expired = {}
+		local seen = {}
+
+		for countryA, pacts in pairs(NonAggressionPacts) do
+			for countryB, expiresAt in pairs(pacts) do
+				if type(expiresAt) == "number" and expiresAt <= now then
+					-- Deduplicate: only process each pair once
+					local key = countryA < countryB and (countryA .. "|" .. countryB) or (countryB .. "|" .. countryA)
+					if not seen[key] then
+						seen[key] = true
+						table.insert(expired, { countryA, countryB })
+					end
+				end
+			end
+		end
+
+		-- Remove expired pacts and notify
+		for _, pair in ipairs(expired) do
+			local a, b = pair[1], pair[2]
+			if NonAggressionPacts[a] then NonAggressionPacts[a][b] = nil end
+			if NonAggressionPacts[b] then NonAggressionPacts[b][a] = nil end
+
+			if DEBUG then print("NAP EXPIRED: " .. a .. " and " .. b) end
+
+			-- Fire the callback so DiplomacyServer can send global notifications
+			if napExpiredCallback then
+				task.spawn(napExpiredCallback, a, b)
+			end
+		end
+	end)
+
+	-- Store connection reference for potential cleanup (module-level, not per-player)
+	DiplomacyManager._sweepConnection = sweepConnection
 end
 
 return DiplomacyManager

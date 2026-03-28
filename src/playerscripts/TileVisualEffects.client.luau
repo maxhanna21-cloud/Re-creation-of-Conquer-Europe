@@ -67,36 +67,23 @@ local function scanCountryColors()
 	end
 end
 
--- Main handler: tween tilePart to the country's color
-local function onTileCaptured(tilePart, playerName, countryName)
-	-- Basic validation
-	if not tilePart or not countryName then
-		return
-	end
-	if not tilePart:IsA("BasePart") then
-		return
-	end
+-- Tween a single tile to the target country color
+local function tweenTileColor(tilePart, countryName)
+	if not tilePart or not countryName then return end
+	if not tilePart:IsA("BasePart") then return end
 
 	-- Resolve target color from the startup cache.
 	-- Do NOT read live tile colors here — tiles may already be repainted by the server,
 	-- and sampling them would corrupt the cache with occupying-country colors.
 	local targetColor = CountryColors[countryName]
-
-	if not targetColor then
-		-- Nothing we can do visually if we don't have a color
-		return
-	end
+	if not targetColor then return end
 
 	-- Skip if already the same color
-	if tilePart.Color == targetColor then
-		return
-	end
+	if tilePart.Color == targetColor then return end
 
 	-- Cancel any existing tween on this part to avoid stacking/jitter
 	local existing = ActiveTweens[tilePart]
 	if existing then
-		-- Cancel the running tween and clear it from the tracker
-		-- Tween:Cancel() exists on Roblox Tween objects
 		pcall(function()
 			existing:Cancel()
 		end)
@@ -109,7 +96,7 @@ local function onTileCaptured(tilePart, playerName, countryName)
 
 	-- Track the tween and clear reference when it's done (completed or cancelled)
 	ActiveTweens[tilePart] = tween
-	tween.Completed:Connect(function(playbackState)
+	tween.Completed:Connect(function(_playbackState)
 		-- Only clear if this same tween is still tracked (defensive)
 		if ActiveTweens[tilePart] == tween then
 			ActiveTweens[tilePart] = nil
@@ -117,6 +104,23 @@ local function onTileCaptured(tilePart, playerName, countryName)
 	end)
 
 	tween:Play()
+end
+
+-- Main handler: accepts either a single BasePart or a table of BaseParts (batched conquest).
+-- Single-part calls come from individual tile captures/releases/reclaims.
+-- Batched calls come from performCountryTakeover for efficient network usage.
+local function onTileCaptured(tilePartOrBatch, playerName, countryName)
+	if not tilePartOrBatch or not countryName then return end
+
+	if typeof(tilePartOrBatch) == "table" then
+		-- Batched: array of BaseParts from a country takeover
+		for _, tilePart in ipairs(tilePartOrBatch) do
+			tweenTileColor(tilePart, countryName)
+		end
+	else
+		-- Single BasePart from individual tile capture/release/reclaim
+		tweenTileColor(tilePartOrBatch, countryName)
+	end
 end
 
 -- Initialize and connect

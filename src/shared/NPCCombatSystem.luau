@@ -713,6 +713,13 @@ end
 function Combat.unregisterNPC(npcModel)
 	if not npcModel then return end
 
+	-- FIX: Early-exit if this NPC was already unregistered (prevents redundant
+	-- O(N) scans across all target/threat tables on the second call from
+	-- the Died→Destroying double-fire path).
+	if not npcRuntime[npcModel] and not npcOwners[npcModel] then
+		return
+	end
+
 	cleanupDebugParts(npcModel.Name)
 
 	-- Step 1: fetch runtime state

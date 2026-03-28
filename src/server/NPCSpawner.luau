@@ -132,9 +132,13 @@ function NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, ownerPlaye
 		-- Remove diagnostics tag
 		CollectionService:RemoveTag(npcClone, NPC_TAG)
 
-		-- Unregister from UnitManager if player-owned
-		if ownerPlayer then
-			UnitManager.deregisterUnit(ownerPlayer, npcClone)
+		-- FIX: Read the CURRENT owner from the ObjectValue instead of the captured
+		-- closure variable. After transferCountryNPCs, ownerPlayer is stale — the
+		-- NPC now belongs to whoever the ObjectValue points to.
+		local currentOwnerVal = npcClone:FindFirstChild("NPCOwner")
+		local currentOwner = currentOwnerVal and currentOwnerVal.Value
+		if currentOwner and typeof(currentOwner) == "Instance" and currentOwner:IsA("Player") then
+			UnitManager.deregisterUnit(currentOwner, npcClone)
 		end
 
 		-- Unregister from combat system (clears all target/threat tables)

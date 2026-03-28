@@ -192,7 +192,7 @@ metadata:
 - ALWAYS defend against nil — StreamingEnabled means any part may not exist on the client.
 - NEVER trust the client for damage, inventory, or currency. Server is authoritative.
 - Every response with code MUST include Block 1 (REJECTED ALTERNATIVES, SCALABILITY CHECK, FAILURE SIMULATION) before the code.
-- **FULL SCRIPT RULE (NO EXCEPTIONS):** When no source files, MCP tools, or canvas features are available to make targeted edits, you MUST output the COMPLETE script from the first line to the last line. This means:
+- **FULL SCRIPT RULE (NO EXCEPTIONS):** When no source files, MCP tools, canvas, or artifact features are available to make targeted edits, you MUST output the COMPLETE script from the first line to the last line. This means:
   - NO `-- ... rest of the script remains the same` or similar abbreviations.
   - NO `-- [existing code unchanged]` or `-- [keep everything above]` comments.
   - NO partial functions. NO snippets. NO "here's just the changed part."
@@ -216,13 +216,3 @@ metadata:
   - If you create a per-player or per-instance table/connection, you MUST write the cleanup code in the same response. No "I'll add cleanup later."
 
 ---
-
-## Feature Ledger
-
-| #  | Feature                                      | Description                                                                                                   | Status    |
-|----|----------------------------------------------|---------------------------------------------------------------------------------------------------------------|-----------|
-| 1  | Atomic tile ownership (Phase 1)              | Private helpers + 3 high-level state applicators in TileOwnershipManager; all 3 state dimensions (Color, OwnerCountry, OccupiedTerritories) written synchronously with no yields. Fixed 3 invariant bugs (reclaimTile, releaseCountryOccupiedTiles, captureTile). | Completed |
-| 2  | TileId occupancy migration (Phase 2)         | TileManager migrated from positional tileKey keys to unique TileId attributes. GlobalOccupiedTiles demoted to DEBUG mirror. Primary API: occupyResolvedTile / releaseResolvedTile. Compatibility shims retained for legacy callers. getSpawnPosition and getAvailableTileCount fixed. NPCSpawner, NPCTargetingHandler, and NPCMovementSystem updated to use TileId-authoritative paths. | Completed |
-| 3  | NPCCombatSystem lifecycle hardening (Phase 3) | Internal Maid/Janitor pattern; per-NPC npcRuntime state bag; idempotent registerNPC (cleans old maid before re-registering); ordered unregisterNPC (maid:DoCleaning before table clearing); generation token approach for combat loops prevents stale loop re-entry after re-registration; transferOwnership calls NPCMovementSystem.OnOwnerChanged. | Completed |
-| 4  | corridorOrigin dead branch removal (Phase 3) | Removed unreachable `if corridorOrigin then` block in NPCMovementSystem monitorMovement; effectiveTarget now resolves directly to waypointPos. | Completed |
-| 5  | CollectionService tag-based NPC iteration (Phase 4) | NPCTargetingHandler uses GetTagged + GetInstanceAddedSignal/GetInstanceRemovedSignal instead of workspace:GetChildren() scans. CountryManager removes getCountryNPCs workspace scan; inlines CountryNPCRegistry.getNPCs. Diagnostics removes workspace fallback scan; logs zero-NPC state. CountryNPCRegistry nils empty country tables after unregister; getNPCs filters dead NPCs (parent nil guard). | Completed |

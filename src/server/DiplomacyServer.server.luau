@@ -2,6 +2,8 @@
 -- Prevents duplicate war declarations
 -- Better validation and error messages
 -- Full conquest-chain resolution via ServerState.resolveTarget()
+-- Added Non-Aggression Pact (NAP) request and break logic
+-- NAPs are now timed truces that expire automatically
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local DEBUG = false
@@ -22,157 +24,202 @@ local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 10
 local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 10)
 local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
+-- Duration constants (in seconds)
+local PEACE_TRUCE_DURATION = 120   -- 2-minute truce automatically created on peace
+local PLAYER_NAP_DURATION = 300    -- 5-minute NAP when players agree to one manually
+
+-- HELPER: Format seconds into a human-readable string (e.g. "5m 00s")
+local function formatDuration(seconds)
+    local mins = math.floor(seconds / 60)
+    local secs = math.floor(seconds % 60)
+    if mins > 0 then
+        return string.format("%dm %02ds", mins, secs)
+    end
+    return string.format("%ds", secs)
+end
+
 -- HELPER: Find which country a player currently owns
 local function getPlayerCountry(player)
-	local countryOwners = ServerState.getCountryOwners()
-	for countryName, owner in pairs(countryOwners) do
-		if owner == player then
-			return countryName
-		end
-	end
-	return nil
+    local countryOwners = ServerState.getCountryOwners()
+    for countryName, owner in pairs(countryOwners) do
+        if owner == player then
+            return countryName
+        end
+    end
+    return nil
 end
 
 -- HELPER: Raw single-level lookup (used ONLY for pre-resolution early-exit checks,
 -- e.g. "does this country exist?").
 -- Do NOT use this to determine the controlling player — use ServerState.resolveTarget() instead.
 local function getCountryOwner(countryName)
-	local countryOwners = ServerState.getCountryOwners()
-	return countryOwners[countryName]
+    local countryOwners = ServerState.getCountryOwners()
+    return countryOwners[countryName]
 end
 
 ---------------------------------------------------------
--- PART 1: WAR LOGIC (Instant Action) - FIXED
+-- NAP EXPIRATION CALLBACK
+---------------------------------------------------------
+-- When the DiplomacyManager sweep detects an expired NAP, this fires a
+-- global notification so all players know the truce has ended.
+DiplomacyManager.setNAPExpiredCallback(function(countryA, countryB)
+    local msg = "⏰ TRUCE EXPIRED: The Non-Aggression Pact between " .. countryA .. " and " .. countryB .. " has expired!"
+    GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 200, 100))
+
+    -- Personally remind both country owners
+    local ownerA = getCountryOwner(countryA)
+    local ownerB = getCountryOwner(countryB)
+
+    if typeof(ownerA) == "Instance" and ownerA:IsA("Player") and ownerA.Parent then
+        DiplomacyReminderEvent:FireClient(ownerA, countryB, "NAPExpired")
+    end
+    if typeof(ownerB) == "Instance" and ownerB:IsA("Player") and ownerB.Parent then
+        DiplomacyReminderEvent:FireClient(ownerB, countryA, "NAPExpired")
+    end
+
+    if DEBUG then print("⏰ NAP EXPIRED callback fired: " .. countryA .. " / " .. countryB) end
+end)
+
+---------------------------------------------------------
+-- PART 1: WAR LOGIC (Instant Action)
 ---------------------------------------------------------
 DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
-	local playerCountry = getPlayerCountry(player)
+    local playerCountry = getPlayerCountry(player)
 
-	-- Validation Checks
-	if not playerCountry then
-		GlobalNotificationEvent:FireClient(player, "❌ You must own a country to declare war.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Validation Checks
+    if not playerCountry then
+        GlobalNotificationEvent:FireClient(player, "❌ You must own a country to declare war.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	if playerCountry == targetCountryName then
-		GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    if playerCountry == targetCountryName then
+        GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	-- Raw pre-resolution checks (before chain-walking)
-	local rawOwner = getCountryOwner(targetCountryName)
+    -- Raw pre-resolution checks (before chain-walking)
+    local rawOwner = getCountryOwner(targetCountryName)
 
-	-- Check if target country exists
-	if rawOwner == nil then
-		GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Check if target country exists
+    if rawOwner == nil then
+        GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	-- Unowned countries (no player controlling them) are still valid war targets.
-	-- NPCs may or may not be present — either way the country has territory on the map.
-	-- (Conquered countries are handled below via the "Conquered_" chain resolution.)
+    -- Unowned countries (no player controlling them) are still valid war targets.
+    -- NPCs may or may not be present — either way the country has territory on the map.
+    -- (Conquered countries are handled below via the "Conquered_" chain resolution.)
 
-	-- If target is conquered, resolve the full chain to the actual controlling country/player.
-	-- ALL conquest-chain resolution goes through ServerState.resolveTarget() — no exceptions.
-	if type(rawOwner) == "string" and rawOwner:find("Conquered_") then
-		local canonicalName, controllingPlayer = ServerState.resolveTarget(targetCountryName)
-		if not canonicalName then
-			GlobalNotificationEvent:FireClient(player, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
-			return
-		end
+    -- If target is conquered, resolve the full chain to the actual controlling country/player.
+    -- ALL conquest-chain resolution goes through ServerState.resolveTarget() — no exceptions.
+    if type(rawOwner) == "string" and rawOwner:find("Conquered_") then
+        local canonicalName, controllingPlayer = ServerState.resolveTarget(targetCountryName)
+        if not canonicalName then
+            GlobalNotificationEvent:FireClient(player, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
+            return
+        end
 
-		-- Redirect war declaration to the canonical controlling country
-		targetCountryName = canonicalName
+        -- Redirect war declaration to the canonical controlling country
+        targetCountryName = canonicalName
 
-		-- Re-validate after redirect
-		local resolvedOwner = getCountryOwner(canonicalName)
-		if not resolvedOwner then
-			GlobalNotificationEvent:FireClient(player, "❌ The conquering country no longer exists.", Color3.fromRGB(255, 100, 100))
-			return
-		end
-		-- Unowned conqueror is still a valid war target (country has territory)
-		if targetCountryName == playerCountry then
-			GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
-			return
-		end
-	end
+        -- Re-validate after redirect
+        local resolvedOwner = getCountryOwner(canonicalName)
+        if not resolvedOwner then
+            GlobalNotificationEvent:FireClient(player, "❌ The conquering country no longer exists.", Color3.fromRGB(255, 100, 100))
+            return
+        end
+        -- Unowned conqueror is still a valid war target (country has territory)
+        if targetCountryName == playerCountry then
+            GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
+            return
+        end
+    end
 
-	-- Check if allied with target (must break alliance first)
-	if DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
-		GlobalNotificationEvent:FireClient(player, "You are allied with " .. targetCountryName .. "! Break the alliance first.", Color3.fromRGB(255, 200, 0))
-		return
-	end
+    -- Check if allied with target (must break alliance first)
+    if DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
+        GlobalNotificationEvent:FireClient(player, "You are allied with " .. targetCountryName .. "! Break the alliance first.", Color3.fromRGB(255, 200, 0))
+        return
+    end
 
-	-- Use the return value from declareWar to check for duplicates
-	local success, message = DiplomacyManager.declareWar(playerCountry, targetCountryName)
+    -- Check if a truce (NAP) is active — show remaining time in the message
+    if DiplomacyManager.hasNonAggressionPact(playerCountry, targetCountryName) then
+        local remaining = DiplomacyManager.getNAPTimeRemaining(playerCountry, targetCountryName)
+        local timeStr = formatDuration(remaining)
+        GlobalNotificationEvent:FireClient(player, "⏰ A truce is active with " .. targetCountryName .. "! Expires in " .. timeStr .. ". Break it first.", Color3.fromRGB(255, 200, 0))
+        return
+    end
 
-	if not success then
-		if message == "Already at war" then
-			GlobalNotificationEvent:FireClient(player, "⚠️ You are already at war with " .. targetCountryName .. "!", Color3.fromRGB(255, 200, 0))
-		else
-			GlobalNotificationEvent:FireClient(player, "❌ " .. (message or "Could not declare war."), Color3.fromRGB(255, 100, 100))
-		end
-		return
-	end
+    -- Use the return value from declareWar to check for duplicates
+    local success, message = DiplomacyManager.declareWar(playerCountry, targetCountryName)
 
-	-- War declared successfully - notify everyone
-	if DEBUG then print("⚔️ WAR: " .. playerCountry .. " vs " .. targetCountryName) end
-	local msg = "⚠️ WAR: " .. playerCountry .. " has declared war on " .. targetCountryName .. "!"
-	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 80, 80))
+    if not success then
+        if message == "Already at war" then
+            GlobalNotificationEvent:FireClient(player, "⚠️ You are already at war with " .. targetCountryName .. "!", Color3.fromRGB(255, 200, 0))
+        else
+            GlobalNotificationEvent:FireClient(player, "❌ " .. (message or "Could not declare war."), Color3.fromRGB(255, 100, 100))
+        end
+        return
+    end
 
-	-- Personally remind the target country's owner via ReminderPopup
-	local targetOwner = getCountryOwner(targetCountryName)
-	if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
-		DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "War")
-	end
+    -- War declared successfully - notify everyone
+    if DEBUG then print("⚔️ WAR: " .. playerCountry .. " vs " .. targetCountryName) end
+    local msg = "⚠️ WAR: " .. playerCountry .. " has declared war on " .. targetCountryName .. "!"
+    GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 80, 80))
+
+    -- Personally remind the target country's owner via ReminderPopup
+    local targetOwner = getCountryOwner(targetCountryName)
+    if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
+        DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "War")
+    end
 end)
 
 ---------------------------------------------------------
 -- PART 1.5: BREAK ALLIANCE LOGIC (Instant Action)
 ---------------------------------------------------------
 BreakAllianceEvent.OnServerEvent:Connect(function(player, targetCountryName)
-	local playerCountry = getPlayerCountry(player)
+    local playerCountry = getPlayerCountry(player)
 
-	-- Validation Checks
-	if not playerCountry then
-		GlobalNotificationEvent:FireClient(player, "❌ You must own a country to break an alliance.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Validation Checks
+    if not playerCountry then
+        GlobalNotificationEvent:FireClient(player, "❌ You must own a country to break an alliance.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	if playerCountry == targetCountryName then
-		GlobalNotificationEvent:FireClient(player, "❌ You cannot break an alliance with yourself.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    if playerCountry == targetCountryName then
+        GlobalNotificationEvent:FireClient(player, "❌ You cannot break an alliance with yourself.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	local targetOwner = getCountryOwner(targetCountryName)
+    local targetOwner = getCountryOwner(targetCountryName)
 
-	-- Check if target country exists
-	if targetOwner == nil then
-		GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Check if target country exists
+    if targetOwner == nil then
+        GlobalNotificationEvent:FireClient(player, "❌ That country doesn't exist.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	-- Check if allied with target
-	if not DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
-		GlobalNotificationEvent:FireClient(player, "❌ You are not allied with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
-		return
-	end
+    -- Check if allied with target
+    if not DiplomacyManager.areCountriesAllied(playerCountry, targetCountryName) then
+        GlobalNotificationEvent:FireClient(player, "❌ You are not allied with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
+        return
+    end
 
-	-- Break the alliance
-	DiplomacyManager.breakAlliance(playerCountry, targetCountryName)
+    -- Break the alliance
+    DiplomacyManager.breakAlliance(playerCountry, targetCountryName)
 
-	-- Notify everyone
-	if DEBUG then print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName) end
-	local msg = "💔 " .. playerCountry .. " has broken their alliance with " .. targetCountryName .. "!"
-	GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 100, 100))
+    -- Notify everyone
+    if DEBUG then print("💔 ALLIANCE BROKEN: " .. playerCountry .. " broke alliance with " .. targetCountryName) end
+    local msg = "💔 " .. playerCountry .. " has broken their alliance with " .. targetCountryName .. "!"
+    GlobalNotificationEvent:FireAllClients(msg, Color3.fromRGB(255, 100, 100))
 
-	-- Personally remind the target country's owner via ReminderPopup
-	if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
-		DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "BreakAlliance")
-	end
+    -- Personally remind the target country's owner via ReminderPopup
+    if typeof(targetOwner) == "Instance" and targetOwner:IsA("Player") and targetOwner.Parent then
+        DiplomacyReminderEvent:FireClient(targetOwner, playerCountry, "BreakAlliance")
+    end
 end)
 
 ---------------------------------------------------------
--- PART 2: PEACE & ALLIANCE LOGIC (Request System)
+-- PART 2: PEACE, ALLIANCE & NAP LOGIC (Request System)
 ---------------------------------------------------------
 
 -- Monotonically incrementing counter for request IDs.
@@ -180,153 +227,208 @@ end)
 -- requests arrive within the same server frame (identical float timestamp).
 local nextRequestId = 0
 local function generateRequestId()
-	nextRequestId += 1
-	return tostring(nextRequestId)
+    nextRequestId += 1
+    return tostring(nextRequestId)
 end
 
 local function processRequest(senderPlayer, targetCountryName, requestType)
-	local senderCountry = getPlayerCountry(senderPlayer)
+    local senderCountry = getPlayerCountry(senderPlayer)
 
-	-- Resolve the full conquest chain to get canonical country name + controlling player.
-	-- This is the single authoritative resolution path — no chain-walking anywhere else.
-	local canonicalName, receiverPlayer = ServerState.resolveTarget(targetCountryName)
-	if not canonicalName then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
-		return
-	end
-	targetCountryName = canonicalName
+    -- Resolve the full conquest chain to get canonical country name + controlling player.
+    -- This is the single authoritative resolution path — no chain-walking anywhere else.
+    local canonicalName, receiverPlayer = ServerState.resolveTarget(targetCountryName)
+    if not canonicalName then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country's ruling power could not be determined.", Color3.fromRGB(255, 100, 100))
+        return
+    end
+    targetCountryName = canonicalName
 
-	-- Validation
-	if not senderCountry then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ You must own a country first.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Validation
+    if not senderCountry then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ You must own a country first.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	if not receiverPlayer then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country has no owner.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    if not receiverPlayer then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ That country has no owner.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	if senderPlayer == receiverPlayer then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ You cannot send requests to yourself.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    if senderPlayer == receiverPlayer then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ You cannot send requests to yourself.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	-- receiverPlayer is guaranteed to be a Player instance by resolveTarget(),
-	-- but keep the safety check so any unexpected value surfaces clearly.
-	if typeof(receiverPlayer) ~= "Instance" or not receiverPlayer:IsA("Player") then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ Cannot send requests to AI/unowned countries.", Color3.fromRGB(255, 200, 0))
-		return
-	end
+    -- receiverPlayer is guaranteed to be a Player instance by resolveTarget(),
+    -- but keep the safety check so any unexpected value surfaces clearly.
+    if typeof(receiverPlayer) ~= "Instance" or not receiverPlayer:IsA("Player") then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ Cannot send requests to AI/unowned countries.", Color3.fromRGB(255, 200, 0))
+        return
+    end
 
-	-- Check if player is still in game
-	if not receiverPlayer.Parent then
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ That player has left the game.", Color3.fromRGB(255, 100, 100))
-		return
-	end
+    -- Check if player is still in game
+    if not receiverPlayer.Parent then
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ That player has left the game.", Color3.fromRGB(255, 100, 100))
+        return
+    end
 
-	-- Additional validation for peace requests
-	if requestType == "Peace" then
-		if not DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
-			GlobalNotificationEvent:FireClient(senderPlayer, "⚠️ You are not at war with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
-			return
-		end
-	end
+    -- Additional validation for peace requests
+    if requestType == "Peace" then
+        if not DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
+            GlobalNotificationEvent:FireClient(senderPlayer, "⚠️ You are not at war with " .. targetCountryName .. ".", Color3.fromRGB(255, 200, 0))
+            return
+        end
+    end
 
-	-- Additional validation for alliance requests
-	if requestType == "Alliance" then
-		if DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
-			GlobalNotificationEvent:FireClient(senderPlayer, "You are at war with " .. targetCountryName .. "! Sign peace first.", Color3.fromRGB(255, 200, 0))
-			return
-		end
-	end
+    -- Additional validation for alliance and NAP requests
+    if requestType == "Alliance" or requestType == "NAP" then
+        if DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
+            GlobalNotificationEvent:FireClient(senderPlayer, "You are at war with " .. targetCountryName .. "! Sign peace first.", Color3.fromRGB(255, 200, 0))
+            return
+        end
+    end
 
-	if DEBUG then print("📨 Sending " .. requestType .. " request from " .. senderCountry .. " to " .. targetCountryName) end
+    -- Prevent duplicate NAP requests when one is already active
+    if requestType == "NAP" then
+        if DiplomacyManager.hasNonAggressionPact(senderCountry, targetCountryName) then
+            local remaining = DiplomacyManager.getNAPTimeRemaining(senderCountry, targetCountryName)
+            local timeStr = formatDuration(remaining)
+            GlobalNotificationEvent:FireClient(senderPlayer, "⏰ You already have a Non-Aggression Pact with " .. targetCountryName .. "! Expires in " .. timeStr .. ".", Color3.fromRGB(255, 200, 0))
+            return
+        end
+    end
 
-	-- FIX: Use fire-and-response pattern instead of InvokeClient
-	-- Store the pending request to handle the response
-	local requestId = generateRequestId()
-	ServerState.setPendingDiplomacyRequest(requestId, {
-		senderPlayer = senderPlayer,
-		receiverPlayer = receiverPlayer,
-		senderCountry = senderCountry,
-		targetCountryName = targetCountryName,
-		requestType = requestType
-	})
+    if DEBUG then print("📨 Sending " .. requestType .. " request from " .. senderCountry .. " to " .. targetCountryName) end
 
-	-- Fire to client to show the popup
-	DiplomacyRequest:FireClient(receiverPlayer, senderCountry, requestType, requestId)
+    -- FIX: Use fire-and-response pattern instead of InvokeClient
+    -- Store the pending request to handle the response
+    local requestId = generateRequestId()
+    ServerState.setPendingDiplomacyRequest(requestId, {
+        senderPlayer = senderPlayer,
+        receiverPlayer = receiverPlayer,
+        senderCountry = senderCountry,
+        targetCountryName = targetCountryName,
+        requestType = requestType
+    })
 
-	-- The response will be handled by DiplomacyResponse.OnServerEvent below
+    -- Fire to client to show the popup
+    DiplomacyRequest:FireClient(receiverPlayer, senderCountry, requestType, requestId)
+
+    -- The response will be handled by DiplomacyResponse.OnServerEvent below
 end
 
 -- Connect the UI buttons to this logic
 SendRequestEvent.OnServerEvent:Connect(function(player, targetCountryName, requestType)
-	task.spawn(function()
-		processRequest(player, targetCountryName, requestType)
-	end)
+    task.spawn(function()
+        processRequest(player, targetCountryName, requestType)
+    end)
 end)
 
 ---------------------------------------------------------
--- PART 3: DIPLOMACY RESPONSE HANDLER (FIX)
+-- PART 3: DIPLOMACY RESPONSE HANDLER
 ---------------------------------------------------------
+
+-- FIX: Clean up pending diplomacy requests when a player leaves.
+-- Notifies senders that their request expired and prevents orphaned entries.
+Players.PlayerRemoving:Connect(function(leavingPlayer)
+    local idsToRemove = {}
+
+    -- Scan all pending requests for ones involving the leaving player
+    -- (as either receiver or sender).
+    for requestId, data in pairs(ServerState.PendingDiplomacyRequests) do
+        if data.receiverPlayer == leavingPlayer or data.senderPlayer == leavingPlayer then
+            table.insert(idsToRemove, requestId)
+        end
+    end
+
+    for _, requestId in ipairs(idsToRemove) do
+        local data = ServerState.getPendingDiplomacyRequest(requestId)
+        ServerState.clearPendingDiplomacyRequest(requestId)
+
+        if data then
+            -- Notify the sender that the receiver left (only if sender is still in game)
+            if data.receiverPlayer == leavingPlayer
+                and data.senderPlayer
+                and data.senderPlayer.Parent then
+                GlobalNotificationEvent:FireClient(
+                    data.senderPlayer,
+                    "❌ " .. data.targetCountryName .. "'s leader left — your " .. data.requestType .. " request expired.",
+                    Color3.fromRGB(255, 200, 0)
+                )
+            end
+        end
+    end
+end)
 
 -- Handle responses from clients using the new RemoteEvent
 DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
-	local requestData = ServerState.getPendingDiplomacyRequest(requestId)
-	if not requestData then
-		warn("[DiplomacyServer] Received response for unknown request: " .. requestId)
-		return
-	end
+    local requestData = ServerState.getPendingDiplomacyRequest(requestId)
+    if not requestData then
+        warn("[DiplomacyServer] Received response for unknown request: " .. requestId)
+        return
+    end
 
-	-- Verify this is the correct player responding
-	if player ~= requestData.receiverPlayer then
-		warn("[DiplomacyServer] Player " .. player.Name .. " attempted to respond to a request not for them.")
-		return
-	end
+    -- Verify this is the correct player responding
+    if player ~= requestData.receiverPlayer then
+        warn("[DiplomacyServer] Player " .. player.Name .. " attempted to respond to a request not for them.")
+        return
+    end
 
-	-- Clean up the pending request
-	ServerState.clearPendingDiplomacyRequest(requestId)
+    -- Clean up the pending request
+    ServerState.clearPendingDiplomacyRequest(requestId)
 
-	local senderPlayer = requestData.senderPlayer
-	local senderCountry = requestData.senderCountry
-	local targetCountryName = requestData.targetCountryName
-	local requestType = requestData.requestType
+    local senderPlayer = requestData.senderPlayer
+    local senderCountry = requestData.senderCountry
+    local targetCountryName = requestData.targetCountryName
+    local requestType = requestData.requestType
 
-	-- Check if sender is still in game
-	if not senderPlayer.Parent then
-		if DEBUG then print("[DiplomacyServer] Sender " .. senderPlayer.Name .. " left the game before response was received.") end
-		return
-	end
+    -- Check if sender is still in game
+    if not senderPlayer.Parent then
+        if DEBUG then print("[DiplomacyServer] Sender " .. senderPlayer.Name .. " left the game before response was received.") end
+        return
+    end
 
-	if accepted then
-		if requestType == "Alliance" then
-			DiplomacyManager.formAlliance(senderCountry, targetCountryName)
-			GlobalNotificationEvent:FireAllClients("🤝 ALLIANCE: " .. senderCountry .. " and " .. targetCountryName .. " are now allies!", Color3.fromRGB(100, 255, 100))
+    if accepted then
+        if requestType == "Alliance" then
+            DiplomacyManager.formAlliance(senderCountry, targetCountryName)
+            GlobalNotificationEvent:FireAllClients("🤝 ALLIANCE: " .. senderCountry .. " and " .. targetCountryName .. " are now allies!", Color3.fromRGB(100, 255, 100))
 
-			-- Personally remind the sender that their alliance was accepted
-			DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "AllianceAccepted")
-		elseif requestType == "Peace" then
-			DiplomacyManager.makePeace(senderCountry, targetCountryName)
-			-- FIX: Annex occupied tiles instead of releasing them
-			-- Each country keeps whatever territory they occupied during the war
-			local senderAnnexed = TileOwnershipManager.annexOccupiedTiles(senderCountry)
-			local targetAnnexed = TileOwnershipManager.annexOccupiedTiles(targetCountryName)
+            -- Personally remind the sender that their alliance was accepted
+            DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "AllianceAccepted")
+        elseif requestType == "NAP" then
+            DiplomacyManager.formNonAggressionPact(senderCountry, targetCountryName, PLAYER_NAP_DURATION)
+            local timeStr = formatDuration(PLAYER_NAP_DURATION)
+            GlobalNotificationEvent:FireAllClients("📜 PACT: " .. senderCountry .. " and " .. targetCountryName .. " signed a Non-Aggression Pact! (Expires in " .. timeStr .. ")", Color3.fromRGB(200, 200, 255))
 
-			local annexMsg = ""
-			if senderAnnexed > 0 then
-				annexMsg = annexMsg .. senderCountry .. " annexed " .. senderAnnexed .. " tiles. "
-			end
-			if targetAnnexed > 0 then
-				annexMsg = annexMsg .. targetCountryName .. " annexed " .. targetAnnexed .. " tiles. "
-			end
+            DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "NAPAccepted")
+        elseif requestType == "Peace" then
+            DiplomacyManager.makePeace(senderCountry, targetCountryName)
+            -- FIX: Annex occupied tiles instead of releasing them
+            -- Each country keeps whatever territory they occupied during the war
+            local senderAnnexed = TileOwnershipManager.annexOccupiedTiles(senderCountry)
+            local targetAnnexed = TileOwnershipManager.annexOccupiedTiles(targetCountryName)
 
-			GlobalNotificationEvent:FireAllClients("🕊️ PEACE: " .. senderCountry .. " and " .. targetCountryName .. " have signed a treaty. " .. annexMsg, Color3.fromRGB(100, 200, 255))
+            local annexMsg = ""
+            if senderAnnexed > 0 then
+                annexMsg = annexMsg .. senderCountry .. " annexed " .. senderAnnexed .. " tiles. "
+            end
+            if targetAnnexed > 0 then
+                annexMsg = annexMsg .. targetCountryName .. " annexed " .. targetAnnexed .. " tiles. "
+            end
 
-			-- Personally remind the sender that their peace offer was accepted
-			DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "PeaceAccepted")
-		end
-	else
-		GlobalNotificationEvent:FireClient(senderPlayer, "❌ " .. targetCountryName .. " rejected your " .. requestType .. " request.", Color3.fromRGB(255, 200, 0))
-	end
+            -- Automatically create a truce (timed NAP) after peace is signed
+            DiplomacyManager.formNonAggressionPact(senderCountry, targetCountryName, PEACE_TRUCE_DURATION)
+            local truceStr = formatDuration(PEACE_TRUCE_DURATION)
+
+            GlobalNotificationEvent:FireAllClients(
+                "🕊️ PEACE: " .. senderCountry .. " and " .. targetCountryName .. " have signed a treaty. " .. annexMsg .. "A " .. truceStr .. " truce is now in effect!",
+                Color3.fromRGB(100, 200, 255)
+            )
+
+            -- Personally remind the sender that their peace offer was accepted
+            DiplomacyReminderEvent:FireClient(senderPlayer, targetCountryName, "PeaceAccepted")
+        end
+    else
+        GlobalNotificationEvent:FireClient(senderPlayer, "❌ " .. targetCountryName .. " rejected your " .. requestType .. " request.", Color3.fromRGB(255, 200, 0))
+    end
 end)

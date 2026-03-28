@@ -13,20 +13,9 @@ local NPC_TAG = "RegisteredNPC" -- Tag applied to all NPCs
 local CHECK_INTERVAL = 10
 local lastCheck = 0
 
--- Helper function to tag NPCs when registered
--- Call this from NPCPurchaseHandler after spawning an NPC
-function _G.TagNPCForDiagnostics(npcModel)
-	if npcModel and npcModel:IsA("Model") then
-		CollectionService:AddTag(npcModel, NPC_TAG)
-	end
-end
-
--- Helper function to untag NPCs when destroyed
-function _G.UntagNPCForDiagnostics(npcModel)
-	if npcModel and npcModel:IsA("Model") then
-		CollectionService:RemoveTag(npcModel, NPC_TAG)
-	end
-end
+-- NOTE: Tagging is handled by NPCSpawner via CollectionService:AddTag.
+-- _G.TagNPCForDiagnostics / _G.UntagNPCForDiagnostics were removed to
+-- prevent global namespace pollution and out-of-lifecycle tag mutations.
 
 RunService.Heartbeat:Connect(function(deltaTime)
 	lastCheck = lastCheck + deltaTime
