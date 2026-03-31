@@ -1,0 +1,27 @@
+name: Publish to Roblox
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rojo
+        uses: rojo-rbx/setup-rojo@v2
+        with:
+          version: 7.x.x
+
+      - name: Build Place
+        run: rojo build -o game.rbxl
+
+      - name: Upload to Roblox
+        run: |
+          curl --location --request POST "https://apis.roblox.com/universes/v1/${{ secrets.UNIVERSE_ID }}/places/${{ secrets.PLACE_ID }}/versions?versionType=Published" \
+          --header "x-api-key: ${{ secrets.ROBLOX_API_KEY }}" \
+          --header "Content-Type: application/octet-stream" \
+          --data-binary "@game.rbxl"
