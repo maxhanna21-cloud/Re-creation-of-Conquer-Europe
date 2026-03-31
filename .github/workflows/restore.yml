@@ -14,4 +14,4 @@ jobs:
           curl --location --request POST "https://apis.roblox.com/universes/v1/${{ secrets.UNIVERSE_ID }}/places/${{ secrets.PLACE_ID }}/versions?versionType=Published" \
           --header "x-api-key: ${{ secrets.ROBLOX_API_KEY }}" \
           --header "Content-Type: application/octet-stream" \
-          --data-binary "@restore.rbxl"
+          --data-binary "@17c3efda7b972ecd360cc0fa1c97c9c4"
