@@ -19,7 +19,7 @@ local NPC_TAG = "RegisteredNPC"
 -- =============================================
 -- Set to true to paint each NPC's body parts with their country's tile color.
 -- Set to false to leave NPCs as the default template appearance.
-local NPC_COUNTRY_COLORS = true
+local NPC_COUNTRY_COLORS = false
 
 local NPCSpawner = {}
 
