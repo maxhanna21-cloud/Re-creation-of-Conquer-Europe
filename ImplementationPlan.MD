@@ -1,939 +1,921 @@
-ZERO-AMBIGUITY IMPLEMENTATION ROADMAP
-Objective
-Eliminate state inconsistency, complete the TileId migration, harden lifecycle cleanup, and replace broad runtime scans with authoritative registries/tags.
-
-Non-Negotiable Global Rules
-Do not do partial fixes.
-
-If a system has two ownership paths, remove one.
-If a tile can be updated visually, logically, and via attribute, all three must be updated in the same code path.
-No hybrid authority after this refactor.
-
-TileId becomes the only authoritative tile identity for occupancy.
-Positional keys may remain as compatibility metadata, but never as the source of truth.
-Every per-NPC signal must have explicit cleanup.
-
-No implicit “Destroy will probably handle it.”
-Every connection created by NPCCombatSystem must be owned by a cleanup container.
-No broad Workspace NPC scans for runtime logic.
-
-Use CollectionService tags for dynamic NPC iteration.
-Use CountryNPCRegistry for country membership queries.
-Maintain behavior unless explicitly changing a bug.
-
-Preserve diplomacy, movement, and capture semantics except where the audit identified inconsistency.
-PHASE 1 — STATE CRITICALITY
-Goal
-Fix the stale OwnerCountry attribute bug and make tile ownership updates atomic.
-
-File Path
-src/shared/TileOwnershipManager.luau
-
-Current Logic
-Ownership state is split across:
-OccupiedTerritories[tilePart]
-tilePart.Color
-tilePart:GetAttribute("OwnerCountry")
-In some code paths, color and table state are updated, but OwnerCountry is not.
-Specifically dangerous paths:
-releaseCountryOccupiedTiles
-reclaimTile
-Other functions already partially rely on OwnerCountry as authoritative override:
-tileEffectivelyBelongsTo
-TileAdjacencyManager.getEffectiveOwner
-Target Logic
-Create a single no-yield ownership mutation path inside TileOwnershipManager.
-
-No-yield rule (mandatory, no exceptions)
-No task.wait, task.defer, remote fire, or any yielded call may occur between the visual update (tilePart.Color), the OwnerCountry update (SetAttribute), and the occupied-record update (OccupiedTerritories write).
-All three writes must happen together, in the same synchronous code path, before any event is fired.
-This is what "atomic" means in Luau — there are no real transactions, so the only guarantee is a single code path with no yields between writes.
-
-Add low-level internal helpers
-These helpers isolate individual state dimensions. They are NOT the entry points for public mutations — they are building blocks only:
-
-applyTileVisualOwner(tilePart, ownerCountryName)
-
-Purpose: set tile color to the controlling country's color.
-Must:
-resolve the correct color from CountryColors
-fail loudly with warn if missing color
-set tilePart.Color
-applyTileOriginalVisual(tilePart, originalColor)
-
-Purpose: restore original visual state.
-Must:
-set tilePart.Color = originalColor
-setTileLogicalOwner(tilePart, ownerCountryNameOrNil)
-
-Purpose: set or clear OwnerCountry
-Must:
-if ownerCountryNameOrNil is a non-empty string, call tilePart:SetAttribute("OwnerCountry", ownerCountryNameOrNil)
-otherwise call tilePart:SetAttribute("OwnerCountry", nil)
-setOccupiedRecord(tilePart, occupyingCountry, originalCountry, originalColor)
-
-Purpose: write OccupiedTerritories[tilePart]
-clearOccupiedRecord(tilePart)
-
-Purpose: delete OccupiedTerritories[tilePart]
-Add high-level state applicators (the only valid public mutation entry points)
-Every public function in TileOwnershipManager that changes tile state MUST end by calling exactly one of these three state applicators. No public function may write visual, logical, or occupied state directly — all writes must go through one of these:
-
-applyOccupiedState(tilePart, occupyingCountry, originalCountry, originalColor)
-
-Applies all three writes together:
-applyTileVisualOwner(tilePart, occupyingCountry)
-setTileLogicalOwner(tilePart, occupyingCountry)
-setOccupiedRecord(tilePart, occupyingCountry, originalCountry, originalColor)
-No yield between any of these calls.
-applyAnnexedState(tilePart, annexingCountry)
-
-Applies annexed state:
-applyTileVisualOwner(tilePart, annexingCountry) — color stays as occupying country color (already set)
-setTileLogicalOwner(tilePart, annexingCountry)
-clearOccupiedRecord(tilePart)
-No yield between any of these calls.
-applyOriginalState(tilePart, originalColor)
-
-Reverts to geographic/original ownership:
-applyTileOriginalVisual(tilePart, originalColor)
-setTileLogicalOwner(tilePart, nil)
-clearOccupiedRecord(tilePart)
-No yield between any of these calls.
-Rule: all public mutation paths in TileOwnershipManager must end by calling one of the three applicators above. No exceptions. No mixed direct writes alongside applicator calls.
-Define ownership state invariants
-After the refactor, the following must always be true:
-
-A. Occupied but not annexed
-If a tile is actively occupied:
-
-OccupiedTerritories[tilePart] ~= nil
-OwnerCountry == occupyingCountry
-tilePart.Color == CountryColors[occupyingCountry]
-B. Annexed
-If a tile has been annexed:
-
-OccupiedTerritories[tilePart] == nil
-OwnerCountry == annexingCountry
-tilePart.Color == CountryColors[annexingCountry]
-C. Reverted to geographic/original owner
-If a tile is no longer occupied and no longer annexed:
-
-OccupiedTerritories[tilePart] == nil
-OwnerCountry == nil
-tilePart.Color == originalColor
-D. Reclaimed by original/geographic owner
-If a country reclaims its own original tile:
-
-OccupiedTerritories[tilePart] == nil
-OwnerCountry == nil
-tilePart.Color == originalColor
-Do not leave OwnerCountry set during reclaim-to-original-owner state.
-
-Required Function-by-Function Changes
-1. captureTile(tilePart, player)
-Current Logic
-Sets OwnerCountry
-Sets color
-Writes occupation record
-Has reclaim handling for geographicCountry == playerCountry
-Target Logic
-Preserve current overall behavior.
-Ensure both normal capture and reclaim branch use the atomic helpers.
-In reclaim branch:
-clear occupied record
-clear OwnerCountry if the tile is returning to its geographic owner
-restore original color
-Do not mix direct writes with helper-driven writes.
-Acceptance Criteria
-After capture of enemy tile:
-OccupiedTerritories[tile] exists
-OwnerCountry == attackerCountry
-tile color matches attacker country
-After reclaiming original homeland tile:
-OccupiedTerritories[tile] == nil
-OwnerCountry == nil
-tile color restored to original
-2. releaseTile(tilePart)
-Current Logic
-Restores color
-clears OwnerCountry
-removes occupied tracking
-Target Logic
-Route through atomic helpers only.
-Preserve current semantics.
-Acceptance Criteria
-Releasing an occupied tile returns it to:
-original color
-no occupied record
-no OwnerCountry
-3. reclaimTile(tilePart, player)
-Current Logic
-Restores color
-removes occupied tracking
-does not clear or reset OwnerCountry
-Target Logic
-Explicitly return the tile to original-geographic ownership state:
-restore original color
-clear occupied record
-clear OwnerCountry
-Do not set OwnerCountry = playerCountry here; reclaimed original land should rely on geography again.
-Acceptance Criteria
-Reclaiming a tile always ends with:
-OccupiedTerritories[tile] == nil
-OwnerCountry == nil
-original color restored
-4. releaseCountryOccupiedTiles(countryName)
-Current Logic
-Collects occupied tiles
-restores color
-removes occupied record
-does not clear OwnerCountry
-Target Logic
-For every released tile:
-
-restore original color
-clear OwnerCountry
-clear occupied record
-fire TileCapturedEvent after state is fully applied
-Do not mutate visual state and logical state in separate phases.
-
-Acceptance Criteria
-Peace treaty release leaves no tile with:
-OccupiedTerritories[tile] == nil and OwnerCountry still set
-Spot-check released tiles from multiple countries:
-visuals and ownership queries agree
-5. annexOccupiedTiles(countryName)
-Current Logic
-sets OwnerCountry
-keeps current color
-removes occupied record
-Target Logic
-Preserve annex semantics.
-Route through helper functions.
-Annexed tile must become:
-no occupied record
-OwnerCountry == countryName
-color remains occupying country's color
-Acceptance Criteria
-Annexed tiles are logically controlled by annexer even though they remain in original map model hierarchy.
-TileAdjacencyManager.getEffectiveOwner(tile) returns annexer.
-6. performCountryTakeover(losingCountryName, winningPlayer, losingPlayer)
-Current Logic
-mixes direct color writes, attribute writes, occupied record updates
-Target Logic
-Refactor all tile state changes in this function to use the same atomic helper pattern.
-For each tile transfer case:
-decide final ownership state first
-then apply visual + attribute + occupied record together
-Acceptance Criteria
-After conquest:
-no transferred tile has mismatched visual owner vs OwnerCountry
-no tile is left with winner color and stale loser OwnerCountry
-no released/third-party tile is silently overwritten
-File Path
-src/shared/TileAdjacencyManager.luau
-
-Current Logic
-getEffectiveOwner(tilePart) checks OwnerCountry first, then geographic owner.
-This is correct only if OwnerCountry is always clean.
-Target Logic
-No structural change required.
-Keep logic as-is.
-Rely on Phase 1 fixes to guarantee correctness.
-Acceptance Criteria
-After all Phase 1 changes, getEffectiveOwner(tile) must always match the actual controlling country in all tested states:
-untouched
-occupied
-reclaimed
-annexed
-conquered-transfer
-Phase 1 Validation Suite
-Run these manual or scripted scenarios:
-
-Capture enemy tile
-
-confirm color, OwnerCountry, occupied record all match attacker
-Peace release
-
-confirm color reverted
-OwnerCountry == nil
-occupied record removed
-Reclaim homeland
-
-confirm color reverted
-OwnerCountry == nil
-occupied record removed
-Annex occupied tile
-
-confirm color stays annexer color
-OwnerCountry == annexer
-occupied record removed
-Country takeover
-
-sample capital tile, regular core tile, previously occupied tile, third-party occupied tile
-PHASE 2 — TOTAL MIGRATION
-Goal
-Make TileId the 100% source of truth for occupancy. Remove threshold-based hybrid behavior.
-
-File Path
-src/shared/TileManager.luau
-
-Current Logic
-Occupancy uses:
-GlobalOccupiedTiles[tileKey]
-GlobalOccupiedTilesById[tileId]
-shouldUseTileIdOccupancy() conditionally enables TileId authority only if ambiguous positional buckets > 10.
-This preserves positional-key authority in low-ambiguity maps.
-Target Logic
-Remove hybrid authority entirely.
-
-Delete or neutralize this behavior
-Remove the UseTileIdOccupancy threshold logic as a decision mechanism.
-shouldUseTileIdOccupancy() should either:
-be deleted entirely, or
-always return true
-Preferred: delete the function and simplify all callers.
-
-New authoritative occupancy model
-Use:
-
-GlobalOccupiedTilesById[tileId] as the sole global occupancy authority
-country-local occupancy should also be keyed by TileId, not positional key
-Required structural migration
-Change these tables:
-
-OccupiedTiles
-
-from: { [countryName] = { [tileKey] = npcModel } }
-to: { [countryName] = { [tileId] = npcModel } }
-GlobalOccupiedTiles
-
-positional-key global table should be removed from authority
-either:
-delete it completely, or
-keep only as optional debug mirror, never read by logic
-Preferred: remove logical reads from it everywhere.
-
-Global authority:
-only GlobalOccupiedTilesById[tileId]
-Required Function-by-Function Changes
-1. getTileIdFromKey(tileKey)
-Current Logic
-tries to resolve TileId from legacy key
-Target Logic
-Keep only for compatibility adapters if needed.
-Do not use this as the normal occupancy path.
-New code should already have TileId before calling occupancy functions.
-Acceptance Criteria
-No core occupancy function depends on converting a positional key at runtime unless explicitly in a compatibility shim.
-No-re-resolution rule (mandatory for all functions in this section)
-If a function already has a validated tilePart, it MUST:
-use that tilePart directly
-get tileId from TileAdjacencyManager.getTileId(tilePart)
-never call getTileFromKey(...) or any positional-key lookup on a tilePart it already has
-Only fall back to key-based resolution when the function genuinely receives only a legacy tileKey and has no tilePart.
-This applies to: occupyTile, releaseTile, occupyTileGlobal, releaseTileGlobal, getSpawnPosition, getAvailableTileCount, and all callers in NPCMovementSystem, NPCTargetingHandler, and NPCSpawner.
-
-2. occupyTile(countryName, tileKey, npcModel)
-Current Logic
-writes country occupancy by tileKey
-writes global occupancy by tileKey
-optionally mirrors to TileId table
-Target Logic
-Change signature behavior internally:
-
-resolve tileId once from the destination tilePart, not from the NPC's CurrentTileId attribute
-store only by tileId
-if keeping positional keys at all, treat them as legacy convenience only
-Implementation requirement:
-
-NEVER derive tileId from npcModel:GetAttribute("CurrentTileId") — that attribute tracks the NPC's current/origin tile and may be stale, nil, or still pointing at the previous tile during spawn, movement, or arrival.
-Always resolve the destination tileId from the destination tilePart:
-resolve tilePart from tileKey via TileAdjacencyManager.getTileFromKey(tileKey) (or equivalent)
-then call TileAdjacencyManager.getTileId(tilePart) to get the authoritative id
-Where practical, prefer callers to pass tilePart directly so no key-to-part roundtrip is needed at all.
-Then:
-
-OccupiedTiles[countryName][tileId] = npcModel
-GlobalOccupiedTilesById[tileId] = npcModel
-Do not make global logic depend on tileKey.
-
-Preferred API direction
-Where callers already have a tilePart, prefer new overloads:
-occupyResolvedTile(countryName, tilePart, npcModel) — accepts tilePart, derives tileId internally
-releaseResolvedTile(countryName, tilePart) — same
-occupyTileById / releaseTileById — for lowest-level calls that already have a tileId
-Legacy tileKey signatures may remain as compatibility shims that delegate to the above.
-
-Acceptance Criteria
-Occupying a tile always registers exactly one authoritative TileId entry.
-TileId is always resolved from the destination tilePart, never from npcModel attributes.
-3. releaseTile(countryName, tileKey)
-Current Logic
-clears by tileKey
-optionally clears TileId entry
-Target Logic
-resolve tilePart from tileKey, then TileId from tilePart
-clear by TileId only for logic
-country-local occupancy must also clear by TileId
-If tilePart is already available at the call site, pass it directly instead of re-resolving from key.
-Acceptance Criteria
-Releasing a tile removes only the authoritative TileId entry.
-No stale occupancy remains if positional key differs or is ambiguous.
-4. occupyTileGlobal(tileKey, npcModel)
-Current Logic
-writes to positional-key map
-optionally mirrors TileId
-Target Logic
-Refactor to:
-
-resolve tilePart from tileKey, then tileId from tilePart
-write only to GlobalOccupiedTilesById
-update country-local OccupiedTiles[country][tileId]
-If needed, rename to occupyTileGlobalByResolvedTile(tileId, npcModel) or equivalent internal form that accepts a pre-resolved tileId.
-
-Acceptance Criteria
-Global occupancy writes are TileId-based only.
-5. releaseTileGlobal(tileKey)
-Current Logic
-clears positional-key map
-optionally clears TileId
-Target Logic
-resolve tilePart from tileKey, then tileId from tilePart (or accept tileId directly if callers already have it)
-clear by TileId only
-country-local table also cleared by TileId
-Acceptance Criteria
-No logical occupancy read path depends on positional key.
-6. isTileOccupied(tileKey)
-7. getTileOccupant(tileKey)
-8. isTileOccupiedByPlayer(tileKey, player)
-Current Logic
-hybrid lookup, may read positional key table
-Target Logic
-resolve TileId first
-query only GlobalOccupiedTilesById[tileId]
-If input is still a legacy positional key:
-
-resolve tile part via TileAdjacencyManager.getTileFromKey / fallback
-get TileId
-then query by TileId
-Acceptance Criteria
-Reads are TileId-authoritative regardless of input format.
-9. occupyTileById, releaseTileById, getTileOccupantById, isTileOccupiedById
-Current Logic
-already aligned with target direction
-Target Logic
-These become the preferred low-level APIs.
-Make higher-level functions delegate to them.
-Acceptance Criteria
-All other occupancy logic routes through these or equivalent TileId-based functions.
-10. getSpawnPosition(player)
-Current Logic
-reads OccupiedTiles[countryName][key] by tileKey (line 247) to skip home tiles with standing NPCs
-reads GlobalOccupiedTiles[key] by tileKey (line 258) to skip conquered tiles with standing NPCs
-Target Logic
-After GlobalOccupiedTiles is no longer authoritative:
-
-resolve TileId for each candidate tile (home and conquered)
-check isTileOccupiedById(tileId) instead of reading GlobalOccupiedTiles[key]
-for home tiles: replace occupied[key] check with TileManager.isTileOccupiedById(tileId)
-for conquered tiles: replace GlobalOccupiedTiles[key] check with TileManager.isTileOccupiedById(tileId)
-All TileId resolution must occur via TileAdjacencyManager.getTileId(tilePart).
-
-Acceptance Criteria
-spawn selection never returns a tile that is already occupied under the TileId authority model
-no read of GlobalOccupiedTiles or OccupiedTiles[country][tileKey] remains in this function
-11. getAvailableTileCount(countryName)
-Current Logic
-reads OccupiedTiles[countryName][key] by tileKey to count unoccupied home tiles
-After OccupiedTiles[countryName] is migrated to { [tileId] = npcModel }, this lookup always misses every entry and returns an inflated available count.
-Target Logic
-For each tile position in ValidTiles[countryName]:
-
-resolve the tile part via TileAdjacencyManager.getTileFromKey or equivalent
-get its TileId via TileAdjacencyManager.getTileId(tilePart)
-check isTileOccupiedById(tileId) for the occupied test
-Acceptance Criteria
-getAvailableTileCount returns zero for a fully-occupied country under the TileId model
-no OccupiedTiles[country][tileKey] read remains in this function
-File Path
-src/shared/TileKeyUtils.luau
-
-Current Logic
-positional rounded keys still widely used
-Target Logic
-Do not remove this module entirely yet.
-Reclassify it as:
-compatibility utility
-spawn-selection helper
-legacy fallback parser
-It must not remain the primary identity system.
-
-Acceptance Criteria
-no global occupancy authority uses rounded positional keys as the primary index
-File Path
-src/shared/NPCMovementSystem.luau
-
-Current Logic
-still passes/reads targetTileKey
-occupancy checks often call TileManager.getTileOccupant(targetTileKey)
-Target Logic
-Do not remove tileKey from movement routing yet, but normalize all occupancy checks through TileId.
-
-Required updates
-Where movement checks occupancy:
-
-resolve targetTilePart
-resolve targetTileId
-use TileId-backed occupancy calls
-Where movement arrives:
-
-when setting occupancy and state, ensure:
-CurrentTileId is updated first or in same block
-occupancy registration uses TileId authority
-Acceptance Criteria
-ambiguous positional hashes cannot cause wrong occupant lookup during movement or arrival
-File Path
-src/server/NPCTargetingHandler.server.luau
-
-Current Logic
-tile click flow gets tile key from part and asks TileManager for occupant
-Target Logic
-preserve interaction flow
-ensure tile occupant checks route through TileId-backed resolution
-when tilePart is already available (it is — the click handler receives a tilePart), resolve tileId directly from it; do not go through tileKey first
-Acceptance Criteria
-clicking a tile with an NPC on it always resolves the correct occupant even in ambiguous positional buckets
-File Path
-src/server/NPCSpawner.luau
-
-Current Logic
-calls TileManager.occupyTile(countryName, tileKey, npcClone) on spawn
-Target Logic
-After TileManager's occupancy APIs are migrated, this caller must be verified and updated.
-If occupyResolvedTile(countryName, tilePart, npcModel) exists at this point: prefer it.
-If only the tileKey overload remains: ensure it still derives the correct destination TileId internally.
-Do not let this caller create legacy-only occupancy entries (i.e., entries only in GlobalOccupiedTiles with no GlobalOccupiedTilesById entry).
-Acceptance Criteria
-Spawning an NPC writes occupancy under the correct destination TileId.
-Spawned NPCs never create only legacy key occupancy entries — the TileId entry must always be present.
-GlobalOccupiedTiles prohibition (mandatory, testable)
-After Phase 2 migration, GlobalOccupiedTiles MUST NOT be read by any gameplay logic anywhere in the codebase.
-If it is kept temporarily (e.g. as a debug mirror), it must not influence:
-movement decisions
-tile selection or occupant lookup
-spawn placement
-attack or diplomacy validation
-occupancy release or reclaim
-Add a prominent comment above the table declaration marking it as "DEBUG ONLY — not read by gameplay logic."
-If any function still reads GlobalOccupiedTiles after migration, that is a regression, not a "safety fallback."
-
-Phase 2 Validation Suite
-Identify a known ambiguous or potentially ambiguous tile region
-
-Spawn/move NPCs across it
-
-Confirm:
-
-selection works
-movement blocking works
-occupancy release/reclaim works
-no wrong NPC is reported as tile occupant
-Log or inspect:
-
-GlobalOccupiedTilesById contains authoritative entries
-grep/search confirms zero gameplay reads of GlobalOccupiedTiles remain
-PHASE 3 — LIFECYCLE & SIGNAL HYGIENE
-Goal
-Introduce explicit cleanup ownership for NPCCombatSystem using a Maid/Janitor pattern.
-
-File Path
-src/shared/NPCCombatSystem.luau
-
-Current Logic
-Per-NPC lifecycle connections are created in:
-registerNPC
-setupDeathCleanup
-Connections are not centrally owned.
-unregisterNPC clears tables but does not explicitly disconnect per-NPC lifecycle signals.
-Target Logic
-Add a lightweight internal Maid/Janitor implementation inside this module.
-
-Required Internal Structure
-Add internal Maid implementation
-Implement a local utility:
-
-newMaid()
-returns a table with:
-tasks = {}
-Give(task)
-DoCleaning()
-Give(task) must accept:
-
-RBXScriptConnection
-function cleanup callbacks
-Instance cleanup if needed
-DoCleaning() must:
-
-disconnect all connections
-call all cleanup functions
-destroy cleanup-owned temporary instances if any
-clear table references
-Add authoritative per-NPC state bag
-Create:
-
-npcRuntime[npcModel] = { maid = ..., ... }
-This state bag should own all per-NPC signals created by combat registration.
-
-At minimum store:
-
-maid
-any future loop-specific cleanup references if applicable
-Required Function-by-Function Changes
-1. setupDeathCleanup(npcModel)
-Current Logic
-attaches humanoid.Died:Once(...)
-no owned cleanup handle
-Target Logic
-remove hidden ownership
-either:
-inline this into registerNPC, or
-pass in the NPC’s maid and register the Died connection through it
-If using :Once(), still store the returned connection in the maid.
-
-Acceptance Criteria
-death cleanup connection is explicitly owned by the NPC maid
-2. registerNPC(npcModel, ownerPlayer, role)
-Current Logic
-writes owner/role tables
-attaches Destroying
-calls setupDeathCleanup
-starts combat loop
-Target Logic
-registerNPC must be idempotent. If called on an already-registered NPC:
-the old maid must be fully cleaned (DoCleaning called) before the new maid is created
-the old npcRuntime entry must be replaced, not accumulated
-no duplicate Destroying or Died callbacks may survive after re-registration
-behavior must be deterministic regardless of how many times registerNPC is called
-This matters because the codebase has: ownership transfers (transferOwnership), Auto-Fix re-registration (periodic re-sync), and possible repeated registration flows.
-
-Order of operations must be:
-
-If existing runtime state exists for npcModel: call existing maid:DoCleaning(), nil the entry.
-Create fresh maid.
-Create fresh runtime bag: npcRuntime[npcModel] = { maid = maid }.
-Register Destroying connection through maid.
-Register Humanoid.Died connection through maid (replaces setupDeathCleanup's hidden ownership).
-Update owner/role tables.
-Start combat loop as before.
-Acceptance Criteria
-Re-registering the same NPC does not accumulate duplicate Destroying or Died callbacks.
-Calling registerNPC three times in a row on the same NPC leaves exactly one live set of lifecycle signals.
-3. unregisterNPC(npcModel)
-Current Logic
-clears combat tables
-does not explicitly disconnect per-NPC signals
-Target Logic
-The cleanup order is mandatory. Deviating from this order is a bug:
-
-Step 1: fetch npcRuntime[npcModel]
-Step 2: if present, call runtime.maid:DoCleaning() — this disconnects all signals while combat tables still have context
-Step 3: set npcRuntime[npcModel] = nil
-Step 4: clear all combat state tables (manualTargets, npcOwners, npcRoles, npcCooldown, defenderAttackers, attackerThreats, pathTimestamps, combatLoops, npcInCombat)
-Why order matters: if step 4 runs before step 2, any cleanup callbacks inside the maid run with already-nilled combat tables and may silently fail or produce partial behavior.
-
-Acceptance Criteria
-After unregister:
-no owned connections remain alive for that NPC
-all combat metadata tables are nilled
-repeated unregister calls are safe (idempotent — second call finds nil runtime and skips DoCleaning without error)
-4. transferOwnership(npcModel, newOwner)
-Current Logic
-clears manual targets/threat links
-updates owner
-does not reset movement system
-does not coordinate lifecycle with movement
-Target Logic
-Add explicit integration with NPCMovementSystem.
-
-Required behavior:
-
-after ownership change:
-clear combat intent as today
-call NPCMovementSystem.OnOwnerChanged(npcModel)
-This requires lazy-loading NPCMovementSystem exactly like other circular-sensitive modules.
-
-Acceptance Criteria
-an NPC that changes owner cannot retain:
-active movement monitor
-stale reservation
-retreat state
-stale IsMoving
-File Path
-src/shared/NPCMovementSystem.luau
-
-Current Logic
-exposes OnOwnerChanged
-not clearly invoked by ownership transfer paths
-Target Logic
-No major internal redesign needed in this phase. Ensure this function becomes part of the ownership-transfer contract.
-
-Also fix one correctness issue found in audit:
-
-Fix dead branch in monitorMovement
-corridorOrigin is referenced at the "Apply path correction" block but is never declared as a local variable or parameter anywhere in monitorMovement's scope.
-In Luau, referencing an undefined upvalue resolves to nil, so the if corridorOrigin then block is permanently dead code and getPathCorrectedPosition is never called.
-Required fix: remove the dead branch entirely (the two lines: if corridorOrigin then / effectiveTarget = getPathCorrectedPosition... / end).
-Do NOT attempt to "correctly define corridorOrigin from movement state" — the movement state has no such concept; the branch was never wired up and has no known caller context. Silently deleting it is the correct, safe fix.
-Do not leave unreachable correction logic.
-
-Acceptance Criteria
-ownership transfer always resets movement state
-no undefined local references remain in path correction logic
-File Path
-src/server/Auto-Fix.server.luau
-
-Current Logic
-may call Combat.transferOwnership
-Target Logic
-No direct structural change required if Combat.transferOwnership is fixed. But verify all reassignment paths use that function rather than bypassing it.
-
-Acceptance Criteria
-Auto-fix ownership correction also resets movement state indirectly via combat transfer
-File Path
-src/server/CountryManager.server.luau
-
-Current Logic
-transfers NPCs when country is released/claimed
-uses combat ownership transfer
-Target Logic
-Same as above:
-
-ensure all ownership changes flow through the corrected Combat.transferOwnership
-Acceptance Criteria
-country release / reclaim / inheritance cannot leave NPCs moving under old owner state
-Phase 3 Validation Suite
-Spawn NPC
-
-Register -> unregister -> register again
-
-confirm no duplicate Died/Destroying behavior
-Move NPC, then transfer ownership mid-move
-
-confirm:
-movement stops/reset
-reservation released
-IsMoving cleared
-NPC can receive fresh orders
-Transfer to nil/country-owned
-
-confirm idle state and no residual movement/combat ownership leaks
-PHASE 4 — OPTIMIZATION & ITERATION AUTHORITY
-Goal
-Replace runtime Workspace:GetChildren() NPC scans with tag-based iteration or CountryNPCRegistry.
-
-File Path
-src/server/NPCTargetingHandler.server.luau
-
-Current Logic
-initializes NPC connections via workspace:GetChildren()
-tracks new NPCs via workspace.ChildAdded
-cleanup via workspace.ChildRemoved
-assumes NPCs are direct children of Workspace
-Target Logic
-Use CollectionService and the RegisteredNPC tag as the sole runtime NPC discovery path.
-
-Required Changes
-Replace initialization
-Current:
-
-loop through workspace:GetChildren()
-Target:
-
-CollectionService:GetTagged("RegisteredNPC")
-call connectNPC for each
-Replace dynamic add/remove listeners
-Current:
-
-workspace.ChildAdded
-workspace.ChildRemoved
-Target:
-
-CollectionService:GetInstanceAddedSignal("RegisteredNPC")
-CollectionService:GetInstanceRemovedSignal("RegisteredNPC")
-Preserve cleanup
-disconnectNPC(npcModel) remains valid
-selectedNPC cleanup on removal remains necessary
-Acceptance Criteria
-NPC interaction registration works even if NPCs are moved into folders/models later
-no dependency on direct workspace child status remains
-File Path
-src/server/CountryManager.server.luau
-
-Current Logic
-getCountryNPCs(countryName) scans Workspace:GetChildren()
-Target Logic
-Delete getCountryNPCs(countryName) entirely. Do not:
-refactor it to use the registry but leave the function around
-comment it out
-leave it as a "fallback" or "backup" path
-The function must not exist in the file after this change. Having it present at all — even dead — creates a second authority path that future code may accidentally invoke.
-
-Inline its single use: refactor transferCountryNPCs(countryName, newOwner) to call CountryNPCRegistry.getNPCs(countryName) directly, without going through getCountryNPCs.
-
-Acceptance Criteria
-getCountryNPCs does not exist anywhere in CountryManager after this change
-country NPC transfer count matches registry count
-no workspace child scan remains for country army lookup
-File Path
-src/server/Diagnostics.server.luau
-
-Current Logic
-uses tags first
-falls back to workspace:GetChildren() if no tagged NPCs
-Target Logic
-Remove fallback workspace scan. This fallback masks tagging failures and creates dual authority.
-
-Replace with:
-
-if no tagged NPCs, log that zero tagged NPCs exist
-do not scan workspace as a backup
-Acceptance Criteria
-diagnostics only trusts tagged NPCs
-missing tags surface as a real issue instead of being silently bypassed
-File Path
-src/server/Auto-Fix.server.luau
-
-Current Logic
-already uses CollectionService:GetTagged("RegisteredNPC")
-Target Logic
-No structural change needed. Keep as tag-driven.
-
-Acceptance Criteria
-remains tag-authoritative
-File Path
-src/server/NPCSpawner.luau
-
-Current Logic
-adds RegisteredNPC tag
-registers into CountryNPCRegistry
-Target Logic
-No major structural change needed. This becomes the canonical source for:
-
-tag presence
-country registry membership
-Verify cleanup path symmetry:
-
-spawn:
-add tag
-register country
-cleanup:
-remove tag
-unregister country
-Acceptance Criteria
-every spawned NPC is tagged and registered exactly once
-every cleaned-up NPC is untagged and unregistered exactly once
-File Path
-src/server/CountryNPCRegistry.luau
-
-Current Logic
-register/unregister/getNPCs/hasNPCs
-leaves empty country subtables
-Target Logic
-Tighten unregister:
-
-after removing npcModel, if country table is empty, set it to nil
-Optional but recommended:
-
-ensure getNPCs(countryName) only returns live NPCs with Parent ~= nil
-Acceptance Criteria
-empty country registry buckets do not linger forever
-callers get cleaner results
-CROSS-PHASE CLEANUP TASKS
-File Path
-src/server/DiplomacyServer.server.luau
-
-Current Logic
-pending requests stored indefinitely
-Target Logic
-Add request expiry and cleanup. Not core to the 4 mandated phases, but should be done immediately after them.
-
-Required:
-
-timestamp pending requests
-cleanup on:
-sender leave
-receiver leave
-timeout expiry
-Acceptance Criteria
-no indefinite growth of PendingDiplomacyRequests
-File Path
-src/shared/ServerState.luau
-
-Current Logic
-still contains OccupiedTerritories data structure
-no longer clearly authoritative relative to TileOwnershipManager
-Target Logic
-Deprecate or remove ServerState.OccupiedTerritories if unused by authoritative logic. Do not maintain duplicate occupation truth.
-
-Acceptance Criteria
-only one authoritative occupied-territory model exists
-EXECUTION ORDER FOR SONNET 4.6
-Pass 1 — Atomic ownership correctness
-Files:
-
-src/shared/TileOwnershipManager.luau
-validate against src/shared/TileAdjacencyManager.luau
-Pass 2 — TileId authority migration
-Files:
-
-src/shared/TileManager.luau
-src/shared/NPCMovementSystem.luau
-src/server/NPCTargetingHandler.server.luau
-src/server/NPCSpawner.luau (verify occupancy caller is updated)
-keep src/shared/TileKeyUtils.luau as compatibility-only
-Pass 3 — Lifecycle cleanup
-Files:
-
-src/shared/NPCCombatSystem.luau
-src/shared/NPCMovementSystem.luau
-verify integration points in:
-src/server/Auto-Fix.server.luau
-src/server/CountryManager.server.luau
-Pass 4 — Runtime iteration optimization
-Files:
-
-src/server/NPCTargetingHandler.server.luau
-src/server/CountryManager.server.luau
-src/server/Diagnostics.server.luau
-src/server/CountryNPCRegistry.luau
-FINAL ACCEPTANCE CHECKLIST
-Ownership correctness
-No tile can exist in a state where:
-color says A
-OwnerCountry says B
-occupied record says nil or C
-Tile identity correctness
-All occupancy reads and writes are TileId-authoritative
-ambiguous positional keys cannot change gameplay outcome
-Lifecycle correctness
-Per-NPC combat signals are explicitly owned and cleaned
-ownership transfer resets movement state every time
-Runtime iteration correctness
-No gameplay-critical NPC iteration relies on Workspace:GetChildren()
-dynamic NPC discovery is tag-driven
-country membership queries use CountryNPCRegistry
-WHAT SONNET 4.6 SHOULD NOT DO
-Do not leave temporary hybrid reads “for safety.”
-Do not patch only one release/reclaim function and leave the others mixed.
-Do not keep positional-key occupancy as a hidden fallback in gameplay logic.
-Do not add Maid infrastructure without actually routing all combat lifecycle signals through it.
-Do not keep workspace NPC scan fallback in diagnostics or targeting.
-Do not leave getCountryNPCs in CountryManager — delete it entirely, do not just redirect it.
-Do not derive destination TileId from npcModel:GetAttribute(“CurrentTileId”) — always resolve from the destination tilePart.
-Do not re-resolve tilePart from tileKey when tilePart is already available — use it directly.
-Do not read GlobalOccupiedTiles in any gameplay logic path after Phase 2 — not as a “safety net,” not as a “fallback.”
-Do not clear combat state tables before calling maid:DoCleaning() in unregisterNPC — DoCleaning must run first.
-Do not call registerNPC on an already-registered NPC without cleaning up the old maid first — re-registration must be fully idempotent.
-Do not add a task.wait, task.defer, or remote fire between any of the three tile state writes (Color, OwnerCountry attribute, OccupiedTerritories) — all three must be written in the same synchronous block.
+# Conquer Europe — Low-End Device Optimization Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Reduce CPU, memory, and network overhead so the game runs smoothly on older/lower-end devices (mobile, low-spec PCs, older consoles).
+
+**Architecture:** Six independent optimization passes targeting the highest-impact bottlenecks: laser beam Part allocation (GC pressure), per-NPC Heartbeat connection sprawl (CPU), per-NPC combat thread sprawl (scheduler), per-tile remote event spam (network), client-side cache eviction spikes (frame drops), and an adaptive NPC LOD system that scales processing cost with NPC count.
+
+**Tech Stack:** Roblox Luau, RunService (Heartbeat/RenderStepped), CollectionService, Debris, TweenService, RemoteEvents/UnreliableRemoteEvents
+
+---
+
+## NON-NEGOTIABLE RULES (from CLAUDE.md — apply to every task)
+
+- NEVER use `wait()`, `spawn()`, or `delay()` — use `task.wait`, `task.spawn`, `task.defer`.
+- NEVER use `GetDescendants` in runtime loops — startup/init only.
+- ALWAYS defend against nil (StreamingEnabled).
+- Every per-NPC signal MUST have explicit cleanup (disconnect + nil table refs).
+- No `--!strict` unless user requests it.
+- Full scripts only — no snippets, no "rest unchanged."
+- Consistent tab indentation, proper `end` alignment.
+
+---
+
+## File Structure Overview
+
+| File | Changes | Responsibility |
+|------|---------|----------------|
+| `src/shared/NPCCombatSystem.luau` | Task 1 (beam pool), Task 3 (combat loop consolidation) | Combat VFX + combat tick scheduling |
+| `src/shared/NPCMovementSystem.luau` | Task 2 (Heartbeat consolidation) | NPC ground checks + movement monitoring |
+| `src/playerscripts/TileCursor.client.luau` | Task 5 (cache eviction) | Tile hover detection LRU cache |
+| `src/shared/TileOwnershipManager.luau` | Task 4 (batch events) | Tile capture/release remote events |
+| `src/playerscripts/TileVisualEffects.client.luau` | Task 4 (batch handler) | Client-side tile color transitions |
+| `src/shared/NPCLODManager.luau` (NEW) | Task 6 (NPC LOD) | Adaptive NPC processing throttle |
+
+---
+
+## Task 1: Laser Beam Part Pooling
+
+**Problem:** `createLaserBeam()` in NPCCombatSystem allocates a new `Part` instance every shot and relies on `Debris` to destroy it 0.1s later. With N NPCs firing at 1 shot/sec, the engine creates and destroys N Parts/sec — heavy GC pressure on low-end devices.
+
+**Solution:** Pre-allocate a pool of reusable beam Parts. On fire: grab from pool, position, make visible. On expiry: hide, return to pool. Zero runtime allocation after warmup.
+
+**Files:**
+- Modify: `src/shared/NPCCombatSystem.luau` (lines 209–221: `createLaserBeam`, lines 224–250: `fireMultiLaser`)
+
+### REJECTED ALTERNATIVES
+1. **Use Beams (Attachment-based):** Requires two Attachments parented to different Parts — more complex, same allocation issue if not pooled, and Beam rendering is heavier than a thin neon Part.
+2. **Use BillboardGui with ImageLabel:** Lower fidelity, doesn't orient correctly in 3D space for laser effects.
+3. **Reduce fire rate globally:** Degrades gameplay feel; pooling solves the root cause without changing mechanics.
+
+### SCALABILITY CHECK
+- Pool size scales with max concurrent beams: `MAX_POOL_SIZE = math.ceil(MAX_EXPECTED_NPCS * 1.2)` to handle multi-target split fire.
+- If pool is exhausted, oldest active beam is recycled (not allocated fresh).
+- Pool cleanup on game end: iterate and Destroy all pooled Parts.
+
+### FAILURE SIMULATION
+- Pool empty + 50 NPCs fire simultaneously → recycled beam appears to teleport (acceptable visual glitch, no allocation).
+- NPC destroyed mid-beam → beam returns to pool on its timer regardless of NPC state.
+- Server lag causes beam to persist longer than 0.1s → no harm, `task.delay` handles it.
+
+---
+
+- [ ] **Step 1: Add beam pool data structures at module top**
+
+Add after the existing `local debugParts = {}` block (around line 64):
+
+```lua
+-- Beam object pool — avoids per-shot Part allocation
+local BEAM_POOL_SIZE = 120 -- enough for ~100 NPCs firing simultaneously
+local beamPool = {}        -- available (hidden) beam Parts
+local activeBeams = {}     -- currently visible beam Parts (keyed by Part)
+
+local function createPooledBeamPart()
+	local beam = Instance.new("Part")
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CanQuery = false
+	beam.CanTouch = false
+	beam.CastShadow = false
+	beam.Material = Enum.Material.Neon
+	beam.Size = Vector3.new(0.2, 0.2, 1)
+	beam.Transparency = 1 -- hidden until needed
+	beam.Parent = workspace
+	return beam
+end
+
+local function initBeamPool()
+	for i = 1, BEAM_POOL_SIZE do
+		table.insert(beamPool, createPooledBeamPart())
+	end
+end
+```
+
+- [ ] **Step 2: Add acquire/release helpers**
+
+```lua
+local function acquireBeam()
+	local beam = table.remove(beamPool)
+	if not beam then
+		-- Pool exhausted: recycle oldest active beam
+		local oldest, oldestKey = nil, nil
+		for b, _ in pairs(activeBeams) do
+			oldest = b
+			oldestKey = b
+			break -- pick an arbitrary active beam to recycle (pairs order is not guaranteed)
+		end
+		if oldest then
+			oldest.Transparency = 1
+			activeBeams[oldestKey] = nil
+			beam = oldest
+		else
+			-- Absolute fallback: create one (should rarely happen)
+			beam = createPooledBeamPart()
+		end
+	end
+	return beam
+end
+
+local function releaseBeam(beam)
+	if not beam or not beam.Parent then return end
+	beam.Transparency = 1
+	activeBeams[beam] = nil
+	table.insert(beamPool, beam)
+end
+```
+
+- [ ] **Step 3: Replace `createLaserBeam` with pooled version**
+
+Replace the existing `createLaserBeam` function (lines 209–221):
+
+```lua
+local function createLaserBeam(originPos, targetPos, color)
+	local distance = (targetPos - originPos).Magnitude
+	local beam = acquireBeam()
+	beam.Color = color or Color3.fromRGB(255, 0, 0)
+	beam.Size = Vector3.new(0.2, 0.2, distance)
+	beam.CFrame = CFrame.lookAt(originPos, targetPos) * CFrame.new(0, 0, -distance / 2)
+	beam.Transparency = 0
+	activeBeams[beam] = true
+	task.delay(BEAM_LIFETIME, function()
+		releaseBeam(beam)
+	end)
+end
+```
+
+- [ ] **Step 4: Call `initBeamPool()` at module initialization**
+
+Add at the bottom of the module, before the `return Combat` line:
+
+```lua
+initBeamPool()
+```
+
+- [ ] **Step 5: Add pool cleanup to module (memory leak prevention)**
+
+Add a cleanup function that the NPC lifecycle can call if the combat system is torn down:
+
+```lua
+function Combat.destroyBeamPool()
+	for _, beam in ipairs(beamPool) do
+		beam:Destroy()
+	end
+	table.clear(beamPool)
+	for beam, _ in pairs(activeBeams) do
+		beam:Destroy()
+	end
+	table.clear(activeBeams)
+end
+```
+
+- [ ] **Step 6: Test in-game**
+
+1. Spawn 10+ NPCs in adjacent enemy tiles so combat triggers.
+2. Observe laser beams firing — they should look identical to before.
+3. Open Roblox Developer Console → check Instance count is stable (not climbing).
+4. Confirm beams appear and disappear correctly with 0.1s lifetime.
+
+- [ ] **Step 7: Remove old Debris import if unused elsewhere**
+
+Check if `Debris` is still used by other functions (e.g., `drawDebugLine`). If `drawDebugLine` is the only other user and `DEBUG` is false in production, consider pooling debug lines too or leaving Debris for debug-only use.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/shared/NPCCombatSystem.luau
+git commit -m "perf: pool laser beam Parts to eliminate per-shot allocation"
+```
+
+---
+
+## Task 2: Consolidate Per-NPC Heartbeat Connections
+
+**Problem:** NPCMovementSystem creates up to 3 separate `RunService.Heartbeat:Connect()` calls per NPC: ground check (line 1130), movement monitor, and follow-movement monitor. With 100 NPCs, that's 300 active RBXScriptConnections firing every frame — significant overhead on low-end devices.
+
+**Solution:** Replace per-NPC Heartbeat connections with a single global Heartbeat loop that iterates a registry of active NPCs. Each NPC gets processed once per tick through a unified update function.
+
+**Scope note:** This task consolidates the **ground check** Heartbeat connections (the most impactful — fires for ALL NPCs including idle ones). The movement monitor and follow-movement monitor connections are shorter-lived (only active during actual movement) and can be consolidated in a follow-up pass if needed. Ground checks are the priority because they run for every NPC at all times.
+
+**Files:**
+- Modify: `src/shared/NPCMovementSystem.luau` (lines 1125–1183: `startGroundCheck`, movement monitor connections, follow-movement connections)
+
+### REJECTED ALTERNATIVES
+1. **Reduce ground check frequency to 1s:** Doesn't fix the connection count problem; NPCs can fall off tiles in <1s.
+2. **Use task.spawn loops instead of Heartbeat:** Trades connection overhead for thread scheduling overhead — lateral move.
+3. **Only check ground for moving NPCs:** Idle NPCs can still drift or be pushed off tiles by physics; need checking.
+
+### SCALABILITY CHECK
+- Single Heartbeat connection = O(1) connection overhead regardless of NPC count.
+- Inner loop is O(N) but with early-exit per NPC (skip if accumulator hasn't elapsed).
+- Ground check remains at 0.1s interval per NPC; movement checks remain per-frame for moving NPCs only.
+
+### FAILURE SIMULATION
+- NPC destroyed during iteration → `if not npcModel or not npcModel.Parent then remove from registry, continue`.
+- NPC registered twice → registry uses npcModel as key (dict), not array — idempotent.
+- All NPCs removed → loop iterates empty table, negligible cost.
+
+---
+
+- [ ] **Step 1: Add global NPC movement registry at module top**
+
+Add near the top of NPCMovementSystem, after existing local declarations:
+
+```lua
+-- Global movement registry: single Heartbeat drives all NPCs
+-- registeredNPCs[npcModel] = { groundAccum = 0, isMoving = false, isFollowing = false }
+local registeredNPCs = {}
+local heartbeatConnection = nil
+```
+
+- [ ] **Step 2: Create unified Heartbeat tick function**
+
+```lua
+local function onMovementHeartbeat(dt)
+	for npcModel, reg in pairs(registeredNPCs) do
+		if not npcModel or not npcModel.Parent then
+			-- NPC was destroyed — clean up
+			registeredNPCs[npcModel] = nil
+			if groundCheckConnections[npcModel] then
+				groundCheckConnections[npcModel]:Disconnect()
+				groundCheckConnections[npcModel] = nil
+			end
+			continue
+		end
+
+		-- Ground check (throttled to GROUND_CHECK_INTERVAL)
+		reg.groundAccum = reg.groundAccum + dt
+		if reg.groundAccum >= GROUND_CHECK_INTERVAL then
+			reg.groundAccum = 0
+
+			if not isOnValidGround(npcModel) then
+				if DEBUG then
+					print("[NPCMovement:GroundCheck] Triggering teleport recovery for " .. npcModel.Name)
+				end
+				teleportToSafeTile(npcModel)
+			else
+				-- Snap idle drifters (same logic as existing startGroundCheck)
+				local state = NPCMovementSystem.getMovementState(npcModel)
+				if state == "Idle" then
+					local root = getRootPart(npcModel)
+					local tileKey = npcModel:GetAttribute("TileKey")
+					if root and tileKey then
+						local tilePart = TileAdjacencyManager.getTileFromKey(tileKey)
+						if tilePart then
+							local safePos = getTileSpawnPosition(tilePart)
+							if safePos then
+								local driftXZ = ((root.Position - safePos) * Vector3.new(1, 0, 1)).Magnitude
+								local stateData = movementStates[npcModel]
+								local timeSinceStop = os.clock() - (stateData and stateData.lastStopTime or 0)
+								local timeSinceNudge = os.clock() - (stateData and stateData.lastNudgeTime or 0)
+								if driftXZ > IDLE_DRIFT_THRESHOLD and timeSinceStop > 1.0 and timeSinceNudge > 4.0 then
+									if DEBUG then
+										print("[NPCMovement:GroundCheck] Idle NPC " .. npcModel.Name .. " is " .. string.format("%.1f", driftXZ) .. " studs from center, walking back")
+									end
+									root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+									local humanoid = getHumanoid(npcModel)
+									if humanoid then humanoid:MoveTo(safePos) end
+									if stateData then stateData.lastNudgeTime = os.clock() end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+```
+
+- [ ] **Step 3: Start/stop the single Heartbeat connection**
+
+```lua
+local function ensureHeartbeatRunning()
+	if not heartbeatConnection then
+		heartbeatConnection = RunService.Heartbeat:Connect(onMovementHeartbeat)
+	end
+end
+
+local function stopHeartbeatIfEmpty()
+	if heartbeatConnection and not next(registeredNPCs) then
+		heartbeatConnection:Disconnect()
+		heartbeatConnection = nil
+	end
+end
+```
+
+- [ ] **Step 4: Refactor `startGroundCheck` to register instead of connect**
+
+Replace the existing `startGroundCheck` function:
+
+```lua
+local function startGroundCheck(npcModel)
+	if registeredNPCs[npcModel] then return end -- already registered
+	registeredNPCs[npcModel] = { groundAccum = 0 }
+	ensureHeartbeatRunning()
+end
+```
+
+- [ ] **Step 5: Update NPC cleanup to unregister from global loop**
+
+Find all places where `groundCheckConnections[npcModel]` is disconnected and add:
+
+```lua
+registeredNPCs[npcModel] = nil
+stopHeartbeatIfEmpty()
+```
+
+- [ ] **Step 6: Test in-game**
+
+1. Spawn 20+ NPCs across multiple countries.
+2. Verify ground checks still work: push an NPC off a tile edge → it should teleport back.
+3. Verify idle drift correction: an idle NPC that drifts should walk back to center.
+4. Open Developer Console → confirm only 1 Heartbeat connection exists for movement (not N).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/shared/NPCMovementSystem.luau
+git commit -m "perf: consolidate per-NPC Heartbeat connections into single global loop"
+```
+
+---
+
+## Task 3: Consolidate Combat Loop Threads
+
+**Problem:** `startCombatLoop()` calls `task.spawn()` per NPC, creating a dedicated coroutine per active combatant. With 100 NPCs in combat, the Luau scheduler manages 100 yielding threads — each calling `task.wait(0.1)` 10 times/sec.
+
+**Solution:** Replace per-NPC `task.spawn` loops with a single global combat tick driven by a Heartbeat connection with a 0.1s accumulator. Process all combat NPCs in one pass.
+
+**Files:**
+- Modify: `src/shared/NPCCombatSystem.luau` (lines 292–377: `startCombatLoop`)
+
+### REJECTED ALTERNATIVES
+1. **Keep task.spawn but increase LOOP_WAIT:** Degrades combat responsiveness; doesn't fix thread count.
+2. **Use BindToRenderStep:** Combat is server-side; RenderStepped is client-only.
+3. **Batch NPCs into groups of 10:** Adds complexity without eliminating the core problem.
+
+### SCALABILITY CHECK
+- Single Heartbeat connection regardless of NPC count.
+- Inner loop processes only NPCs with `combatLoops[npc] ~= nil`.
+- Token-based generation tracking still works — stale entries are skipped and cleaned.
+
+### FAILURE SIMULATION
+- NPC destroyed during combat tick → `npcModel.Parent` check, skip and unregister.
+- NPC re-registered mid-tick → token mismatch on old entry, new entry processed next tick.
+- Zero combat NPCs → loop iterates empty table, negligible cost.
+
+---
+
+- [ ] **Step 1: Add global combat registry and tick infrastructure**
+
+Add after the existing internal tables block:
+
+```lua
+-- Global combat tick: single Heartbeat replaces per-NPC task.spawn loops
+-- combatRegistry[npcModel] = { token = {}, getAllTargets = fn, beamColor = Color3, lastShot = 0 }
+local combatRegistry = {}
+local combatTickConnection = nil
+local combatAccumulator = 0
+```
+
+- [ ] **Step 2: Create unified combat tick function**
+
+```lua
+local function onCombatTick(dt)
+	combatAccumulator = combatAccumulator + dt
+	if combatAccumulator < LOOP_WAIT then return end
+	combatAccumulator = 0
+
+	local now = os.clock()
+	for npcModel, reg in pairs(combatRegistry) do
+		-- Validity check
+		if not npcModel or not npcModel.Parent then
+			combatRegistry[npcModel] = nil
+			combatLoops[npcModel] = nil
+			continue
+		end
+
+		-- Token check (re-registration invalidates old entry)
+		if combatLoops[npcModel] ~= reg.token then
+			combatRegistry[npcModel] = nil
+			continue
+		end
+
+		local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then
+			-- Stop processing this NPC in the combat tick.
+			-- Do NOT call Combat.unregisterNPC here — the Maid's Humanoid.Died
+			-- connection (set up in registerNPC) handles full cleanup including
+			-- table clearing and connection disconnection. Calling unregister here
+			-- would race with the Maid and could double-clean.
+			combatRegistry[npcModel] = nil
+			combatLoops[npcModel] = nil
+			continue
+		end
+
+		local allTargets = reg.getAllTargets()
+		updateCombatHealthState(npcModel, #allTargets > 0)
+
+		if not hasActivePlayerOwner(npcModel) and #allTargets == 0 then
+			local root = getRootPart(npcModel)
+			if root then humanoid:MoveTo(root.Position) end
+			continue
+		end
+
+		if #allTargets > 0 then
+			local npcRoot = getRootPart(npcModel)
+			if npcRoot then
+				humanoid:MoveTo(npcRoot.Position)
+
+				local firstTarget = allTargets[1]
+				if firstTarget and firstTarget.Parent then
+					local targetRoot = getRootPart(firstTarget.Parent)
+					if targetRoot then
+						local targetPos = targetRoot.Position
+						local selfPos = npcRoot.Position
+						local lookAtCFrame = CFrame.lookAt(selfPos, Vector3.new(targetPos.X, selfPos.Y, targetPos.Z))
+						npcRoot.CFrame = CFrame.new(npcRoot.CFrame.Position) * (lookAtCFrame - lookAtCFrame.Position)
+					end
+				end
+
+				local lastShot = npcCooldown[npcModel] or 0
+				if now - lastShot >= SHOOT_INTERVAL then
+					fireMultiLaser(npcModel, allTargets, reg.beamColor)
+					npcCooldown[npcModel] = now
+				end
+			end
+		else
+			if DEBUG then
+				local targetKey = npcModel.Name .. "_Target"
+				if debugParts[targetKey] then
+					debugParts[targetKey]:Destroy()
+					debugParts[targetKey] = nil
+				end
+			end
+			local root = getRootPart(npcModel)
+			if root then humanoid:MoveTo(root.Position) end
+		end
+	end
+
+	-- Stop connection if no combat NPCs
+	if not next(combatRegistry) and combatTickConnection then
+		combatTickConnection:Disconnect()
+		combatTickConnection = nil
+	end
+end
+```
+
+- [ ] **Step 3: Refactor `startCombatLoop` to register instead of spawn**
+
+Replace the existing `startCombatLoop` function:
+
+```lua
+local function startCombatLoop(npcModel, getAllTargets, beamColor)
+	if not npcModel then return end
+	if combatLoops[npcModel] then return end
+
+	local token = {}
+	combatLoops[npcModel] = token
+
+	combatRegistry[npcModel] = {
+		token = token,
+		getAllTargets = getAllTargets,
+		beamColor = beamColor,
+	}
+
+	if not combatTickConnection then
+		combatAccumulator = 0
+		combatTickConnection = RunService.Heartbeat:Connect(onCombatTick)
+	end
+end
+```
+
+- [ ] **Step 4: Update `unregisterNPC` to clear combat registry entry**
+
+In the existing `unregisterNPC` function, add after the maid cleanup and before clearing combat tables:
+
+```lua
+combatRegistry[npcModel] = nil
+```
+
+- [ ] **Step 5: Test in-game**
+
+1. Declare war between two adjacent countries.
+2. Verify NPCs engage in combat — lasers fire, damage applies, NPCs face targets.
+3. Kill an NPC → verify it's cleaned from combat registry (no errors).
+4. Transfer ownership mid-combat → verify token invalidation works.
+5. Check Developer Console for thread count — should be dramatically lower.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/shared/NPCCombatSystem.luau
+git commit -m "perf: replace per-NPC combat threads with single global combat tick"
+```
+
+---
+
+## Task 4: Batch Tile Capture Remote Events
+
+**Problem:** `captureTile()` and `releaseTile()` each fire `TileCapturedEvent:FireAllClients()` individually per tile. During intense combat with many NPCs capturing tiles simultaneously, this generates a burst of remote events. `performCountryTakeover` already batches — but the per-tile combat capture path does not.
+
+**Solution:** Introduce a short accumulation window (0.1s) that collects tile capture events and fires them as a single batched array. Update the client handler to accept both single-tile and batched formats.
+
+**Files:**
+- Modify: `src/shared/TileOwnershipManager.luau` (lines 350–390: `captureTile` event firing, lines 406–414: `releaseTile` event firing)
+- Modify: `src/playerscripts/TileVisualEffects.client.luau` (client event handler)
+
+### REJECTED ALTERNATIVES
+1. **Use UnreliableRemoteEvent for tile captures:** Tile ownership is gameplay-critical state — dropped packets would leave clients with wrong tile colors permanently.
+2. **Debounce per-tile with longer window (1s):** Too much visual delay; players expect immediate feedback on capture.
+3. **Only batch during war, not single captures:** Adds branching complexity for marginal gain — 0.1s batch window is imperceptible.
+
+### SCALABILITY CHECK
+- Batch fires once per 0.1s regardless of how many tiles were captured in that window.
+- Worst case (country takeover): already batched by `performCountryTakeover`.
+- Average case (combat captures): 1–5 tiles per batch = 1 event instead of 1–5.
+
+### FAILURE SIMULATION
+- Zero captures in window → no event fired (timer exits cleanly).
+- Server shuts down during accumulation → pending captures lost, but tile state is already written server-side; clients reconnect to correct state.
+- Client receives batch with destroyed tileParts → handler skips nil entries.
+
+---
+
+- [ ] **Step 1: Add batch accumulator to TileOwnershipManager**
+
+Add near the top of the module, after existing local declarations:
+
+```lua
+-- Batch tile capture events to reduce network overhead
+local pendingCaptureEvents = {} -- { {tilePart, playerName, countryName}, ... }
+local batchTimerActive = false
+local BATCH_WINDOW = 0.1 -- seconds to accumulate before firing
+
+local function flushCaptureEvents()
+	if #pendingCaptureEvents == 0 then
+		batchTimerActive = false
+		return
+	end
+
+	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
+	if TileCapturedEvent then
+		TileCapturedEvent:FireAllClients(pendingCaptureEvents)
+	end
+
+	table.clear(pendingCaptureEvents)
+	batchTimerActive = false
+end
+
+local function queueCaptureEvent(tilePart, playerName, countryName)
+	table.insert(pendingCaptureEvents, { tilePart, playerName, countryName })
+	if not batchTimerActive then
+		batchTimerActive = true
+		task.delay(BATCH_WINDOW, flushCaptureEvents)
+	end
+end
+```
+
+- [ ] **Step 2: Replace ALL per-tile FireAllClients calls with queueCaptureEvent**
+
+There are **6 per-tile** `TileCapturedEvent:FireAllClients` call sites in `TileOwnershipManager.luau`. Replace each with `queueCaptureEvent`:
+
+| Line | Function | Current Call | Replacement |
+|------|----------|-------------|-------------|
+| 353 | `captureTile` (reclaim branch) | `FireAllClients(tilePart, player.Name, playerCountry)` | `queueCaptureEvent(tilePart, player.Name, playerCountry)` |
+| 389 | `captureTile` (normal capture) | `FireAllClients(tilePart, player.Name, playerCountry)` | `queueCaptureEvent(tilePart, player.Name, playerCountry)` |
+| 414 | `releaseTile` | `FireAllClients(tilePart, "", originalCountry)` | `queueCaptureEvent(tilePart, "", originalCountry)` |
+| 459 | `reclaimTile` | `FireAllClients(tilePart, player.Name, playerCountry)` | `queueCaptureEvent(tilePart, player.Name, playerCountry)` |
+| 490 | `releaseCountryOccupiedTiles` | `FireAllClients(tilePart, "", data.originalCountry)` | `queueCaptureEvent(tilePart, "", data.originalCountry)` |
+| 553 | `releaseCountryOccupiedTiles` (inner loop) | `FireAllClients(tilePart, "", countryName)` | `queueCaptureEvent(tilePart, "", countryName)` |
+
+**DO NOT touch line 755** — `performCountryTakeover` already sends its own batch format and should remain as-is.
+
+- [ ] **Step 4: Update TileVisualEffects client handler to accept batched format**
+
+In `TileVisualEffects.client.luau`, update the `TileCapturedEvent.OnClientEvent` handler to detect whether it received a batch (table of tables) or the legacy single-tile format:
+
+```lua
+TileCapturedEvent.OnClientEvent:Connect(function(tileDataOrPart, playerNameOrNil, countryNameOrNil)
+	-- Detect batch format: array of {tilePart, playerName, countryName}
+	if typeof(tileDataOrPart) == "table" then
+		for _, entry in ipairs(tileDataOrPart) do
+			local tilePart, playerName, countryName = entry[1], entry[2], entry[3]
+			if tilePart and tilePart.Parent then
+				applyTileVisual(tilePart, playerName, countryName)
+			end
+		end
+	else
+		-- Legacy single-tile format (also used by performCountryTakeover batch)
+		if tileDataOrPart and tileDataOrPart.Parent then
+			applyTileVisual(tileDataOrPart, playerNameOrNil, countryNameOrNil)
+		end
+	end
+end)
+```
+
+Note: `performCountryTakeover` already sends its own batch format (array of Parts + playerName + country). You may need to reconcile these two batch formats or unify them. Check the existing client handler for `performCountryTakeover`'s batch format and ensure compatibility.
+
+- [ ] **Step 5: Test in-game**
+
+1. Have NPCs capture tiles in rapid succession (intense border combat).
+2. Verify tile colors update on all clients with minimal delay (<0.1s perceptible).
+3. Check network stats in Developer Console — event fire count should be reduced.
+4. Verify `performCountryTakeover` still works correctly (it has its own batch path).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/shared/TileOwnershipManager.luau src/playerscripts/TileVisualEffects.client.luau
+git commit -m "perf: batch tile capture remote events with 0.1s accumulation window"
+```
+
+---
+
+## Task 5: Incremental TileCursor Cache Eviction
+
+**Problem:** `TileCursor.client.luau` uses an LRU cache with `CACHE_MAX_SIZE = 500`. When full, it evicts 250 entries in a single `RenderStepped` frame via `table.remove(cacheAccessOrder, 1)` in a loop — O(250²) due to array shifting. This causes a frame spike (stutter) on low-end devices.
+
+**Solution:** Replace batch eviction with incremental eviction: remove 1–2 oldest entries per frame when the cache exceeds a soft limit. The cache never hits the hard limit, so no spike occurs.
+
+**Files:**
+- Modify: `src/playerscripts/TileCursor.client.luau` (lines 20–21: config, lines 66–92: `touchCacheEntry` + `evictOldestEntries`)
+
+### REJECTED ALTERNATIVES
+1. **Use a dictionary with timestamps instead of array:** Requires scanning all entries to find oldest — worse than incremental eviction.
+2. **Reduce cache size to 100:** More frequent evictions; doesn't fix the batch-eviction spike.
+3. **Use weak tables:** Roblox Parts have strong references from Workspace — weak table entries won't collect.
+
+### SCALABILITY CHECK
+- Eviction is O(1) per frame (remove 1 entry from array head + clear dict entry).
+- Soft limit at 400, hard limit at 500 → 100-entry buffer absorbs rapid exploration.
+- Worst case: player pans camera fast over 100 new tiles/sec → cache fills in 5s, eviction drains at 60/sec (one per frame), so net growth = 40/sec, still 2.5s before hard limit.
+
+### FAILURE SIMULATION
+- Cache grows past soft limit during lag spike → hard limit catch evicts 1 extra per frame until under soft limit.
+- Part in cache is destroyed (StreamingEnabled) → cache entry points to nil Part, harmless (cache miss on next access triggers re-lookup).
+
+---
+
+- [ ] **Step 1: Update cache config constants**
+
+Replace:
+```lua
+local CACHE_MAX_SIZE = 500
+local CACHE_EVICT_COUNT = 250
+```
+with:
+```lua
+local CACHE_SOFT_LIMIT = 400   -- start evicting 1 per frame above this
+local CACHE_HARD_LIMIT = 500   -- absolute max (safety net)
+```
+
+- [ ] **Step 2: Replace `evictOldestEntries` with incremental eviction**
+
+Replace the existing `evictOldestEntries` function:
+
+```lua
+local function evictOldestEntries()
+	-- Incremental: evict at most 2 entries per call (called once per RenderStepped)
+	local evictCount = 0
+	local maxEvict = 2
+
+	while #cacheAccessOrder > CACHE_SOFT_LIMIT and evictCount < maxEvict do
+		local oldPart = table.remove(cacheAccessOrder, 1)
+		if oldPart then
+			countryModelCache[oldPart] = nil
+		end
+		evictCount = evictCount + 1
+	end
+end
+```
+
+- [ ] **Step 3: Replace `touchCacheEntry` linear scan with dictionary-backed index**
+
+The existing `touchCacheEntry` does a reverse linear scan to find and remove the part from `cacheAccessOrder` — O(N) per hover. Replace with a dictionary that tracks array position:
+
+```lua
+local cacheIndexMap = {} -- [part] = index in cacheAccessOrder
+
+local function touchCacheEntry(part)
+	local existingIdx = cacheIndexMap[part]
+	if existingIdx then
+		table.remove(cacheAccessOrder, existingIdx)
+		-- Rebuild indices for shifted entries
+		for i = existingIdx, #cacheAccessOrder do
+			cacheIndexMap[cacheAccessOrder[i]] = i
+		end
+	end
+	table.insert(cacheAccessOrder, part)
+	cacheIndexMap[part] = #cacheAccessOrder
+end
+```
+
+Alternatively, if the linear scan is acceptable (500 entries max, Luau tables are fast), keep the existing approach and just fix the eviction. The linear scan in `touchCacheEntry` is much less impactful than the batch eviction.
+
+- [ ] **Step 4: Update cleanup to clear new data structures**
+
+In the existing `cleanup` function, add:
+
+```lua
+table.clear(cacheIndexMap)
+```
+
+alongside the existing cache clearing.
+
+- [ ] **Step 5: Test in-game**
+
+1. Pan camera across the Europe map rapidly, hovering over many tiles.
+2. Watch for frame rate drops — should be smooth (no 250-entry eviction spike).
+3. Verify tile hover highlighting still works correctly.
+4. Verify cache cleanup on player leave (no memory leak).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/playerscripts/TileCursor.client.luau
+git commit -m "perf: replace batch cache eviction with incremental per-frame eviction"
+```
+
+---
+
+## Task 6: Adaptive NPC Processing LOD
+
+**Problem:** All NPCs receive equal processing regardless of total NPC count. On low-end devices with 50+ NPCs, the cumulative cost of ground checks, combat ticks, and movement monitoring degrades frame rate.
+
+**Solution:** Create an `NPCLODManager` that adapts processing frequency based on total active NPC count. When NPC count exceeds thresholds, non-critical processing (ground check frequency, combat tick rate, idle drift correction) is throttled.
+
+**Files:**
+- Create: `src/shared/NPCLODManager.luau`
+- Modify: `src/shared/NPCMovementSystem.luau` (read LOD interval for ground checks)
+- Modify: `src/shared/NPCCombatSystem.luau` (read LOD interval for combat ticks)
+
+### REJECTED ALTERNATIVES
+1. **Distance-based LOD from camera:** This is a server-side game — NPCs process on server, no camera concept.
+2. **Hard NPC cap:** Degrades gameplay (players can't buy more NPCs). Throttling is better than blocking.
+3. **Skip processing for "idle" NPCs entirely:** Idle NPCs can still fall off tiles or drift; must maintain ground checks.
+
+### SCALABILITY CHECK
+- LOD tiers: 0–30 NPCs (full rate), 30–60 (reduced ground checks), 60–100 (reduced combat rate + ground checks), 100+ (aggressive throttle).
+- Tier transitions are smooth — no sudden behavior changes.
+- LOD only affects processing *frequency*, not correctness.
+
+### FAILURE SIMULATION
+- NPC count fluctuates around tier boundary → hysteresis prevents rapid tier switching (must stay above threshold for 2s).
+- All NPCs in combat at highest LOD tier → combat rate drops from 10/sec to 5/sec. Damage output halves but is consistent for all NPCs.
+- NPC falls off tile during reduced ground check → still detected within 0.5s (worst case at highest tier), recovery still works.
+
+---
+
+- [ ] **Step 1: Create NPCLODManager module**
+
+Create `src/shared/NPCLODManager.luau`:
+
+```lua
+-- NPCLODManager: Adapts NPC processing frequency based on active NPC count.
+-- Other systems read LOD intervals instead of using hardcoded values.
+
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+local NPCLODManager = {}
+
+-- LOD tiers (NPC count thresholds)
+local TIERS = {
+	{ maxNPCs = 30,  groundCheckInterval = 0.1,  combatTickInterval = 0.1,  label = "Full" },
+	{ maxNPCs = 60,  groundCheckInterval = 0.2,  combatTickInterval = 0.1,  label = "Medium" },
+	{ maxNPCs = 100, groundCheckInterval = 0.3,  combatTickInterval = 0.15, label = "Reduced" },
+	{ maxNPCs = math.huge, groundCheckInterval = 0.5, combatTickInterval = 0.2, label = "Minimal" },
+}
+
+local currentTier = TIERS[1]
+local tierChangeStartTime = nil -- os.clock() when we first detected a different target tier
+local HYSTERESIS_SECONDS = 2 -- must stay above threshold for this long before tier change
+local pendingTargetTier = nil
+
+local function updateTier()
+	local npcCount = #CollectionService:GetTagged("RegisteredNPC")
+
+	local targetTier = TIERS[1]
+	for _, tier in ipairs(TIERS) do
+		if npcCount <= tier.maxNPCs then
+			targetTier = tier
+			break
+		end
+	end
+
+	if targetTier ~= currentTier then
+		if targetTier ~= pendingTargetTier then
+			-- New target tier detected — start hysteresis timer
+			pendingTargetTier = targetTier
+			tierChangeStartTime = os.clock()
+		elseif os.clock() - tierChangeStartTime >= HYSTERESIS_SECONDS then
+			-- Held long enough — apply tier change
+			currentTier = targetTier
+			pendingTargetTier = nil
+			tierChangeStartTime = nil
+		end
+	else
+		-- Back to current tier — cancel pending change
+		pendingTargetTier = nil
+		tierChangeStartTime = nil
+	end
+end
+
+-- Public API
+function NPCLODManager.getGroundCheckInterval()
+	return currentTier.groundCheckInterval
+end
+
+function NPCLODManager.getCombatTickInterval()
+	return currentTier.combatTickInterval
+end
+
+function NPCLODManager.getCurrentTierLabel()
+	return currentTier.label
+end
+
+-- Single Heartbeat to update tier (very lightweight — 1 GetTagged call per second)
+local accumulator = 0
+RunService.Heartbeat:Connect(function(dt)
+	accumulator = accumulator + dt
+	if accumulator < 1 then return end -- check once per second
+	accumulator = 0
+	updateTier()
+end)
+
+return NPCLODManager
+```
+
+- [ ] **Step 2: Integrate LOD into NPCMovementSystem ground check**
+
+In the consolidated Heartbeat loop from Task 2, replace the hardcoded `GROUND_CHECK_INTERVAL` comparison:
+
+```lua
+local NPCLODManager = require(game.ServerScriptService:WaitForChild("NPCLODManager", 10))
+
+-- Inside onMovementHeartbeat, replace:
+--   if reg.groundAccum >= GROUND_CHECK_INTERVAL then
+-- with:
+if reg.groundAccum >= NPCLODManager.getGroundCheckInterval() then
+```
+
+- [ ] **Step 3: Integrate LOD into NPCCombatSystem combat tick**
+
+In the consolidated combat tick from Task 3, replace the hardcoded `LOOP_WAIT` comparison:
+
+```lua
+local NPCLODManager = require(game.ServerScriptService:WaitForChild("NPCLODManager", 10))
+
+-- Inside onCombatTick, replace:
+--   if combatAccumulator < LOOP_WAIT then return end
+-- with:
+if combatAccumulator < NPCLODManager.getCombatTickInterval() then return end
+```
+
+- [ ] **Step 4: Test with varying NPC counts**
+
+1. Start with 10 NPCs → verify "Full" tier, normal responsiveness.
+2. Spawn 50 NPCs → verify tier transitions to "Medium" after 2s hysteresis.
+3. Spawn 80 NPCs → verify "Reduced" tier, combat is slightly slower but functional.
+4. Spawn 120 NPCs → verify "Minimal" tier, game still runs (lower fidelity but stable).
+5. Remove NPCs back to 20 → verify tier returns to "Full."
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/shared/NPCLODManager.luau src/shared/NPCMovementSystem.luau src/shared/NPCCombatSystem.luau
+git commit -m "perf: add adaptive NPC LOD system that throttles processing at high NPC counts"
+```
+
+---
+
+## Execution Order & Dependencies
+
+```
+Task 1 (Beam Pool) ──────────────────┐
+Task 5 (Cache Eviction) ─────────────┤── Independent, can run in parallel
+Task 4 (Batch Events) ───────────────┘
+Task 2 (Heartbeat Consolidation) ────┐
+Task 3 (Combat Loop Consolidation) ──┤── Independent of each other, but both modify NPCMovementSystem/NPCCombatSystem
+                                      └── Task 6 depends on Tasks 2 & 3 being complete
+Task 6 (NPC LOD) ────────────────────── Must run after Tasks 2 & 3
+```
+
+**Recommended execution order:** Tasks 1, 4, 5 in parallel → Tasks 2, 3 in parallel → Task 6 last.
+
+---
+
+## Expected Performance Impact Summary
+
+| Optimization | Metric | Before | After | Device Impact |
+|-------------|--------|--------|-------|---------------|
+| Beam pooling | Part alloc/sec | N (one per NPC shot) | 0 (after warmup) | Reduces GC pauses |
+| Heartbeat consolidation | RBXScriptConnections | 3N | 1 | Reduces per-frame dispatch overhead |
+| Combat loop consolidation | Active coroutines | N | 1 | Reduces scheduler overhead |
+| Batch tile events | Remote fires/sec | N (per tile) | 1 per 0.1s window | Reduces network bandwidth |
+| Cache eviction | Frame spike (ms) | ~5–15ms every ~8s | <0.1ms per frame | Eliminates stutter |
+| NPC LOD | Processing cost at 100 NPCs | Full rate | 50–70% of full rate | Maintains playability |
+
+Where N = active NPC count.

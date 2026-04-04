@@ -108,10 +108,44 @@ local STRAIT_CONNECTIONS = {
 	-- ================================================================
 
 	-- Kerch Strait: Crimea → Krasnodar.
-	-- The strait is narrow (~1.2 studs at the closest point) and should be auto-detected
-	-- by the evidence-first pipeline, but this explicit entry serves as a safety net.
-	-- Duplicate-safe: applyExplicitStraitConnections() checks alreadyAdj before inserting.
+	-- NOTE: Neither tile name currently exists in the map. "кримська область" and
+	-- "Краснода́рский край" will emit warnings at startup until corresponding tiles
+	-- are added. Krasnodar Krai (English name) already has AABB overlap with Ukraine's
+	-- херсонська область, so Russia↔Ukraine connectivity is not blocked.
 	{ "кримська область", "Краснода́рский край" },
+
+	-- ================================================================
+	-- ITALY — ISLAND CROSSINGS
+	-- ================================================================
+
+	-- Strait of Sicily / Malta Channel: Sicilia → Malta.
+	-- AABB edge distance ~6.2 studs — beyond the 5-stud auto-detection water gap,
+	-- so Malta is completely isolated without this explicit entry.
+	{ "Sicilia", "Malta" },
+
+	-- Tyrrhenian Sea: Toscana → Sardegna (Sardinia).
+	-- AABB edge distance ~11.5 studs — far beyond any auto-detection threshold.
+	-- Sardinia has no other route to the mainland; without this it is fully isolated.
+	{ "Toscana", "Sardegna" },
+
+	-- ================================================================
+	-- SWEDEN — ISLAND CROSSINGS
+	-- ================================================================
+
+	-- Baltic Sea: Kalmar län → Gotlands län (Gotland).
+	-- AABB edge distance ~7.8 studs — right at the 8-stud narrow-strait threshold.
+	-- Walkability raycast may fail over open water, so this explicit entry is a safety net.
+	{ "Kalmar län", "Gotlands län" },
+
+	-- ================================================================
+	-- GREECE — ISLAND CROSSINGS
+	-- ================================================================
+
+	-- Sea of Crete: Περιφέρεια Πελοποννήσου (Peloponnese) → Αποκεντρωμένη Διοίκηση Κρήτης (Crete).
+	-- AABB edge distance ~7.9 studs — at the narrow-strait threshold limit.
+	-- Crete chains to South Aegean islands (0.0 stud overlap), so this single entry
+	-- connects the entire southern Greek island chain to the mainland.
+	{ "Περιφέρεια Πελοποννήσου", "Αποκεντρωμένη Διοίκηση Κρήτης" },
 
 	-- ================================================================
 	-- Add further crossings here as you expand the map:
