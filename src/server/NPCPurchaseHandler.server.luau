@@ -7,6 +7,7 @@ local DEBUG = false
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local BuyNPCEvent = ReplicatedStorage:WaitForChild("BuyNPCEvent", 10)
+local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
 local TileManager = require(game.ServerScriptService:WaitForChild("TileManager", 10))
 local ServerState = require(game.ServerScriptService:WaitForChild("ServerState", 10))
@@ -54,7 +55,10 @@ BuyNPCEvent.OnServerEvent:Connect(function(player, npcType)
 		local manpower = stats and stats:FindFirstChild("Manpower")
 
 		if not manpower or math.floor(manpower.Value) < cost then
-			error("Insufficient manpower (need " .. cost .. ")")
+			if DiplomacyReminderEvent then
+				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", cost)
+			end
+			return
 		end
 
 		-- Tile reservation
