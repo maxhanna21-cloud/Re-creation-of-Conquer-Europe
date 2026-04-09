@@ -6,15 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
-## Build & Development Commands
+## Development Workflow
 
+The `.rbxlx` place file is the source of truth for all non-script content (EuropeMap tiles, NPC templates, RemoteEvents, GUIs built in Studio, Lighting, folders, etc.). This repo only tracks scripts — there are no `.rbxm` model files.
+
+**Day-to-day development:**
 ```bash
-# Build the place file
-rojo build -o "Re-creation of Conquer Europe.rbxlx"
-
-# Live-sync to Roblox Studio (keep running while developing)
+# Live-sync scripts from src/ into an open Studio session
 rojo serve
 ```
+Open the `.rbxlx` place file in Studio, run `rojo serve`, and Studio will reflect script changes from disk in real time. Save from Studio when you change non-script things.
+
+**`rojo build` is not a full build.** It only packages scripts into a new `.rbxlx` — the output file will be missing the map, assets, and all Studio-authored content. Only use it to bootstrap a fresh place or for testing script structure in isolation.
 
 Toolchain is managed by `aftman.toml`. Rojo version: `7.7.0-rc.1`.
 
