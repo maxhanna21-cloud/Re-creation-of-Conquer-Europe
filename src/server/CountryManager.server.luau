@@ -306,6 +306,7 @@ local function startIncomeLoop(config)
 	-- config.incomeAmount: number (amount added per tick)
 	-- config.statName: string ("Coins" or "Manpower")
 	-- config.statSetter: function(countryName, amount)
+	local includeConqueredCountries = config.includeConqueredCountries ~= false
 	while loopRunning[config.loopFlag] do
 		if not hasAnyOwnedCountries() then
 			if DEBUG then
@@ -324,7 +325,7 @@ local function startIncomeLoop(config)
 			if typeof(ownerValue) == "Instance" and ownerValue:IsA("Player") then
 				resolvedOwner = ownerValue
 				isDirectlyOwned = true
-			elseif type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
+			elseif includeConqueredCountries and type(ownerValue) == "string" and ownerValue:sub(1, 10) == "Conquered_" then
 				resolvedOwner = ServerState.resolveCountryOwner(countryName)
 			end
 
@@ -375,6 +376,7 @@ local function startManpowerIncomeLoop()
 		incomeAmount = BASE_MANPOWER_INCOME,
 		statName = "Manpower",
 		statSetter = ServerState.setCountryManpower,
+		includeConqueredCountries = false,
 	})
 end
 

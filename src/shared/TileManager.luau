@@ -217,22 +217,48 @@ function TileManager.getSpawnPosition(player)
 		return false
 	end
 
-	-- Build unified pool of all available tiles (home + conquered)
+	-- TIER 1: Own capital — highest priority
+	-- CapitalTilesByModel is populated by scanCountryTiles at startup; direct reference, no scan needed.
+	local countryModel = EUROPE_MAP:FindFirstChild(countryName)
+	local capitalPart = countryModel and CapitalTilesByModel[countryModel]
+	if capitalPart then
+		local capitalTileId = TAM.getTileId(capitalPart)
+		if not TileManager.isTileOccupiedById(capitalTileId) and not isEnemyDiplomaticOccupied(capitalPart) then
+			local fallback = capitalPart.Position + Vector3.new(0, capitalPart.Size.Y / 2 + 3, 0)
+			return getSafeSpawnPos(capitalPart, fallback), getTileKey(capitalPart.Position)
+		end
+	end
+
+	-- TIER 2: Conquered enemy capitals — second priority
+	-- getCountryOccupiedTiles returns BaseParts from diplomatically occupied enemy territory.
+	-- Parts named "Capital" within that set are the enemy's capital tiles.
+	local conqueredTiles = TOM.getCountryOccupiedTiles(countryName)
+	for _, tilePart in ipairs(conqueredTiles) do
+		if tilePart and tilePart.Parent and tilePart.Name == "Capital" then
+			local tileId = TAM.getTileId(tilePart)
+			if not TileManager.isTileOccupiedById(tileId) then
+				local fallback = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
+				return getSafeSpawnPos(tilePart, fallback), getTileKey(tilePart.Position)
+			end
+		end
+	end
+
+	-- TIER 3: All remaining eligible tiles (home + conquered), shuffled for variety.
+	-- Own capital and enemy capitals that reached here are occupied, so the NPC-occupancy
+	-- filter below naturally excludes them — no explicit skip logic needed.
 	local allCandidates = {}
 
-	-- Add home tiles: filter out NPC-occupied tiles (by TileId) and enemy-occupied tiles
+	-- Home tiles: filter out NPC-occupied tiles (by TileId) and enemy diplomatic occupants
 	for _, tilePos in ipairs(tiles) do
 		local tileKey = getTileKey(tilePos)
 		local tilePart = TAM.getTileFromKey(tileKey)
 		local tileId = tilePart and TAM.getTileId(tilePart)
-		-- Skip tiles with standing NPCs (TileId-authoritative) or enemy diplomatic occupants
 		if not TileManager.isTileOccupiedById(tileId) and not isEnemyDiplomaticOccupied(tilePart) then
 			table.insert(allCandidates, { tilePart = tilePart, tileKey = tileKey, pos = tilePos })
 		end
 	end
 
-	-- Add conquered/occupied territory tiles: filter by TileId occupancy
-	local conqueredTiles = TOM.getCountryOccupiedTiles(countryName)
+	-- Conquered tiles: filter by TileId occupancy
 	for _, tilePart in ipairs(conqueredTiles) do
 		if tilePart and tilePart.Parent then
 			local tileId = TAM.getTileId(tilePart)
@@ -249,7 +275,7 @@ function TileManager.getSpawnPosition(player)
 		return nil
 	end
 
-	-- Shuffle all candidates uniformly
+	-- Shuffle Tier 3 candidates for variety
 	for i = #allCandidates, 2, -1 do
 		local j = math.random(1, i)
 		allCandidates[i], allCandidates[j] = allCandidates[j], allCandidates[i]

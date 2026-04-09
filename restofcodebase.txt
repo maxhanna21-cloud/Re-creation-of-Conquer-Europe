@@ -611,6 +611,7 @@ local DEBUG = false
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local BuyNPCEvent = ReplicatedStorage:WaitForChild("BuyNPCEvent", 10)
+local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
 local TileManager = require(game.ServerScriptService:WaitForChild("TileManager", 10))
 local ServerState = require(game.ServerScriptService:WaitForChild("ServerState", 10))
@@ -658,7 +659,10 @@ BuyNPCEvent.OnServerEvent:Connect(function(player, npcType)
 		local manpower = stats and stats:FindFirstChild("Manpower")
 
 		if not manpower or math.floor(manpower.Value) < cost then
-			error("Insufficient manpower (need " .. cost .. ")")
+			if DiplomacyReminderEvent then
+				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", cost)
+			end
+			return
 		end
 
 		-- Tile reservation
@@ -1853,7 +1857,7 @@ local function processReminderQueue()
     end
 end
 
-DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType)
+DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData)
     local message, color
 
     if eventType == "War" then
@@ -1874,6 +1878,10 @@ DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventTyp
     elseif eventType == "NAPExpired" then
         message = "⏰ Your truce with " .. aggressorCountry .. " has expired!"
         color = Color3.fromRGB(255, 200, 100)
+    elseif eventType == "InsufficientManpower" then
+        local requiredCost = tonumber(extraData) or 10000
+        message = "Not enough manpower! You need " .. requiredCost .. " manpower to purchase a unit."
+        color = Color3.fromRGB(255, 170, 50)
     else
         -- Unknown type — log and ignore rather than show a blank popup
         warn("[DiplomacyGui] Unknown reminder type: " .. tostring(eventType))

@@ -4,7 +4,7 @@
         {
             "label": "Watch: Auto-update split codebase",
             "type": "shell",
-            "command": "while true; do sleep 30 && sh update_split.command; done",
+            "command": "while true; do sleep 30 && bash update_split.command; done",
             "options": {
                 "cwd": "${workspaceFolder}"
             },

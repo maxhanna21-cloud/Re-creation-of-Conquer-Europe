@@ -8,11 +8,12 @@ top_files=$(find src -type f \( -name "*.lua" -o -name "*.luau" \) \
 
 # Output largescripts.txt (top N files)
 > largescripts.txt
-while IFS= read -r f; do
+printf '%s\n' "$top_files" | while IFS= read -r f; do
+  [ -n "$f" ] || continue
   echo ""
   echo "--- $f ---"
   cat "$f"
-done <<< "$top_files" >> largescripts.txt
+done >> largescripts.txt
 
 # Output restofcodebase.txt (everything NOT in top N)
 > restofcodebase.txt
