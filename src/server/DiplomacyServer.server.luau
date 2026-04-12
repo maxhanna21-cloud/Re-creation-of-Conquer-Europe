@@ -14,6 +14,8 @@ local Players = game:GetService("Players")
 local DiplomacyManager = require(ServerScriptService:WaitForChild("DiplomacyManager", 10))
 local ServerState = require(ServerScriptService:WaitForChild("ServerState", 10))
 local TileOwnershipManager = require(ServerScriptService:WaitForChild("TileOwnershipManager", 10))
+local TileAdjacencyManager = require(ServerScriptService:WaitForChild("TileAdjacencyManager", 10))
+local CountryNPCRegistry = require(ServerScriptService:WaitForChild("CountryNPCRegistry", 10))
 
 -- 2. REQUIREMENTS (Remotes)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
@@ -80,6 +82,24 @@ DiplomacyManager.setNAPExpiredCallback(function(countryA, countryB)
     if DEBUG then print("⏰ NAP EXPIRED callback fired: " .. countryA .. " / " .. countryB) end
 end)
 
+-- HELPER: Check if a country has any NPCs currently on allied territory
+local function hasUnitsOnAlliedTerritory(playerCountry)
+    local npcs = CountryNPCRegistry.getNPCs(playerCountry)
+    for _, npcModel in ipairs(npcs) do
+        local tileId = npcModel:GetAttribute("CurrentTileId") or npcModel:GetAttribute("TileKey")
+        if tileId then
+            local tilePart = TileAdjacencyManager.getTileFromKey(tileId)
+            if tilePart then
+                local tileCountry = TileAdjacencyManager.getTileCountry(tilePart)
+                if tileCountry and tileCountry ~= playerCountry and DiplomacyManager.areCountriesAllied(playerCountry, tileCountry) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 ---------------------------------------------------------
 -- PART 1: WAR LOGIC (Instant Action)
 ---------------------------------------------------------
@@ -133,6 +153,12 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
             GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
             return
         end
+    end
+
+    -- Check if player has units on allied territory — must withdraw first
+    if hasUnitsOnAlliedTerritory(playerCountry) then
+        DiplomacyReminderEvent:FireClient(player, targetCountryName, "WithdrawUnits")
+        return
     end
 
     -- Check if allied with target (must break alliance first)
@@ -284,6 +310,14 @@ local function processRequest(senderPlayer, targetCountryName, requestType)
     if requestType == "Alliance" or requestType == "NAP" then
         if DiplomacyManager.areCountriesAtWar(senderCountry, targetCountryName) then
             GlobalNotificationEvent:FireClient(senderPlayer, "You are at war with " .. targetCountryName .. "! Sign peace first.", Color3.fromRGB(255, 200, 0))
+            return
+        end
+    end
+
+    -- Prevent duplicate alliance requests when already allied
+    if requestType == "Alliance" then
+        if DiplomacyManager.areCountriesAllied(senderCountry, targetCountryName) then
+            GlobalNotificationEvent:FireClient(senderPlayer, "🤝 You are already allied with " .. targetCountryName .. "!", Color3.fromRGB(255, 200, 0))
             return
         end
     end

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.maximushanna.update-split</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>while true; do sleep 30 && bash "/Users/maximushanna/Documents/Re-creation of Conquer Europe/update_split.command"; done</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/maximushanna/Documents/Re-creation of Conquer Europe</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/maximushanna/Documents/Re-creation of Conquer Europe/.update-split.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/maximushanna/Documents/Re-creation of Conquer Europe/.update-split.err</string>
+</dict>
+</plist>

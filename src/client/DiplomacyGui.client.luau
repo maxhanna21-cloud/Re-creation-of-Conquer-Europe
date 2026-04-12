@@ -265,6 +265,9 @@ DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventTyp
     elseif eventType == "NAPExpired" then
         message = "⏰ Your truce with " .. aggressorCountry .. " has expired!"
         color = Color3.fromRGB(255, 200, 100)
+    elseif eventType == "WithdrawUnits" then
+        message = "⚠️ You have units on allied territory! Withdraw them before declaring war."
+        color = Color3.fromRGB(255, 170, 50)
     elseif eventType == "InsufficientManpower" then
         local requiredCost = tonumber(extraData) or 10000
         message = "Not enough manpower 👷! You need " .. requiredCost .. " manpower to purchase a unit."
