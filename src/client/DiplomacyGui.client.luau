@@ -244,7 +244,33 @@ local function processReminderQueue()
     end
 end
 
-DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData)
+local function formatDuration(totalSeconds)
+    totalSeconds = math.max(0, math.floor(totalSeconds))
+    local hours = math.floor(totalSeconds / 3600)
+    local minutes = math.floor((totalSeconds % 3600) / 60)
+    local seconds = totalSeconds % 60
+
+    local parts = {}
+    if hours > 0 then
+        table.insert(parts, hours .. (hours == 1 and " hour" or " hours"))
+    end
+    if minutes > 0 then
+        table.insert(parts, minutes .. (minutes == 1 and " minute" or " minutes"))
+    end
+    if seconds > 0 or #parts == 0 then
+        table.insert(parts, seconds .. (seconds == 1 and " second" or " seconds"))
+    end
+
+    if #parts == 1 then
+        return parts[1]
+    elseif #parts == 2 then
+        return parts[1] .. " and " .. parts[2]
+    else
+        return parts[1] .. ", " .. parts[2] .. ", and " .. parts[3]
+    end
+end
+
+DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData, secondsData)
     local message, color
 
     if eventType == "War" then
@@ -271,6 +297,10 @@ DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventTyp
     elseif eventType == "InsufficientManpower" then
         local requiredCost = tonumber(extraData) or 10000
         message = "⚠️ Not enough manpower! You need " .. requiredCost .. " manpower to purchase a unit."
+        local secondsRemaining = tonumber(secondsData)
+        if secondsRemaining and secondsRemaining > 0 then
+            message = message .. "\nTime until you can purchase: " .. formatDuration(secondsRemaining) .. "."
+        end
         color = Color3.fromRGB(255, 170, 50)
     else
         -- Unknown type — log and ignore rather than show a blank popup

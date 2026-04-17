@@ -19,6 +19,11 @@ local NPC_COSTS = {
 	DefenderNPC = 10000
 }
 
+-- Manpower income rate (mirrors CountryManager's flat 100-per-3s regen).
+-- Used to estimate time-until-purchase for the InsufficientManpower reminder.
+local MANPOWER_INTERVAL = 3
+local BASE_MANPOWER_INCOME = 100
+
 -- Rate limiting configuration
 local PURCHASE_COOLDOWN = 0.5 -- Minimum seconds between purchases
 
@@ -56,7 +61,19 @@ BuyNPCEvent.OnServerEvent:Connect(function(player, npcType)
 
 		if not manpower or math.floor(manpower.Value) < cost then
 			if DiplomacyReminderEvent then
-				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", cost)
+				-- Estimate seconds until the player has enough manpower.
+				-- Only meaningful if they own a country (otherwise no income).
+				local currentManpower = manpower and math.max(0, math.floor(manpower.Value)) or 0
+				local secondsRemaining = -1
+				if TileManager.getPlayerCountry(player) then
+					local needed = cost - currentManpower
+					if needed > 0 and BASE_MANPOWER_INCOME > 0 then
+						secondsRemaining = math.ceil(needed * MANPOWER_INTERVAL / BASE_MANPOWER_INCOME)
+					else
+						secondsRemaining = 0
+					end
+				end
+				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", cost, secondsRemaining)
 			end
 			return
 		end
