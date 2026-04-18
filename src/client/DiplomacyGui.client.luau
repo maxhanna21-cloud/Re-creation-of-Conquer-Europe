@@ -269,8 +269,47 @@ DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventTyp
         message = "⚠️ You have units on allied territory! Withdraw them before declaring war."
         color = Color3.fromRGB(255, 170, 50)
     elseif eventType == "InsufficientManpower" then
-        local requiredCost = tonumber(extraData) or 10000
-        message = "⚠️ Not enough manpower! You need " .. requiredCost .. " manpower to purchase a unit."
+        local requiredCost = 10000
+        local currentManpower = 0
+        if typeof(extraData) == "table" then
+            requiredCost = extraData.cost or 10000
+            currentManpower = extraData.currentManpower or 0
+        elseif tonumber(extraData) then
+            requiredCost = tonumber(extraData)
+        end
+
+        local shortfall = requiredCost - currentManpower
+        local MANPOWER_PER_INTERVAL = 100
+        local INTERVAL_SECONDS = 3
+        local secondsRemaining = math.ceil((shortfall / MANPOWER_PER_INTERVAL) * INTERVAL_SECONDS)
+
+        local timeStr = ""
+        if secondsRemaining >= 3600 then
+            local hours = math.floor(secondsRemaining / 3600)
+            local mins = math.floor((secondsRemaining % 3600) / 60)
+            local secs = secondsRemaining % 60
+            if mins > 0 and secs > 0 then
+                timeStr = hours .. "h " .. mins .. "m " .. secs .. "s"
+            elseif mins > 0 then
+                timeStr = hours .. "h " .. mins .. "m"
+            elseif secs > 0 then
+                timeStr = hours .. "h " .. secs .. "s"
+            else
+                timeStr = hours .. "h"
+            end
+        elseif secondsRemaining >= 60 then
+            local mins = math.floor(secondsRemaining / 60)
+            local secs = secondsRemaining % 60
+            if secs > 0 then
+                timeStr = mins .. "m " .. secs .. "s"
+            else
+                timeStr = mins .. "m"
+            end
+        else
+            timeStr = secondsRemaining .. "s"
+        end
+
+        message = "⚠️ Not enough manpower! You need " .. requiredCost .. " 👤. Time until enough: " .. timeStr
         color = Color3.fromRGB(255, 170, 50)
     else
         -- Unknown type — log and ignore rather than show a blank popup

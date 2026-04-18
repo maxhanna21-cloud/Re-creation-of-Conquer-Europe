@@ -56,7 +56,11 @@ BuyNPCEvent.OnServerEvent:Connect(function(player, npcType)
 
 		if not manpower or math.floor(manpower.Value) < cost then
 			if DiplomacyReminderEvent then
-				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", cost)
+				local currentManpower = manpower and math.floor(manpower.Value) or 0
+				DiplomacyReminderEvent:FireClient(player, nil, "InsufficientManpower", {
+					cost = cost,
+					currentManpower = currentManpower,
+				})
 			end
 			return
 		end
