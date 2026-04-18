@@ -300,10 +300,10 @@ function TileOwnershipManager.reclaimTile(tilePart, player)
 	end
 
 	-- Notify the reclaiming player
-	local GlobalNotificationEvent = ReplicatedStorage:FindFirstChild("GlobalNotificationEvent")
-	if GlobalNotificationEvent then
-		GlobalNotificationEvent:FireClient(player, "Territory reclaimed from " .. occupyingCountry .. "!", Color3.fromRGB(100, 255, 100))
-	end
+	--local GlobalNotificationEvent = ReplicatedStorage:FindFirstChild("GlobalNotificationEvent")
+	--if GlobalNotificationEvent then
+		--GlobalNotificationEvent:FireClient(player, "Territory reclaimed from " .. occupyingCountry .. "!", Color3.fromRGB(100, 255, 100))
+	--end
 
 	-- Fire tile captured event for UI updates
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
