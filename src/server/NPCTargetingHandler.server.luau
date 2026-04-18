@@ -173,11 +173,6 @@ local function handleSecondClick(player, targetModel)
 		return
 	end
 
-	if NPCMovementSystem.isMoving(attackerModel) then
-		if DEBUG then print("Cannot attack: " .. attackerModel.Name .. " is currently moving") end
-		return
-	end
-
 	-- Rule 3: Tile adjacency check
 	if not TileAdjacencyManager.canNPCsInteract(attackerModel, targetModel) then
 		if DEBUG then print("Cannot attack: " .. targetModel.Name .. " is not on an adjacent tile") end
@@ -188,14 +183,6 @@ local function handleSecondClick(player, targetModel)
 	if NPCMovementSystem.isRetreating(targetModel) then
 		if DEBUG then print("Cannot attack: " .. targetModel.Name .. " is retreating (invulnerable)") end
 		return
-	end
-
-	if NPCMovementSystem.isMoving(targetModel) then
-		local restored, restoreResult = NPCMovementSystem.restoreToMovementOrigin(targetModel)
-		if not restored then
-			if DEBUG then print("Cannot attack: failed to restore moving target " .. targetModel.Name .. " (" .. tostring(restoreResult) .. ")") end
-			return
-		end
 	end
 
 	-- ADD target to the list (not replace!)

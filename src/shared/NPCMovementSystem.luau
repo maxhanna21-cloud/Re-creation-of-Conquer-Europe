@@ -2043,77 +2043,6 @@ function NPCMovementSystem.cancelMovement(npcModel)
 	return true
 end
 
-function NPCMovementSystem.restoreToMovementOrigin(npcModel)
-	getDependencies()
-
-	if not npcModel then
-		return false, "Invalid NPC"
-	end
-
-	if NPCMovementSystem.isRetreating(npcModel) then
-		return false, "NPC is retreating"
-	end
-
-	local movement = activeMovements[npcModel]
-	if not movement then
-		return false, "NPC has no active movement"
-	end
-
-	local originTileKey = movement.originTileKey or npcModel:GetAttribute("TileKey")
-	local originTilePart = originTileKey and TileAdjacencyManager.getTileFromKey(originTileKey) or nil
-	local originPosition = movement.originPosition or (originTilePart and getTileSpawnPosition(originTilePart))
-
-	if movement.targetTileKey then
-		releaseTileReservation(movement.targetTileKey, npcModel)
-	end
-
-	if movement.connection then
-		pcall(function() movement.connection:Disconnect() end)
-	end
-
-	activeMovements[npcModel] = nil
-
-	movementStates[npcModel] = movementStates[npcModel] or {}
-	movementStates[npcModel].state = "Idle"
-	movementStates[npcModel].moveAttempts = 0
-	movementStates[npcModel].stuckSince = nil
-	movementStates[npcModel].lastStopTime = os.clock()
-	movementStates[npcModel].lastSamplePos = originPosition or (getRootPart(npcModel) and getRootPart(npcModel).Position) or Vector3.new(0, 0, 0)
-	movementStates[npcModel].lastSampleTime = os.clock()
-
-	if originTileKey then
-		npcModel:SetAttribute("TileKey", originTileKey)
-	end
-
-	if originTilePart then
-		local originTileId = TileAdjacencyManager.getTileId(originTilePart)
-		if originTileId then
-			npcModel:SetAttribute("CurrentTileId", originTileId)
-		end
-	end
-
-	if originPosition then
-		pcall(function() npcModel:PivotTo(CFrame.new(originPosition)) end)
-	end
-
-	local restoreHumanoid = getHumanoid(npcModel)
-	local root = getRootPart(npcModel)
-	if restoreHumanoid then
-		if originPosition then
-			restoreHumanoid:MoveTo(originPosition)
-		elseif root then
-			restoreHumanoid:MoveTo(root.Position)
-		end
-	end
-
-	npcModel:SetAttribute("IsMoving", nil)
-	if Combat and not Combat.isInCombat(npcModel) then
-		setNPCHealthScriptEnabled(npcModel, true)
-	end
-
-	return true, originTileKey
-end
-
 ---------------------------------------------------
 -- OnOwnerChanged: reset movement state when ownership transfers
 ---------------------------------------------------
@@ -2125,13 +2054,15 @@ function NPCMovementSystem.OnOwnerChanged(npcModel)
 	movementStates[npcModel].stuckSince = nil
 	movementStates[npcModel].moveAttempts = 0
 
+	-- release any reservation this NPC had on other tiles if present
 	for k, v in pairs(reservedTiles) do
 		if v == npcModel then reservedTiles[k] = nil end
 	end
 
-	local ownerChangeMovement = activeMovements[npcModel]
-	if ownerChangeMovement and ownerChangeMovement.connection then
-		pcall(function() ownerChangeMovement.connection:Disconnect() end)
+	-- Stop active movement monitor
+	local movement = activeMovements[npcModel]
+	if movement and movement.connection then
+		pcall(function() movement.connection:Disconnect() end)
 	end
 	activeMovements[npcModel] = nil
 

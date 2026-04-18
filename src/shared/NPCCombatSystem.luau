@@ -923,3 +923,4 @@ function Combat.getThreatCount(attackerModel)
 end
 
 return Combat
+
