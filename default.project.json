@@ -2,6 +2,7 @@
   "name": "Re-creation of Conquer Europe",
   "tree": {
     "$className": "DataModel",
+    "$ignoreUnknownInstances": true,
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "$ignoreUnknownInstances": true,

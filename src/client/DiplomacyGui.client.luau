@@ -56,9 +56,13 @@ local acceptBtn = popup:WaitForChild("ButtonContainer", 10).AcceptButton
 local declineBtn = popup:WaitForChild("ButtonContainer", 10).DeclineButton
 
 -- ReminderPopup Elements
-local reminderPopup = gui:WaitForChild("ReminderPopup", 10)
-local reminderMessage = reminderPopup:WaitForChild("Message", 10)
-local reminderOkayBtn = reminderPopup:WaitForChild("ButtonContainer", 10):WaitForChild("OkayButton", 10)
+local reminderPopup = gui:WaitForChild("ReminderPopup", 5)
+local reminderMessage = reminderPopup and reminderPopup:WaitForChild("Message", 5)
+local reminderOkayBtn = reminderPopup and reminderPopup:WaitForChild("ButtonContainer", 5):WaitForChild("OkayButton", 5)
+
+if not reminderPopup then
+    warn("[DiplomacyGui] ReminderPopup not found - diplomacy reminders will not be displayed.")
+end
 
 -- STATE VARIABLE (Prevents multiple clicks stacking up)
 local currentConnection = nil
@@ -212,7 +216,7 @@ local reminderQueue = {}
 local reminderActive = false
 
 local function processReminderQueue()
-    if reminderActive or #reminderQueue == 0 then return end
+    if reminderActive or #reminderQueue == 0 or not reminderPopup then return end
     reminderActive = true
 
     local entry = table.remove(reminderQueue, 1)
@@ -244,79 +248,83 @@ local function processReminderQueue()
     end
 end
 
-DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData)
-    local message, color
+if DiplomacyReminderEvent then
+    DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData)
+        local message, color
 
-    if eventType == "War" then
-        message = "⚔️ " .. aggressorCountry .. " has declared war on you!"
-        color = Color3.fromRGB(255, 80, 80)
-    elseif eventType == "BreakAlliance" then
-        message = "💔 " .. aggressorCountry .. " has broken their alliance with you!"
-        color = Color3.fromRGB(255, 180, 50)
-    elseif eventType == "AllianceAccepted" then
-        message = "🤝 " .. aggressorCountry .. " has accepted your alliance!"
-        color = Color3.fromRGB(100, 255, 100)
-    elseif eventType == "PeaceAccepted" then
-        message = "🕊️ " .. aggressorCountry .. " has signed your peace treaty!"
-        color = Color3.fromRGB(100, 200, 255)
-    elseif eventType == "NAPAccepted" then
-        message = "📜 " .. aggressorCountry .. " has accepted your Non-Aggression Pact!"
-        color = Color3.fromRGB(200, 200, 255)
-    elseif eventType == "NAPExpired" then
-        message = "⏰ Your truce with " .. aggressorCountry .. " has expired!"
-        color = Color3.fromRGB(255, 200, 100)
-    elseif eventType == "WithdrawUnits" then
-        message = "⚠️ You have units on allied territory! Withdraw them before declaring war."
-        color = Color3.fromRGB(255, 170, 50)
-    elseif eventType == "InsufficientManpower" then
-        local requiredCost = 10000
-        local currentManpower = 0
-        if typeof(extraData) == "table" then
-            requiredCost = extraData.cost or 10000
-            currentManpower = extraData.currentManpower or 0
-        elseif tonumber(extraData) then
-            requiredCost = tonumber(extraData)
-        end
-
-        local shortfall = requiredCost - currentManpower
-        local MANPOWER_PER_INTERVAL = 100
-        local INTERVAL_SECONDS = 3
-        local secondsRemaining = math.ceil((shortfall / MANPOWER_PER_INTERVAL) * INTERVAL_SECONDS)
-
-        local timeStr = ""
-        if secondsRemaining >= 3600 then
-            local hours = math.floor(secondsRemaining / 3600)
-            local mins = math.floor((secondsRemaining % 3600) / 60)
-            local secs = secondsRemaining % 60
-            if mins > 0 and secs > 0 then
-                timeStr = hours .. "h " .. mins .. "m " .. secs .. "s"
-            elseif mins > 0 then
-                timeStr = hours .. "h " .. mins .. "m"
-            elseif secs > 0 then
-                timeStr = hours .. "h " .. secs .. "s"
-            else
-                timeStr = hours .. "h"
+        if eventType == "War" then
+            message = "⚔️ " .. aggressorCountry .. " has declared war on you!"
+            color = Color3.fromRGB(255, 80, 80)
+        elseif eventType == "BreakAlliance" then
+            message = "💔 " .. aggressorCountry .. " has broken their alliance with you!"
+            color = Color3.fromRGB(255, 180, 50)
+        elseif eventType == "AllianceAccepted" then
+            message = "🤝 " .. aggressorCountry .. " has accepted your alliance!"
+            color = Color3.fromRGB(100, 255, 100)
+        elseif eventType == "PeaceAccepted" then
+            message = "🕊️ " .. aggressorCountry .. " has signed your peace treaty!"
+            color = Color3.fromRGB(100, 200, 255)
+        elseif eventType == "NAPAccepted" then
+            message = "📜 " .. aggressorCountry .. " has accepted your Non-Aggression Pact!"
+            color = Color3.fromRGB(200, 200, 255)
+        elseif eventType == "NAPExpired" then
+            message = "⏰ Your truce with " .. aggressorCountry .. " has expired!"
+            color = Color3.fromRGB(255, 200, 100)
+        elseif eventType == "WithdrawUnits" then
+            message = "⚠️ You have units on allied territory! Withdraw them before declaring war."
+            color = Color3.fromRGB(255, 170, 50)
+        elseif eventType == "InsufficientManpower" then
+            local requiredCost = 10000
+            local currentManpower = 0
+            if typeof(extraData) == "table" then
+                requiredCost = extraData.cost or 10000
+                currentManpower = extraData.currentManpower or 0
+            elseif tonumber(extraData) then
+                requiredCost = tonumber(extraData)
             end
-        elseif secondsRemaining >= 60 then
-            local mins = math.floor(secondsRemaining / 60)
-            local secs = secondsRemaining % 60
-            if secs > 0 then
-                timeStr = mins .. "m " .. secs .. "s"
+
+            local shortfall = requiredCost - currentManpower
+            local MANPOWER_PER_INTERVAL = 100
+            local INTERVAL_SECONDS = 3
+            local secondsRemaining = math.ceil((shortfall / MANPOWER_PER_INTERVAL) * INTERVAL_SECONDS)
+
+            local timeStr = ""
+            if secondsRemaining >= 3600 then
+                local hours = math.floor(secondsRemaining / 3600)
+                local mins = math.floor((secondsRemaining % 3600) / 60)
+                local secs = secondsRemaining % 60
+                if mins > 0 and secs > 0 then
+                    timeStr = hours .. "h " .. mins .. "m " .. secs .. "s"
+                elseif mins > 0 then
+                    timeStr = hours .. "h " .. mins .. "m"
+                elseif secs > 0 then
+                    timeStr = hours .. "h " .. secs .. "s"
+                else
+                    timeStr = hours .. "h"
+                end
+            elseif secondsRemaining >= 60 then
+                local mins = math.floor(secondsRemaining / 60)
+                local secs = secondsRemaining % 60
+                if secs > 0 then
+                    timeStr = mins .. "m " .. secs .. "s"
+                else
+                    timeStr = mins .. "m"
+                end
             else
-                timeStr = mins .. "m"
+                timeStr = secondsRemaining .. "s"
             end
+
+            message = "⚠️ Not enough manpower! You need " .. requiredCost .. " 👤. Time until enough: " .. timeStr
+            color = Color3.fromRGB(255, 170, 50)
         else
-            timeStr = secondsRemaining .. "s"
+            -- Unknown type — log and ignore rather than show a blank popup
+            warn("[DiplomacyGui] Unknown reminder type: " .. tostring(eventType))
+            return
         end
 
-        message = "⚠️ Not enough manpower! You need " .. requiredCost .. " 👤. Time until enough: " .. timeStr
-        color = Color3.fromRGB(255, 170, 50)
-    else
-        -- Unknown type — log and ignore rather than show a blank popup
-        warn("[DiplomacyGui] Unknown reminder type: " .. tostring(eventType))
-        return
-    end
-
-    table.insert(reminderQueue, { message = message, color = color })
-    task.defer(processReminderQueue)
-end)
+        table.insert(reminderQueue, { message = message, color = color })
+        task.defer(processReminderQueue)
+    end)
+else
+    warn("[DiplomacyGui] DiplomacyReminderEvent not found - reminders will not function.")
+end

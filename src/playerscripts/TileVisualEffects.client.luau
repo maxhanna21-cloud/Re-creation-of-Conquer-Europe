@@ -1,6 +1,6 @@
 -- TileVisualEffects (client)
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local TileCapturedEvent = ReplicatedStorage:WaitForChild("TileCapturedEvent", 10)
@@ -9,22 +9,21 @@ local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
 -- Config
 local TWEEN_TIME = 0.8 -- Duration of the color transition
 
--- Cache & active tween tracker (weak keys so destroyed parts can be collected)
+-- Cache
 local CountryColors = {}
-local ActiveTweens = setmetatable({}, { __mode = "k" }) -- weak keys
+-- ActiveTransitions: part -> { startColor: Color3, targetColor: Color3, elapsed: number }
+local ActiveTransitions = {}
 
 -- Helper: get a representative BasePart color for a country model
 local function getFirstBasePartColor(countryModel)
 	if not countryModel then return nil end
 
-	-- Prefer a well-known container if present (reduce work & avoid decorations)
 	local container = countryModel:FindFirstChild("Parts") or countryModel:FindFirstChild("Tiles")
 	if container and typeof(container.GetChildren) == "function" then
 		for _, child in ipairs(container:GetChildren()) do
 			if child:IsA("BasePart") then
 				return child.Color
 			end
-			-- quick shallow check for nested model/folder
 			if child:IsA("Model") or child:IsA("Folder") then
 				for _, sub in ipairs(child:GetChildren()) do
 					if sub:IsA("BasePart") then
@@ -35,14 +34,12 @@ local function getFirstBasePartColor(countryModel)
 		end
 	end
 
-	-- Fall back to checking direct children of the model (cheaper than full descendants)
 	for _, child in ipairs(countryModel:GetChildren()) do
 		if child:IsA("BasePart") then
 			return child.Color
 		end
 	end
 
-	-- Last resort: descendants (use sparingly)
 	for _, desc in ipairs(countryModel:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			return desc.Color
@@ -52,9 +49,6 @@ local function getFirstBasePartColor(countryModel)
 	return nil
 end
 
--- Initialize country colors once at startup from the map's original tile colors.
--- CountryColors is intentionally immutable after this point — updating it from live
--- tile colors during gameplay would corrupt lookups once tiles are captured/repainted.
 local function scanCountryColors()
 	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
 		if countryModel:IsA("Model") then
@@ -67,64 +61,73 @@ local function scanCountryColors()
 	end
 end
 
--- Tween a single tile to the target country color
-local function tweenTileColor(tilePart, countryName)
-	if not tilePart or not countryName then return end
-	if not tilePart:IsA("BasePart") then return end
+-- Initialize and connect
+scanCountryColors()
 
-	-- Resolve target color from the startup cache.
-	-- Do NOT read live tile colors here — tiles may already be repainted by the server,
-	-- and sampling them would corrupt the cache with occupying-country colors.
+-- Task Scheduler Optimization Loop
+local function onHeartbeat(dt)
+	if not next(ActiveTransitions) then return end
+
+	-- Optimization: Calculate all new colors in a single pass
+	local updates = {}
+	local toRemove = {}
+	
+	for part, data in pairs(ActiveTransitions) do
+		data.elapsed += dt
+		local alpha = math.clamp(data.elapsed / TWEEN_TIME, 0, 1)
+		
+		-- Use quadratic out easing: 1 - (1 - x)^2
+		local easeAlpha = 1 - (1 - alpha) * (1 - alpha)
+		local newColor = data.startColor:Lerp(data.targetColor, easeAlpha)
+		
+		updates[part] = newColor
+		
+		if alpha >= 1 then
+			table.insert(toRemove, part)
+		end
+	end
+	
+	-- Apply property changes in a batch
+	for part, color in pairs(updates) do
+		if part.Parent then
+			part.Color = color
+		end
+	end
+	
+	for _, part in ipairs(toRemove) do
+		ActiveTransitions[part] = nil
+	end
+end
+
+RunService.Heartbeat:Connect(onHeartbeat)
+
+local function onTileCaptured(tilePartOrBatch, playerName, countryName)
+	if not tilePartOrBatch or not countryName then return end
+	
 	local targetColor = CountryColors[countryName]
 	if not targetColor then return end
 
-	-- Skip if already the same color
-	if tilePart.Color == targetColor then return end
-
-	-- Cancel any existing tween on this part to avoid stacking/jitter
-	local existing = ActiveTweens[tilePart]
-	if existing then
-		pcall(function()
-			existing:Cancel()
-		end)
-		ActiveTweens[tilePart] = nil
+	local function registerPart(part)
+		if not part:IsA("BasePart") then return end
+		if part.Color == targetColor then return end
+		
+		ActiveTransitions[part] = {
+			startColor = part.Color,
+			targetColor = targetColor,
+			elapsed = 0
+		}
 	end
-
-	-- Create and play the tween
-	local tweenInfo = TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local tween = TweenService:Create(tilePart, tweenInfo, { Color = targetColor })
-
-	-- Track the tween and clear reference when it's done (completed or cancelled)
-	ActiveTweens[tilePart] = tween
-	tween.Completed:Connect(function(_playbackState)
-		-- Only clear if this same tween is still tracked (defensive)
-		if ActiveTweens[tilePart] == tween then
-			ActiveTweens[tilePart] = nil
-		end
-	end)
-
-	tween:Play()
-end
-
--- Main handler: accepts either a single BasePart or a table of BaseParts (batched conquest).
--- Single-part calls come from individual tile captures/releases/reclaims.
--- Batched calls come from performCountryTakeover for efficient network usage.
-local function onTileCaptured(tilePartOrBatch, playerName, countryName)
-	if not tilePartOrBatch or not countryName then return end
 
 	if typeof(tilePartOrBatch) == "table" then
-		-- Batched: array of BaseParts from a country takeover
 		for _, tilePart in ipairs(tilePartOrBatch) do
-			tweenTileColor(tilePart, countryName)
+			registerPart(tilePart)
 		end
 	else
-		-- Single BasePart from individual tile capture/release/reclaim
-		tweenTileColor(tilePartOrBatch, countryName)
+		registerPart(tilePartOrBatch)
 	end
 end
 
--- Initialize and connect
-scanCountryColors()
 TileCapturedEvent.OnClientEvent:Connect(onTileCaptured)
 
-print("[TileVisualEffects] Smooth color transitions active.")
+print("[TileVisualEffects] Batched color transitions active.")
+

@@ -1,404 +1,380 @@
-# Brainstorm Findings Reconciled
-**NPC Combat Retreat System — Reconciliation Pass**
+# NPC Retreat & Recovery System — Design Spec (Final)
+
+## Overview
+
+Replace the current "fight to the death" behavior with a health-threshold-triggered retreat system. NPCs that take enough damage while being attacked disengage combat, walk to the safest available adjacent friendly tile (invulnerable during transit), then enter a vulnerable recovery state (skull GUI visible) until healed past a recovery threshold.
 
 ---
 
-## 1. Contradictions Found
+## Architecture: Hybrid Combat-Loop-Driven (Approach A)
 
-| Contradiction | Why It's a Problem | Corrected Rule |
-|---------------|-------------------|----------------|
-| Document says "Use or extend startRetreat() for combat retreat" but `startRetreat(npcModel, originTileKey, originPosition)` is designed specifically for snap-back to origin tile, not forward movement to a new destination | `startRetreat` sets `targetTileKey = originTileKey` and moves TO the origin. Combat retreat must move AWAY from origin to a safer adjacent tile. These are opposite operations. | **Corrected:** Must create new `startCombatRetreat(npcModel, targetTileKey, targetTilePart)` function that moves NPC to a chosen destination tile (not origin). Cannot reuse existing `startRetreat()` - it's the wrong semantic. |
-| Document says "Add isRetreating() check in getAllTargets()" as if getAllTargets is a module function | `getAllTargets` is NOT a module function. It's an inline anonymous function passed as a callback to `startCombatLoop()` at lines 595 and 673. | **Corrected:** Must add `NPCMovementSystem.isRetreating(target)` check inside the two inline `getAllTargets` callbacks within `Combat.registerNPC()` — one for Attackers (line ~614), one for Defenders (line ~685). |
-| Document says "Intercept damage in fireMultiLaser() before TakeDamage()" but also says "If no valid tile: return false, deal damage, NPC dies" | If we intercept BEFORE TakeDamage, we need to conditionally apply the damage ourselves when retreat fails. The current wording is ambiguous about who applies damage on retreat failure. | **Corrected:** The interception point checks `if damage would drop health ≤ threshold`. If retreat succeeds, skip TakeDamage entirely. If retreat fails OR skull is active, call TakeDamage normally. The interception wrapper applies damage on failure, not the caller. |
-| Document lists "retreatReservations" as a new table but also references "releaseTileReservation" from movement system | The existing `releaseTileReservation` is a private function inside NPCMovementSystem. It operates on `reservedTiles`, not on `retreatReservations`. These are two different reservation systems. | **Corrected:** Combat retreat uses its own `retreatReservations` table in NPCRetreatSystem. This is separate from NPCMovementSystem's `reservedTiles`. When retreat movement starts, occupancy is managed via `TileManager.occupyTileById/releaseTileById`, not via movement reservations. |
+Add a `Combat.tryTriggerRetreat(npcModel)` helper called inside the existing combat loop (after humanoid/health validation, before attack execution for that tick). This keeps the loop readable while centralizing all retreat decision logic in one function.
+
+The combat system **owns** retreat decisions. The movement system **owns** pathing. They coordinate via an `OnRetreatArrived(npcModel)` callback.
 
 ---
 
-## 2. Unsupported or Assumed APIs
+## Thresholds (Constants, Tunable)
 
-| Referenced API | Actually Provided? | Correction |
-|----------------|-------------------|------------|
-| `DiplomacyManager.areCountriesAllied(countryA, countryB)` | **YES** — line 54 of DiplomacyManager.luau | No correction needed. API exists. |
-| `DiplomacyManager.areCountriesAtWar(countryA, countryB)` | **YES** — line 46 of DiplomacyManager.luau | No correction needed. API exists. |
-| `TileManager.occupyTileById(tileId, npcModel)` | **YES** — line 342 of TileManager.luau | No correction needed. API exists. |
-| `TileManager.releaseTileById(tileId)` | **YES** — line 348 of TileManager.luau | No correction needed. API exists. |
-| `NPCMovementSystem.canBeAttacked(npcModel)` | **YES** — line 1210 of NPCMovementSystem.luau. Returns `not isRetreating(npcModel)` | Exists but **NOT CALLED** by NPCCombatSystem. Combat target filtering does not use this function. Must add calls to inline getAllTargets callbacks. |
-| `startCombatRetreat(npcModel, targetTileKey, targetTilePart)` | **NO** — does not exist | **New API to add.** Must be created in NPCMovementSystem. Similar to `startMovement` but sets state to "Retreating" for invulnerability. |
-| `getAllTargets()` as a module function | **NO** — getAllTargets is an inline anonymous function, not a module API | **Remove dependency.** The filtering must be added inside the two inline callbacks at lines 595-626 and 673-696 in NPCCombatSystem.luau. |
+| Constant | Example Value | Purpose |
+|----------|--------------|---------|
+| `RETREAT_THRESHOLD` | 0.30 | Health ratio below which retreat triggers |
+| `RECOVERY_THRESHOLD` | 0.55 | Health ratio above which recovery clears (skull removed, can attack again) |
+| `RETREAT_RETRY_COOLDOWN` | 3–5 seconds | Prevents re-checking retreat every 0.1s tick after a failed attempt |
+
+Single hysteresis pair. No intermediate "re-engage" threshold — the `RECOVERING` state itself is the gameplay lock that prevents attacking until `RECOVERY_THRESHOLD` is crossed.
 
 ---
 
-## 3. Rules That Need Exact Final Wording
+## Unified State Attribute
 
-### Retreat Trigger Rule
-When `fireMultiLaser()` is about to call `targetHumanoid:TakeDamage(damagePerTarget)`, first check: would `(humanoid.Health - damagePerTarget) / humanoid.MaxHealth <= RETREAT_HEALTH_THRESHOLD`? If yes, call `NPCRetreatSystem.attemptRetreat(targetNpcModel)`. If attempt returns true, skip TakeDamage for this target. If attempt returns false, call TakeDamage normally.
+**`RetreatState`: `"None"` | `"Retreating"` | `"Recovering"`** — set on the NPC model as an attribute.
 
-### Damage Interception Rule
-Interception happens inside `fireMultiLaser()` at line 238, wrapping the `TakeDamage` call. The wrapper calculates projected health percentage. If projected health ≤ 10% AND no skull, attempt retreat. On success, skip damage. On failure (no valid tile or skull active), apply damage.
-
-### Post-Retreat Health Rule
-Successful retreat does NOT modify health. The NPC survives at its current health (which is ≤ 10% of max). Natural health regeneration must bring health above 30% to remove the skull.
-
-### Skull Behavior Rule
-After successful retreat: set `hasSkull[npcModel] = true`, show skull BillboardGui, connect `Humanoid.HealthChanged`. While skull is active, retreat is blocked — any damage that would trigger retreat instead kills the NPC. When `health / maxHealth >= SKULL_REMOVAL_THRESHOLD`, remove skull, disconnect HealthChanged connection, and retreat becomes available again.
-
-### Invulnerability Rule
-Invulnerability is achieved by target filtering, not health manipulation. When `movementStates[npc].state == "Retreating"`, the NPC must be excluded from all combat target lists. Add check `if NPCMovementSystem.isRetreating(target) then skip` in both inline getAllTargets callbacks (Attacker at line ~614, Defender at line ~685).
-
-### Valid Destination Territory Rule
-Valid retreat destinations must satisfy: `TileManager.getTileOccupantById(tileId) == nil` (not occupied) AND `retreatReservations[tileId] == nil` (not reserved by another retreating NPC) AND one of: (a) `TileAdjacencyManager.getEffectiveOwner(tile) == npcCountry`, OR (b) `DiplomacyManager.areCountriesAllied(npcCountry, tileOwner)`, OR (c) tile's `OwnerCountry` attribute == npcCountry (conquered territory). Tiles controlled by enemies are invalid.
-
-### No-Capture Rule
-Retreat movement does NOT trigger `TileOwnershipManager` capture logic. When the NPC arrives at the destination tile, update occupancy via `TileManager.occupyTileById(newTileId, npcModel)` and `TileManager.releaseTileById(oldTileId)`, but do NOT call any capture/takeover functions.
-
-### Movement-Failure Retry Rule
-If `startCombatRetreat()` returns false for the best-scored tile, release its reservation from `retreatReservations`, try the next-best tile. Repeat until success or no valid tiles remain. If all tiles fail, `attemptRetreat()` returns false and damage is applied.
-
-### Transit Edge-Case Rule
-If the retreat destination becomes occupied while the NPC is in transit, use existing `startRetreat()` to snap back to origin tile. NPC ends up at origin with skull active. Next lethal damage kills the NPC (skull blocks retreat).
-
-### Cleanup Rule
-On `Humanoid.Died` or `Model.Destroying`: clear `hasSkull[npcModel]`, release any entry in `retreatReservations` where value == npcModel, disconnect and nil `healthChangedConnections[npcModel]`. Hook into existing maid cleanup in `Combat.registerNPC()` or add parallel cleanup in NPCRetreatSystem.
+- This is the **authoritative gameplay state** for retreat/recovery logic, attack blocking, skull GUI, and vulnerability.
+- `NPCMovementSystem` maintains its own internal `movementStates[npc].state` for pathing independently.
+- Both systems coordinate via the `OnRetreatArrived(npcModel)` callback but do not overwrite each other's domain.
 
 ---
 
-## 4. Corrected Decision Table
+## State Machine
 
-| Decision | Final Wording for Draft Use | Confidence |
-|----------|----------------------------|------------|
-| Retreat threshold | `RETREAT_HEALTH_THRESHOLD = 0.10` — retreat triggers when projected health would drop to ≤ 10% | Settled |
-| Skull removal threshold | `SKULL_REMOVAL_THRESHOLD = 0.30` — skull removed when health regenerates to ≥ 30% | Settled |
-| Automatic retreat only | No player input; retreat triggers automatically server-side | Settled |
-| Distance scoring | `(tilePos - enemyPos).Magnitude` for each enemy within scan radius; tile score = minimum distance to any enemy; pick tile with highest score | Settled |
-| Enemy scan radius | `ENEMY_SCAN_RADIUS = 100` studs; only consider enemies within this radius for scoring | Provisional |
-| No capture during retreat | Retreat arrival updates occupancy only, no ownership transfer | Settled |
-| Territory validity | Same-country OR allied OR conquered-by-NPC's-country. No enemy tiles. | Settled |
-| Tie-breaker priority | Same-country > allied > conquered > neutral (if neutral is ever valid) | Provisional |
-| Die if no valid tile | `attemptRetreat()` returns false; damage is applied; NPC dies | Settled |
-| Health unchanged after retreat | NPC keeps current health; must regenerate above 30% | Settled |
-| Skull GUI | BillboardGui with skull ImageLabel visible to all players | Settled |
-| Skull asset | Use placeholder ImageId; finalize during implementation | Provisional |
-| Invulnerability mechanism | Filter retreating NPCs from target lists via `isRetreating()` check | Settled |
-| New startCombatRetreat function | Required in NPCMovementSystem; cannot reuse existing startRetreat | Settled |
-| Separate retreatReservations | New table in NPCRetreatSystem; separate from movement reservations | Settled |
-| Intercept point | Inside `fireMultiLaser()` at line 238, wrapping TakeDamage | Settled |
-| Target filtering location | Inside inline getAllTargets callbacks at lines ~614 and ~685 | Settled |
-| Exhaustion counter | Future enhancement; design API to support later | Settled |
+```
+"None" ──(health < RETREAT_THRESHOLD while being attacked)──> Combat.tryTriggerRetreat()
+    → Selects retreat tile (see Tile Selection section)
+    → ONLY on successful movement start:
+        → Combat.disengageForRetreat(npc)
+        → Set RetreatState = "Retreating"
+        → NPC walks to tile (invulnerable, NO regen during walk)
 
----
+"Retreating" ──(arrival at retreat tile)──> Movement fires OnRetreatArrived(npc)
+    → Set RetreatState = "Recovering"
+    → Enable Health script (regen starts NOW, after arrival)
+    → Show skull BillboardGui (already exists in NPC templates — toggle Enabled = true)
+    → Connect Humanoid.HealthChanged listener
 
-## 5. Corrected Rules Matrix
+"Recovering" ──(HealthChanged: health/maxHealth > RECOVERY_THRESHOLD)──>
+    → Set RetreatState = "None"
+    → Hide skull GUI (Enabled = false)
+    → Disconnect HealthChanged listener
+    → NPC fully operational
 
-| Condition | Expected Behavior |
-|-----------|-------------------|
-| Damage would drop health to ≤10% | Check skull: if no skull → attemptRetreat(); if skull active → apply damage, NPC dies |
-| attemptRetreat() called, no skull | Get adjacent tiles, filter valid, score by enemy distance, try best tile first |
-| Best tile reservation succeeds | Call startCombatRetreat(), set hasSkull, show GUI, connect HealthChanged, return true |
-| Best tile reservation fails | Release, try next tile; repeat until success or exhausted |
-| All tiles invalid/fail | Return false; caller applies damage; NPC dies |
-| Tile is enemy-controlled | Invalid destination; skip during evaluation |
-| Tile is same-country | Valid; highest priority tie-breaker |
-| Tile is allied | Valid; second priority tie-breaker |
-| Tile is conquered (OwnerCountry == npcCountry) | Valid; third priority tie-breaker |
-| Retreat destination occupied | startCombatRetreat returns false; try next tile |
-| Destination becomes occupied during transit | Existing startRetreat() snaps NPC to origin; skull remains; next lethal hit kills |
-| NPC state == "Retreating" | Invulnerable; excluded from all combat target lists |
-| Health regenerates to ≥30% | Skull removed; hasSkull cleared; HealthChanged disconnected; retreat available |
-| Lethal damage while skull active | Retreat blocked; damage applied; NPC dies |
-| NPC dies during retreat (TileOwnershipManager) | Death proceeds; cleanup clears hasSkull, reservations, connections |
-| Retreat completes successfully | Update occupancy via TileManager; state → Idle; skull persists until 30% |
+"Recovering" ──(killed by enemy)──> normal death cleanup
+```
 
 ---
 
-## 6. Safe Assumptions for the First Draft
+## Vulnerability Rules
 
-1. `DiplomacyManager.areCountriesAllied()` and `areCountriesAtWar()` work correctly for all country pairs.
-2. `TileManager.occupyTileById()` and `releaseTileById()` correctly update `GlobalOccupiedTilesById`.
-3. `TileAdjacencyManager.getAdjacentTiles()` returns only walkable adjacent tiles.
-4. `NPCMovementSystem.isRetreating()` returns true when state == "Retreating".
-5. Humanoid.HealthChanged fires reliably during health regeneration.
-6. BillboardGui attached to NPC with Adornee set will render for all players.
-7. The existing maid pattern in Combat.registerNPC() can accommodate additional cleanup callbacks.
-8. `fireMultiLaser()` is the only damage source for NPC-vs-NPC combat (no environmental damage in v1).
+| State | Can Be Attacked | Can Attack / Auto-Retaliate | Can Receive Move Orders |
+|-------|-----------------|----------------------------|------------------------|
+| None | Yes | Yes | Yes |
+| Retreating | **No** (invulnerable) | No | No |
+| Recovering | **Yes** (killable) | **No** | **Yes** |
 
 ---
 
-## 7. Items That Must Be Marked Provisional in the First Draft
+## Retreat Eligibility (Trigger Conditions)
 
-1. **Enemy scan radius (100 studs)** — may need tuning based on map scale and combat feel
-2. **Tie-breaker priority order** — same-country > allied > conquered is a reasonable guess; may need balancing
-3. **Skull GUI ImageId** — placeholder acceptable; finalize with MCP tools
-4. **startCombatRetreat() exact implementation** — signature is clear, but internal details (waypoint handling, arrival detection) depend on reviewing startMovement() internals
-5. **Coordination with existing movement reservations** — may need review if retreat and normal movement can conflict
+Retreat triggers only when **ALL** are true:
+
+1. NPC is alive (`humanoid.Health > 0`)
+2. `RetreatState == "None"` (not already retreating/recovering)
+3. `humanoid.Health / humanoid.MaxHealth < RETREAT_THRESHOLD`
+4. NPC is **being attacked** (not merely initiating):
+   - Defender: `Combat.getAttackerCount(npc) > 0`
+   - Attacker: `Combat.getThreatCount(npc) > 0`
+5. Retreat retry cooldown has expired (if previously failed)
+6. NPC is not in a non-retreat terminal transition
+
+**Requirement #6 satisfied:** An Attacker that initiated combat against a Defender but has NO threats in `attackerThreats` will never trigger retreat, even at low health. The trigger requires being attacked, not merely having low health from initiating.
 
 ---
 
-## 8. Clean Draft-Ready Summary
+## Retreat Tile Selection Algorithm
 
-### System: NPC Combat Retreat System
+### Candidate Generation
+1. Get adjacent tiles via `TileAdjacencyManager.getAdjacentTiles(currentTilePart)`
+2. **Filter to friendly-owned tiles only** — tiles belonging to the NPC's own country, or tiles conquered/occupied by the NPC's country. No allied or neutral territory. Friendly-owned tile checks must use **current tile ownership/control** (runtime game state), not the tile's original geographic country metadata from `TileAdjacencyManager.getTileCountry()`.
 
-**Trigger:** In `fireMultiLaser()` (NPCCombatSystem line 238), before calling `TakeDamage`, check if `(health - damage) / maxHealth <= 0.10`. If yes, call `NPCRetreatSystem.attemptRetreat(npcModel)`. If true, skip damage. If false, apply damage.
+### Scoring
+3. Find all enemy NPCs on tiles adjacent to the NPC's current tile (enemies = NPCs of countries at war with this NPC's country)
+4. Score each candidate by **minimum distance to any enemy NPC position** (higher distance = safer)
+5. **Fallback (no visible enemies):** Treat all valid candidates as equal. Choose by deterministic tie-break order (lowest tileId).
 
-**attemptRetreat(npcModel) → boolean:**
-1. If `hasSkull[npcModel]`, return false
-2. Get current tile via `npcModel:GetAttribute("CurrentTileId")`
-3. Get adjacent tiles via `TileAdjacencyManager.getAdjacentTiles(currentTilePart)`
-4. Filter: not occupied (`TileManager.getTileOccupantById`), not reserved (`retreatReservations`), valid territory (same-country OR allied OR conquered)
-5. Score each by max distance to nearest enemy within 100 studs
-6. Try tiles in score order: reserve in `retreatReservations`, call `startCombatRetreat()`
-7. On success: set `hasSkull[npcModel] = true`, show skull GUI, connect HealthChanged, return true
-8. If all fail: return false
+### Filtering
+6. Remove tiles that are:
+   - Already occupied by another NPC (`TileManager.isTileOccupiedById(tileId)`)
+   - Already reserved by another retreating NPC (`reservedRetreatTiles[tileId] ~= nil`)
 
-**startCombatRetreat(npcModel, targetTileKey, targetTilePart):** New function in NPCMovementSystem. Moves NPC to target tile with state "Retreating" (invulnerable). On arrival: update occupancy via TileManager, set state Idle. If destination occupied mid-transit: use existing `startRetreat()` to snap to origin.
+### Selection (Exhaustive)
+7. Sort valid candidates by score descending (safest first)
+8. Reserve best tile, attempt `NPCMovementSystem.startHealthRetreat(npc, tile)`
+9. If movement start fails:
+   - **Release reservation immediately**
+   - Try next-best candidate
+10. Continue until success or ALL candidates exhausted
+11. **If ALL fail:** Retreat fails entirely. `disengageForRetreat()` is NOT applied. `RetreatState` remains `"None"`. NPC stays in combat. Set retry cooldown.
 
-**Invulnerability:** Add to both inline `getAllTargets` callbacks in Combat.registerNPC():
+---
+
+## Sequencing & Atomicity
+
+Retreat is **transactional** — partial application is never left behind:
+
+```
+Combat.tryTriggerRetreat(npcModel):
+    1. Check all preconditions (eligibility section above)
+    2. Generate + filter + score retreat candidates
+    3. If no candidates → return false, set cooldown
+    4. For each candidate (best-first):
+        a. Reserve tile (reservedRetreatTiles[tileId] = npcModel)
+        b. Attempt NPCMovementSystem.startHealthRetreat(npc, tile)
+        c. If success:
+            → Combat.disengageForRetreat(npc)
+            → npc:SetAttribute("RetreatState", "Retreating")
+            → return true
+        d. If fail:
+            → Release reservation (reservedRetreatTiles[tileId] = nil)
+            → Continue to next candidate
+    5. All exhausted → return false, set cooldown, NPC stays in combat unchanged
+```
+
+**Critical:** `disengageForRetreat()` is ONLY called after movement start succeeds. If all candidates fail, combat state is completely untouched.
+
+---
+
+## Reservation System
+
+**`reservedRetreatTiles[tileId] = npcModel`** — module-level table preventing two NPCs from retreating to the same tile.
+
+### Reservation Release Triggers
+| Event | Action |
+|-------|--------|
+| Successful arrival at retreat tile | Release reservation |
+| Failed movement attempt | Release reservation immediately |
+| NPC death / destruction | Release reservation |
+| Movement cancellation | Release reservation |
+| Ownership transfer / forced cleanup | Release reservation |
+
+---
+
+## Combat.disengageForRetreat(npcModel) — Full Cleanup
+
+1. Clear this NPC's `manualTargets` list
+2. Clear this NPC's own `defenderAttackers` / `attackerThreats` entries
+3. Remove this NPC from **all other NPCs'**:
+   - `manualTargets`
+   - `defenderAttackers`
+   - `attackerThreats`
+4. Set `npcInCombat[npcModel] = false`
+5. Stop any active beam/laser visuals for this NPC
+6. Health script stays **disabled** during retreat walk (re-enabled only on arrival)
+
+---
+
+## Where Attack Commands Are Blocked (Recovering State)
+
+| System | Check Location | Guard |
+|--------|---------------|-------|
+| `NPCTargetingHandler` | Second-click targeting (line ~170) | Reject if `RetreatState == "Recovering"` |
+| `Combat.addManualTarget()` | Entry point | Return early if attacker `RetreatState == "Recovering"` |
+| Combat loop (auto-retaliate) | Before threat/attacker processing | Skip retaliation if `RetreatState == "Recovering"` |
+
+---
+
+## Invulnerability (Retreating State)
+
+Invulnerability is achieved by **target filtering**, not health manipulation:
+- `NPCMovementSystem.canBeAttacked(npc)` already returns `not isRetreating(npc)`
+- Add `isRetreating()` / `canBeAttacked()` checks in the two inline `getAllTargets` callbacks within `Combat.registerNPC()`:
+  - Attacker callback (line ~614)
+  - Defender callback (line ~685)
+
 ```lua
 if NPCMovementSystem.isRetreating(target) then
-    -- skip this target
+    -- skip this target entirely
 end
 ```
-Add at Attacker callback (line ~614) and Defender callback (line ~685).
 
-**Skull Removal:** On HealthChanged, if `health/maxHealth >= 0.30`: `hasSkull[npcModel] = nil`, hide GUI, disconnect connection.
+**Recovering NPCs are NOT invulnerable** — `canBeAttacked()` must return `true` for Recovering state. Only `Retreating` = invulnerable.
 
-**Cleanup:** On Humanoid.Died/Destroying: clear hasSkull, release retreatReservations, disconnect HealthChanged.
+---
 
-**State Tables (NPCRetreatSystem):**
-- `hasSkull: {[Model]: boolean}`
-- `retreatReservations: {[TileId]: Model}`
-- `healthChangedConnections: {[Model]: RBXScriptConnection}`
+## Recovery Monitoring
 
-**Constants:**
-- `RETREAT_HEALTH_THRESHOLD = 0.10`
-- `SKULL_REMOVAL_THRESHOLD = 0.30`
-- `ENEMY_SCAN_RADIUS = 100`
+**On entering RECOVERING state** (OnRetreatArrived callback):
+1. Enable Health script (`setHealthScriptEnabled(npc, true)`) — regen begins
+2. Toggle skull BillboardGui `Enabled = true` (GUI already exists in NPC templates)
+3. Set `npc:SetAttribute("RetreatState", "Recovering")`
+4. Connect `Humanoid.HealthChanged` listener for this NPC only
 
-**Files to Modify:**
-- `src/shared/NPCCombatSystem.luau` — damage interception in fireMultiLaser(), target filtering in inline callbacks
-- `src/shared/NPCMovementSystem.luau` — add startCombatRetreat()
-- **NEW:** `src/shared/NPCRetreatSystem.luau` — attemptRetreat(), skull management, state tables
+**HealthChanged handler:**
+```lua
+if humanoid.Health / humanoid.MaxHealth > RECOVERY_THRESHOLD then
+    npc:SetAttribute("RetreatState", "None")
+    skullGui.Enabled = false
+    disconnect the listener
+end
+```
 
-**Explicit Non-Goals for v1:**
-- Exhaustion counter
-- Player-controlled retreat
+**Listener cleanup triggers:**
+- Normal recovery (health crosses threshold)
+- NPC death
+- NPC destruction (`.Destroying`)
+- Ownership transfer
+- Any forced cleanup/reset
+
+**Retreat retry cooldown cleanup:** Any retreat retry cooldown entry for the NPC must also be cleared on death, destruction, ownership transfer, or forced cleanup.
+
+---
+
+## Skull GUI
+
+The skull `BillboardGui` already exists in both `AttackerNPC` and `DefenderNPC` templates in ReplicatedStorage. Implementation only needs to toggle `Enabled`:
+- `Enabled = true` on entering RECOVERING
+- `Enabled = false` on exiting RECOVERING (or death)
+
+No new GUI creation needed — just show/hide the existing one.
+
+---
+
+## Applies To
+
+- **Both AttackerNPCs and DefenderNPCs** retreat
+- **Both player-owned and country-owned (AI/AutoRetaliate) NPCs** retreat
+- The trigger condition differs by role:
+  - Defender: retreat-eligible only if `Combat.getAttackerCount(npc) > 0`
+  - Attacker: retreat-eligible only if `Combat.getThreatCount(npc) > 0`
+
+---
+
+## State Authority Clarification
+
+| Domain | Authority | Notes |
+|--------|-----------|-------|
+| Retreat/recovery gameplay state | `RetreatState` attribute on NPC model | Authoritative for attack blocking, skull, vulnerability |
+| Movement/pathing state | `NPCMovementSystem.movementStates[npc].state` | Internal to movement system |
+| Combat engagement | `npcInCombat[npc]` in NPCCombatSystem | Cleared by `disengageForRetreat()` |
+
+These never overwrite each other. They coordinate via callback (`OnRetreatArrived`) and API calls.
+
+---
+
+## Integration Points (File Locations)
+
+| File | Changes |
+|------|---------|
+| `src/shared/NPCCombatSystem.luau` | Add `tryTriggerRetreat()`, `disengageForRetreat()`. Reuse existing `Combat.getAttackerCount()` and `Combat.getThreatCount()` (do not re-add). Call `tryTriggerRetreat()` in combat loop (after health validation, before attack execution). Handle `OnRetreatArrived` callback (set Recovering state, enable regen, show skull, attach HealthChanged listener). Block auto-retaliate for Recovering NPCs. Add retreat cooldown tracking. Add `reservedRetreatTiles` table. |
+| `src/shared/NPCMovementSystem.luau` | Add `startHealthRetreat(npc, tilePart)` function (similar to existing movement but sets internal state to "Retreating" for invulnerability). Fire `OnRetreatArrived(npcModel)` callback on arrival. Ensure `canBeAttacked()` returns `true` for Recovering NPCs (only Retreating = invulnerable). |
+| `src/server/NPCTargetingHandler.server.luau` | Guard second-click targeting against `RetreatState == "Recovering"`. |
+| `src/server/NPCSpawner.luau` | Initialize `RetreatState = "None"` attribute on spawn. Add reservation release + HealthChanged listener disconnect to death/destroy cleanup. |
+| `src/shared/TileManager.luau` | No changes (existing occupancy API suffices). |
+| `src/shared/TileAdjacencyManager.luau` | No changes (existing adjacency query API suffices). |
+
+---
+
+## API Surface Used / Added
+
+### In NPCCombatSystem:
+```lua
+Combat.tryTriggerRetreat(npcModel) → boolean   -- NEW
+Combat.disengageForRetreat(npcModel) → void    -- NEW
+Combat.getAttackerCount(npcModel) → number     -- EXISTING (reuse as-is)
+Combat.getThreatCount(npcModel) → number       -- EXISTING (reuse as-is)
+```
+
+### In NPCMovementSystem:
+```lua
+NPCMovementSystem.startHealthRetreat(npcModel, targetTilePart) → (boolean, string?)
+-- Returns (success, errorMsg). Sets internal state to "Retreating".
+-- On arrival: fires OnRetreatArrived callback, updates tile occupancy.
+```
+
+---
+
+## Constants Summary
+
+```lua
+local RETREAT_THRESHOLD = 0.30        -- health ratio to trigger retreat
+local RECOVERY_THRESHOLD = 0.55       -- health ratio to clear recovery
+local RETREAT_RETRY_COOLDOWN = 4.0    -- seconds before retreat can re-attempt after failure
+```
+
+These are placeholder values — tune based on playtesting.
+
+---
+
+## Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| NPC at low health initiates attack (Attacker, no threats) | Does NOT retreat (requirement #6) |
+| Two NPCs try to retreat to same tile simultaneously | Reservation system prevents — second NPC picks next-best tile |
+| All adjacent friendly tiles occupied/reserved | Retreat fails, NPC stays in combat, cooldown set |
+| NPC killed during Recovering state | Normal death cleanup (release reservation, disconnect listener, hide skull) |
+| NPC ownership transferred during Recovering | Clear RetreatState to "None", disconnect listener, hide skull, release reservation |
+| NPC retreating when owner leaves game | Movement completes, enters Recovering normally under new country-owned state |
+| No enemy NPCs visible for scoring | All valid candidates scored equally, picked by deterministic tie-break (lowest tileId) |
+| Enemy attacks Recovering NPC | Allowed — NPC is killable but cannot fight back |
+| Retreat destination becomes occupied during transit | If the reserved retreat destination becomes invalid during transit (e.g. occupied by another NPC), v1 uses the existing movement fallback: the NPC returns to its origin tile and still enters Recovering there. This is an intentional simplification for v1, not a second retreat-candidate search mid-transit. |
+
+---
+
+## Existing Codebase Context (for implementer)
+
+### NPCCombatSystem (`src/shared/NPCCombatSystem.luau`, 927 lines)
+- Combat loop: lines 304–369, runs at `LOOP_WAIT = 0.1s`
+- `DAMAGE = 10` per shot, split among targets
+- `fireMultiLaser()`: line ~238, deals damage
+- `npcInCombat[npcModel]`: boolean combat state
+- `manualTargets[npcModel]`: attacker's target list
+- `defenderAttackers[defenderModel]`: who's attacking a defender
+- `attackerThreats[attackerModel]`: who's counter-attacking an attacker
+- `Combat.clearAllManualTargets()`: clears targets + reciprocal refs
+- Health script control: `setHealthScriptEnabled(npc, bool)` (line 146–155)
+- Death cleanup: `humanoid.Died:Once(...)` (line 134–143)
+
+### NPCMovementSystem (`src/shared/NPCMovementSystem.luau`, 2131 lines)
+- States: `"Idle" | "Moving" | "Retreating"`
+- `isRetreating(npc)`: line 1198–1200
+- `canBeAttacked(npc)`: line 1210–1212, returns `not isRetreating(npc)`
+- Existing `startRetreat()`: line 1987–2036, snaps back to origin (NOT suitable for forward retreat)
+- `startMovement()`: line 1699–1981, moves to adjacent tile
+- Health script disabled during movement (line 1928)
+- Arrival detection: heartbeat at 0.1s intervals
+
+### TileAdjacencyManager (`src/shared/TileAdjacencyManager.luau`, 1800+ lines)
+- `getAdjacentTiles(tilePart)`: returns neighbor list
+- `canNPCsInteract(npcA, npcB)`: adjacency check for combat
+- `getTileId(tilePart)`: get stable TileId
+- `getTileCountry(tilePart)`: get geographic country from hierarchy
+
+### TileManager (`src/shared/TileManager.luau`, 561 lines)
+- `GlobalOccupiedTilesById[tileId]`: authoritative occupancy
+- `isTileOccupiedById(tileId)`: check occupancy
+- `getTileOccupantById(tileId)`: get NPC at tile
+- `occupyTileById(tileId, npcModel)` / `releaseTileById(tileId)`: write occupancy
+
+### NPCSpawner (`src/server/NPCSpawner.luau`, 170 lines)
+- Sets attributes: `TileKey`, `Country`, `CurrentTileId`, `AutoRetaliate`
+- Cleanup pipeline: lines 106–155 (death + destroying handlers)
+- Skull BillboardGui already exists in templates (just needs `Enabled` toggle)
+
+### NPC Attributes (already set on spawn)
+- `TileKey`: string "x,z"
+- `Country`: string
+- `CurrentTileId`: string (stable TileId)
+- `IsMoving`: boolean
+- `AutoRetaliate`: boolean (country-owned only)
+- **NEW:** `RetreatState`: "None" | "Retreating" | "Recovering"
+
+---
+
+## Explicit Non-Goals for v1
+
+- Exhaustion counter (retreat limit)
+- Player-controlled retreat button
 - Chain-retreat during transit
-- Health restoration after retreat
-
----
-
-# Original Consolidation (Preserved Below for Reference)
-
----
-
-Brainstorm Findings Consolidation
-NPC Combat Retreat System — Draft Preparation Document
-1. Executive Summary
-The NPC Combat Retreat System enables NPCs to flee to an adjacent tile instead of dying when health drops to a critical threshold. The system uses a skull-based recovery gate: after retreating, a skull GUI appears over the NPC, blocking further retreats until health regenerates above a recovery threshold. If an NPC reaches the retreat threshold while the skull is active, it dies.
-
-Core behavior flow:
-
-NPC health drops to ≤10% during combat
-If no skull → attempt retreat to safest adjacent tile
-If retreat succeeds → skull appears, NPC is invulnerable during movement
-If no valid tile exists → NPC dies
-If skull is present → NPC dies (cannot retreat again yet)
-When health regenerates to ≥30% → skull disappears, retreat available again
-The system is automatic-only (no player control), uses world-space Euclidean distance for tile scoring, does not trigger capture mechanics, and treats the exhaustion counter as a future enhancement.
-
-2. Confirmed Decisions
-Decision	Reasoning	Implementation Implication
-Retreat threshold: 10% health	Low enough to feel dramatic, high enough to allow escape before death	Configurable constant RETREAT_HEALTH_THRESHOLD = 0.10
-Skull removal threshold: 30% health	Requires meaningful recovery before re-retreat; not too punishing	Configurable constant SKULL_REMOVAL_THRESHOLD = 0.30
-Automatic retreat only	Consistent behavior across all NPCs; no UI complexity	No player input handling required; pure server logic
-World-space Vector3 distance scoring	Fast, deterministic, sufficient for 1-hop adjacent tile decisions	(tilePos - enemyPos).Magnitude per enemy, take minimum
-No capture during retreat	Retreat is defensive escape, not offensive occupation; prevents exploits	Retreat movement must skip TileOwnershipManager capture logic
-No enemy-controlled tiles as destinations	NPCs cannot flee into hostile territory they don't control	Filter out tiles where getEffectiveOwner(tile) ~= npcCountry AND tile is not conquered by NPC's country
-Conquered territory IS allowed	Already-occupied enemy territory is under NPC's country control	Check OwnerCountry attribute matches NPC's country
-Die if no valid tile exists	Clean fallback; no invulnerability exploits	Return false from attemptRetreat(), let death proceed
-Keep current health after retreat	NPC survives at threshold health; must regenerate to remove skull	No health manipulation on retreat success
-Skull visible to all players	Strategic information is public; enemies know who is vulnerable	BillboardGui replicated to all clients
-Skull GUI: new simple design	No existing pattern to follow	Create BillboardGui with skull ImageLabel; use MCP tools
-Humanoid.HealthChanged for skull removal	Event-driven; catches regen outside combat; cheaper than polling	Connect signal, check health/maxHealth >= 0.30, remove skull
-Exhaustion is future enhancement	Keep v1 simple; skull mechanic sufficient for initial balance	Design state model to support exhaustion later; add TODO
-Invulnerability during retreat movement	Retreating NPC must survive transit	Filter retreating NPCs from combat target lists
-3. Provisional Decisions
-Provisional Decision	Why Chosen For Now	What Could Change It
-Intercept damage in fireMultiLaser() before TakeDamage()	Proactive; avoids health restoration; clean integration point	If other damage sources exist (e.g., environmental), may need HealthChanged fallback
-New NPCRetreatSystem module	Isolates retreat logic; lazy-loaded by NPCCombatSystem	Could merge into NPCCombatSystem if scope is small enough
-Separate retreatReservations table	reservedTiles in NPCMovementSystem is private	Could expose reservation API from NPCMovementSystem instead
-Use modified startRetreat() or new startCombatRetreat()	Existing startRetreat() sets state to "Retreating" and handles invulnerability	May need wrapper if existing function is too coupled to snap-back behavior
-Enemy scan limited to 100-stud radius	Optimization; distant enemies don't affect relative tile scoring	May need adjustment based on map scale and NPC density
-Skull state stored in module table + attribute	Table for fast server lookup; attribute for client GUI	Could use attribute-only if client needs are simple
-4. Open Questions Still Not Fully Resolved
-Question	Why It Matters	Temporary Assumption for First Draft
-Exact startRetreat() modification vs. new function	Existing startRetreat() is designed for snap-back to origin tile, not forward movement to a new tile	Assume new startCombatRetreat() wrapper that sets target to chosen tile and delegates to existing movement machinery
-Health regeneration script location/naming	Need to know if it's consistently named "Health" and is a Script	Assume npcModel:FindFirstChild("Health", true) pattern from existing code is reliable
-Skull GUI asset (ImageId)	Need actual skull image for BillboardGui	Use placeholder; finalize asset via MCP tools during implementation
-Connection cleanup on mid-retreat death	If NPC dies during retreat (edge case: TileOwnershipManager kills NPCs on capture), HealthChanged connection must be cleaned	Assume cleanup in unregisterNPC() path; add explicit handling in NPCRetreatSystem
-Should allied territory be preferred over neutral?	Tile scoring tie-breaker priority	Assume: same-country > allied > conquered > neutral; implement as secondary sort
-5. Rejected Alternatives
-Rejected Option	Why Rejected	Future Enhancement?
-Player-ordered retreat	Adds UI complexity; automatic is simpler and consistent	Possibly, if players request more control
-Graph-hop distance scoring	Expensive BFS per enemy; overkill for adjacent-only retreat	No — Euclidean is sufficient
-Retreat to any enemy tile	Exploitable; illogical (fleeing into hostile territory)	No
-Chain-retreat during transit	Overly complex; destination changes mid-movement are bug-prone	No
-Temporary invulnerability on no-tile fallback	Creates exploit potential; user chose death-if-trapped	Possibly, as a "last stand" mechanic
-Health restore after retreat	User chose keep-current-health with skull recovery gate	Possibly, as a medic/healing feature
-Exhaustion counter in v1	Adds balancing complexity; skull mechanic is sufficient	Yes — design API to support it
-Poll health in combat loop for skull removal	Wasteful; NPC may regenerate outside combat	No — event-driven is better
-Intercept at Humanoid.Died	Health already 0; must restore it; races with Debris timer	No — pre-damage interception is cleaner
-6. Rules Matrix
-Condition	Expected Behavior
-Lethal damage reached (health would drop ≤10%)	Check skull state; if no skull → attempt retreat; if skull present → allow death
-Retreat available (no skull, health ≤10%)	Evaluate adjacent tiles, pick safest, reserve it, start retreat movement
-No valid retreat tile exists	Retreat fails; NPC dies normally
-Tile is enemy-controlled (not conquered by NPC's country)	Invalid retreat destination; skip during tile evaluation
-Tile is friendly (same country)	Valid retreat destination; highest priority in tie-breaker
-Tile is allied	Valid retreat destination; second priority in tie-breaker
-Tile is conquered enemy territory (OwnerCountry == NPC's country)	Valid retreat destination; third priority in tie-breaker
-Tile is neutral/unowned	Valid retreat destination; lowest priority in tie-breaker
-Tile capture during retreat	Disabled; retreat movement does NOT trigger TileOwnershipManager capture logic
-Retreat while skull is active	Retreat blocked; NPC dies
-Health regen above 30% threshold	Skull removed; hasSkull[npc] = nil; hide skull GUI; retreat available again
-Repeated retreat attempts (after skull removal)	Allowed; no limit in v1 (exhaustion is future enhancement)
-Retreat destination conflict (two NPCs pick same tile)	First to reserve wins; second NPC tries next-best tile; if none available, dies
-Movement start failure after tile selection	Release reservation, try next-best tile; if all fail, NPC dies
-Destination becomes unsafe during transit	Continue to destination; on arrival, if occupied, snap back to origin via existing startRetreat() logic; NPC now at origin with skull; next lethal hit kills
-NPC is retreating (state == "Retreating")	NPC is invulnerable; filtered out of all combat target lists
-NPC killed by TileOwnershipManager during retreat	Death proceeds; cleanup connections in unregisterNPC() path
-7. Data / State Model Implied by the Brainstorm
-Name	Scope	Purpose	Cleanup Point	Required for v1
-hasSkull: {[Model]: boolean}	NPCRetreatSystem module	Tracks which NPCs have active skull state	Humanoid.Died, Model.Destroying, unregisterNPC()	Yes
-retreatReservations: {[TileId]: Model}	NPCRetreatSystem module	Prevents multiple NPCs claiming same retreat tile	Retreat completion, retreat failure, NPC death	Yes
-healthChangedConnections: {[Model]: RBXScriptConnection}	NPCRetreatSystem module	Stores HealthChanged connection for skull removal monitoring	Humanoid.Died, Model.Destroying, skull removal	Yes
-exhaustionCount: {[Model]: number}	NPCRetreatSystem module	Tracks retreat count for future exhaustion mechanic	N/A	No (future)
-RETREAT_HEALTH_THRESHOLD: number	Constant	Configurable retreat trigger (0.10)	N/A	Yes
-SKULL_REMOVAL_THRESHOLD: number	Constant	Configurable skull removal trigger (0.30)	N/A	Yes
-IsRetreatingCombat: Attribute	NPC Model	Optional attribute for client-side skull GUI visibility	Retreat completion, NPC death	Maybe (if needed for client)
-8. Integration Points with Existing Systems
-NPCCombatSystem
-What Needs to Happen	What Should NOT Change	Risks Identified
-Modify fireMultiLaser() to check if damage would trigger retreat before calling TakeDamage()	Core combat loop structure; damage splitting logic	Invasive change to hot path; must preserve existing behavior for non-retreat cases
-Add NPCMovementSystem.isRetreating(target) check in getAllTargets() for both Attacker and Defender loops	Target validation logic for adjacency, diplomacy	Must not break existing target filtering
-Lazy-load NPCRetreatSystem to avoid circular dependency	Existing lazy-load pattern	None
-NPCMovementSystem
-What Needs to Happen	What Should NOT Change	Risks Identified
-Use or extend startRetreat() for combat retreat movement, OR create startCombatRetreat()	Existing startRetreat() behavior for snap-back	Must ensure state is set to "Retreating" for invulnerability
-isRetreating() already returns correct state	N/A	None — already works
-canBeAttacked() exists but is not used by combat loop	N/A	Consider deprecating or documenting
-TileAdjacencyManager
-What Needs to Happen	What Should NOT Change	Risks Identified
-Call getAdjacentTiles(tilePart) to get retreat candidates	Adjacency graph; walkability guarantees	None — read-only usage
-Call getEffectiveOwner(tilePart) for territory filtering	N/A	None
-Call getTileId(tilePart) for reservation keying	N/A	None
-TileManager
-What Needs to Happen	What Should NOT Change	Risks Identified
-Call getTileOccupantById(tileId) to check if tile is occupied	N/A	None
-Call occupyTileById() / releaseTileById() on retreat completion	Existing occupancy tracking	Must coordinate with movement system's tile updates
-DiplomacyManager
-What Needs to Happen	What Should NOT Change	Risks Identified
-Call areCountriesAllied(countryA, countryB) for ally territory detection	N/A	None
-Possibly call areCountriesAtWar() for enemy detection during scoring	N/A	None
-NPCTargetingHandler
-What Needs to Happen	What Should NOT Change	Risks Identified
-Already blocks targeting of retreating NPCs via canBeAttacked()	N/A	None — no changes needed
-Death Pipeline / Humanoid.Died
-What Needs to Happen	What Should NOT Change	Risks Identified
-NPCRetreatSystem must clean up hasSkull, retreatReservations, healthChangedConnections on death	Existing cleanup order in setupDeathCleanup()	Must hook into maid or register separate cleanup
-If retreat intercepts death, Humanoid.Died should NOT fire	Existing pipeline	Must prevent health from reaching 0, not restore it after
-Health Regeneration Handling
-What Needs to Happen	What Should NOT Change	Risks Identified
-Connect Humanoid.HealthChanged after successful retreat	N/A	Connection must be stored and cleaned up
-Check health/maxHealth >= SKULL_REMOVAL_THRESHOLD on each change	N/A	Must handle edge case where NPC is damaged again before threshold
-Disconnect and remove skull when threshold reached	N/A	None
-9. Likely v1 Scope
-Must Be in v1
-Retreat trigger at configurable health threshold (10%)
-Skull state tracking and GUI display
-Skull removal at configurable health threshold (30%)
-Adjacent tile evaluation with occupancy filtering
-World-space distance scoring
-Retreat reservation system
-Invulnerability during retreat (target list filtering)
-Territory filtering (friendly/allied/conquered only)
-No-capture rule during retreat
-Die-if-trapped fallback
-Cleanup on NPC death
-Should Probably Be in v1
-Tile ownership tie-breaker (friendly > allied > conquered > neutral)
-Enemy scan radius optimization (100 studs)
-Debug logging for retreat events
-Can Wait Until Later
-Fine-tuned skull GUI visual design (placeholder acceptable)
-Performance profiling of enemy scan
-Metrics/analytics for retreat frequency
-Explicit Future Enhancements
-Exhaustion counter: Track retreat count; after N retreats, NPC cannot retreat
-Player-controlled retreat: Manual retreat order for player-owned NPCs
-Retreat priority: High-value NPCs retreat first in simultaneous scenarios
-Retreat sound/VFX: Audio/visual feedback on retreat trigger
-10. Drafting Notes for the First Implementation Plan
-Treat as Settled
-All items in Section 2 (Confirmed Decisions)
-Rules Matrix behaviors
-Integration points with existing systems
-v1 scope boundaries
-Label as Provisional in First Draft
-Exact function signature for startCombatRetreat() vs. modified startRetreat()
-Enemy scan radius (100 studs — may need tuning)
-Skull GUI asset ID (placeholder)
-Tie-breaker priority order (reasonable default, may need balancing)
-Areas Needing Careful Wording
-Damage interception point: Must be crystal clear that retreat check happens BEFORE TakeDamage() is called, not after
-Invulnerability mechanism: Clarify this is achieved by filtering, not by health manipulation
-Reservation vs. movement failure: Explain the retry-next-tile flow explicitly
-Transit edge cases: State clearly that destination changes during transit are ignored
-Prioritize Simplicity
-Single module (NPCRetreatSystem) for all new logic
-Minimal changes to existing systems (filter additions, not restructuring)
-No new events/signals unless absolutely necessary
-No client-side logic beyond skull GUI visibility
-11. Ready-to-Transfer Design Summary
-For GPT-5 Implementation Plan Draft:
-
-System: NPC Combat Retreat System
-
-Trigger: When fireMultiLaser() in NPCCombatSystem would deal damage that drops an NPC's health to ≤10%, check skull state. If no skull, call NPCRetreatSystem.attemptRetreat(npcModel) instead of dealing damage.
-
-Retreat Logic (NPCRetreatSystem.attemptRetreat):
-
-Get adjacent tiles via TileAdjacencyManager.getAdjacentTiles(currentTilePart)
-Filter: not occupied (TileManager.getTileOccupantById), not reserved (retreatReservations), valid territory (same country OR allied OR conquered)
-Score each by minimum Euclidean distance to any enemy NPC within 100 studs
-Tie-break: same-country > allied > conquered > neutral
-Reserve best tile: retreatReservations[tileId] = npcModel
-Call movement: NPCMovementSystem.startCombatRetreat(npcModel, tileKey, tilePart)
-Set skull state: hasSkull[npcModel] = true, show skull BillboardGui
-Connect Humanoid.HealthChanged to monitor for skull removal at ≥30%
-Return true (retreat succeeded, skip damage)
-If no valid tile: return false (retreat failed, deal damage, NPC dies)
-
-Invulnerability: Add to getAllTargets() in both Attacker and Defender combat loops: if NPCMovementSystem.isRetreating(target) then skip
-
-Skull Removal: On HealthChanged, if health/maxHealth >= 0.30: hasSkull[npcModel] = nil, hide GUI, disconnect connection
-
-Cleanup: On Humanoid.Died or Model.Destroying: clear hasSkull, release retreatReservations if any, disconnect HealthChanged connection
-
-Territory Rules: No capture during retreat. Only retreat to: own country tiles, allied tiles, conquered enemy tiles (OwnerCountry == NPC's country). No retreat to enemy-controlled tiles.
-
-State Tables:
-
-hasSkull: {[Model]: boolean}
-retreatReservations: {[TileId]: Model}
-healthChangedConnections: {[Model]: RBXScriptConnection}
-Constants:
-
-RETREAT_HEALTH_THRESHOLD = 0.10
-SKULL_REMOVAL_THRESHOLD = 0.30
-ENEMY_SCAN_RADIUS = 100
-Files to Modify:
-
-src/shared/NPCCombatSystem.luau — damage interception, target filtering
-src/shared/NPCMovementSystem.luau — add startCombatRetreat() or modify startRetreat()
-NEW: src/shared/NPCRetreatSystem.luau — core retreat logic
-Exhaustion: Future enhancement. Design state to support exhaustionCount later.
+- Different thresholds per NPC type
+- Retreat sound/VFX beyond skull GUI
+- Allied territory as valid retreat destination
