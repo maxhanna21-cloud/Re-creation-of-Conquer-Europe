@@ -6,25 +6,25 @@
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "$ignoreUnknownInstances": true,
-      "DiplomacyManager": { "$path": "src/shared/DiplomacyManager.luau" },
-      "NPCCombatSystem": { "$path": "src/shared/NPCCombatSystem.luau" },
-      "NPCMovementSystem": { "$path": "src/shared/NPCMovementSystem.luau" },
-      "ServerState": { "$path": "src/shared/ServerState.luau" },
-      "TileAdjacencyManager": { "$path": "src/shared/TileAdjacencyManager.luau" },
-      "TileKeyUtils": { "$path": "src/shared/TileKeyUtils.luau" },
-      "TileManager": { "$path": "src/shared/TileManager.luau" },
-      "TileOwnershipManager": { "$path": "src/shared/TileOwnershipManager.luau" },
-      "UnitManager": { "$path": "src/shared/UnitManager.luau" },
-      "Auto-Fix": { "$path": "src/server/Auto-Fix.server.luau" },
-      "CollisionSetup": { "$path": "src/server/CollisionSetup.server.luau" },
-      "CountryManager": { "$path": "src/server/CountryManager.server.luau" },
-      "Diagnostics": { "$path": "src/server/Diagnostics.server.luau" },
-      "DiplomacyServer": { "$path": "src/server/DiplomacyServer.server.luau" },
-      "Leaderstats": { "$path": "src/server/Leaderstats.server.luau" },
-      "CountryNPCRegistry": { "$path": "src/server/CountryNPCRegistry.luau" },
-      "NPCPurchaseHandler": { "$path": "src/server/NPCPurchaseHandler.server.luau" },
-      "NPCSpawner": { "$path": "src/server/NPCSpawner.luau" },
-      "NPCTargetingHandler": { "$path": "src/server/NPCTargetingHandler.server.luau" }
+      "DiplomacyManager": { "$path": "src/shared/DiplomacyManager.lua" },
+      "NPCCombatSystem": { "$path": "src/shared/NPCCombatSystem.lua" },
+      "NPCMovementSystem": { "$path": "src/shared/NPCMovementSystem.lua" },
+      "ServerState": { "$path": "src/shared/ServerState.lua" },
+      "TileAdjacencyManager": { "$path": "src/shared/TileAdjacencyManager.lua" },
+      "TileKeyUtils": { "$path": "src/shared/TileKeyUtils.lua" },
+      "TileManager": { "$path": "src/shared/TileManager.lua" },
+      "TileOwnershipManager": { "$path": "src/shared/TileOwnershipManager.lua" },
+      "UnitManager": { "$path": "src/shared/UnitManager.lua" },
+      "Auto-Fix": { "$path": "src/server/Auto-Fix.server.lua" },
+      "CollisionSetup": { "$path": "src/server/CollisionSetup.server.lua" },
+      "CountryManager": { "$path": "src/server/CountryManager.server.lua" },
+      "Diagnostics": { "$path": "src/server/Diagnostics.server.lua" },
+      "DiplomacyServer": { "$path": "src/server/DiplomacyServer.server.lua" },
+      "Leaderstats": { "$path": "src/server/Leaderstats.server.lua" },
+      "CountryNPCRegistry": { "$path": "src/server/CountryNPCRegistry.lua" },
+      "NPCPurchaseHandler": { "$path": "src/server/NPCPurchaseHandler.server.lua" },
+      "NPCSpawner": { "$path": "src/server/NPCSpawner.lua" },
+      "NPCTargetingHandler": { "$path": "src/server/NPCTargetingHandler.server.lua" }
     },
     "StarterPlayer": {
       "StarterPlayerScripts": {
@@ -39,7 +39,7 @@
       "BuyNPCGui": {
         "$className": "ScreenGui",
         "$ignoreUnknownInstances": true,
-        "BuyNPCGui": { "$path": "src/client/BuyNPCGui.client.luau" }
+        "BuyNPCGui": { "$path": "src/client/BuyNPCGui.client.lua" }
       },
       "CountrySelectionScreen": {
         "$className": "ScreenGui",
@@ -47,17 +47,17 @@
           "Enabled": false
         },
         "$ignoreUnknownInstances": true,
-        "CountrySelectionScreen": { "$path": "src/client/CountrySelectionScreen.client.luau" }
+        "CountrySelectionScreen": { "$path": "src/client/CountrySelectionScreen.client.lua" }
       },
       "DiplomacyGui": {
         "$className": "ScreenGui",
         "$ignoreUnknownInstances": true,
-        "DiplomacyGui": { "$path": "src/client/DiplomacyGui.client.luau" }
+        "DiplomacyGui": { "$path": "src/client/DiplomacyGui.client.lua" }
       },
       "NotificationGui": {
         "$className": "ScreenGui",
         "$ignoreUnknownInstances": true,
-        "NotificationGui": { "$path": "src/client/NotificationGui.client.luau" }
+        "NotificationGui": { "$path": "src/client/NotificationGui.client.lua" }
       }
     }
   }

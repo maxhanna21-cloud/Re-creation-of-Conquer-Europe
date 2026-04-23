@@ -94,26 +94,35 @@ Retreat triggers only when **ALL** are true:
 
 ### Candidate Generation
 1. Get adjacent tiles via `TileAdjacencyManager.getAdjacentTiles(currentTilePart)`
-2. **Filter to friendly-owned tiles only** — tiles belonging to the NPC's own country, or tiles conquered/occupied by the NPC's country. No allied or neutral territory. Friendly-owned tile checks must use **current tile ownership/control** (runtime game state), not the tile's original geographic country metadata from `TileAdjacencyManager.getTileCountry()`.
+2. **Filter to friendly-owned tiles only** — tiles currently controlled by the NPC's country. Use `TileOwnershipManager.tileEffectivelyBelongsTo(tilePart, npcCountry)` as the authoritative check. This function checks the `OwnerCountry` attribute (set on capture/annexation), falls back to geographic Model parent for uncaptured home territory, and checks the `OccupiedTerritories` table. No allied or neutral territory qualifies. Do NOT use `TileAdjacencyManager.getTileCountry()` — that returns the geographic/original country, ignoring runtime ownership changes.
 
 ### Scoring
-3. Find all enemy NPCs on tiles adjacent to the NPC's current tile (enemies = NPCs of countries at war with this NPC's country)
-4. Score each candidate by **minimum distance to any enemy NPC position** (higher distance = safer)
-5. **Fallback (no visible enemies):** Treat all valid candidates as equal. Choose by deterministic tie-break order (lowest tileId).
+3. For each candidate tile, compute a **safety score**:
+   - Get the candidate tile's center position via `TileAdjacencyManager.getSafeCenter(candidateTilePart)` (returns a `Vector3`)
+   - Get the set of tiles adjacent to the **NPC's current tile** (already computed in step 1) — NOT adjacent to the candidate
+   - For each adjacent tile, check `TileManager.getTileOccupantById(tileId)` to find occupying NPCs
+   - Filter to enemy NPCs only (NPCs whose `Country` attribute belongs to a country at war with the retreating NPC's country, checked via `DiplomacyManager.areCountriesAtWar(npcCountry, enemyCountry)`)
+   - For each enemy NPC found, compute world-space Euclidean distance from candidate tile center to enemy NPC's `HumanoidRootPart.Position`
+   - Candidate score = **minimum such distance** (higher = safer). If no enemies found on adjacent tiles, score = `math.huge`
+4. **No line-of-sight check.** Distance is purely Euclidean in world space.
+5. **The NPC's current tile is NOT a valid retreat candidate** (it is where the NPC is being attacked).
+
+### Fallback (no enemies on adjacent tiles)
+6. If all candidates score `math.huge` (no enemies on any adjacent tile), treat all valid candidates as equal. Sort by `tileId` ascending, pick the first (deterministic tie-break).
 
 ### Filtering
-6. Remove tiles that are:
+7. Remove tiles that are:
    - Already occupied by another NPC (`TileManager.isTileOccupiedById(tileId)`)
    - Already reserved by another retreating NPC (`reservedRetreatTiles[tileId] ~= nil`)
 
 ### Selection (Exhaustive)
-7. Sort valid candidates by score descending (safest first)
-8. Reserve best tile, attempt `NPCMovementSystem.startHealthRetreat(npc, tile)`
-9. If movement start fails:
-   - **Release reservation immediately**
-   - Try next-best candidate
-10. Continue until success or ALL candidates exhausted
-11. **If ALL fail:** Retreat fails entirely. `disengageForRetreat()` is NOT applied. `RetreatState` remains `"None"`. NPC stays in combat. Set retry cooldown.
+8. Sort valid candidates by score descending (safest first)
+9. Reserve best tile, attempt `NPCMovementSystem.startHealthRetreat(npc, tile)`
+10. If movement start fails:
+    - **Release reservation immediately**
+    - Try next-best candidate
+11. Continue until success or ALL candidates exhausted
+12. **If ALL fail:** Retreat fails entirely. `disengageForRetreat()` is NOT applied. `RetreatState` remains `"None"`. NPC stays in combat. Set retry cooldown.
 
 ---
 
@@ -145,16 +154,45 @@ Combat.tryTriggerRetreat(npcModel):
 
 ## Reservation System
 
-**`reservedRetreatTiles[tileId] = npcModel`** — module-level table preventing two NPCs from retreating to the same tile.
+### Data Structures (both in NPCCombatSystem, module-level)
+
+```lua
+local reservedRetreatTiles = {}  -- [tileId] = npcModel (forward lookup)
+local npcReservedTile = {}       -- [npcModel] = tileId (reverse lookup)
+```
+
+### Centralized Helpers
+
+All reservation writes MUST go through these two functions. No direct table manipulation elsewhere.
+
+```lua
+local function reserveRetreatTile(npcModel, tileId)
+    reservedRetreatTiles[tileId] = npcModel
+    npcReservedTile[npcModel] = tileId
+end
+
+local function releaseRetreatReservation(npcModel)
+    local tileId = npcReservedTile[npcModel]
+    if tileId then
+        reservedRetreatTiles[tileId] = nil
+    end
+    npcReservedTile[npcModel] = nil
+end
+```
 
 ### Reservation Release Triggers
-| Event | Action |
-|-------|--------|
-| Successful arrival at retreat tile | Release reservation |
-| Failed movement attempt | Release reservation immediately |
-| NPC death / destruction | Release reservation |
-| Movement cancellation | Release reservation |
-| Ownership transfer / forced cleanup | Release reservation |
+
+All of the following call `releaseRetreatReservation(npcModel)` — never release by tileId directly:
+
+| Event | Location |
+|-------|----------|
+| Successful arrival at retreat tile | `OnRetreatArrived` callback |
+| Failed movement attempt | `tryTriggerRetreat()` candidate loop |
+| NPC death / destruction | `Combat.cleanupRetreatState(npcModel)` called from NPCSpawner cleanup, and also from `Combat.unregisterNPC()` as defense-in-depth |
+| Movement cancellation | `NPCMovementSystem` internal cleanup |
+| Ownership transfer / forced cleanup | `Combat.transferOwnership()` |
+
+The reverse lookup `npcReservedTile[npcModel]` makes cleanup safe — any code path that has the NPC reference can release without searching for which tileId to clear.
 
 ---
 
@@ -180,6 +218,20 @@ Combat.tryTriggerRetreat(npcModel):
 | `Combat.addManualTarget()` | Entry point | Return early if attacker `RetreatState == "Recovering"` |
 | Combat loop (auto-retaliate) | Before threat/attacker processing | Skip retaliation if `RetreatState == "Recovering"` |
 
+### Catch-All Rule
+
+The three guards above are the **known entry points as of this spec**. The broader rule is:
+
+**ANY server-side code path that could result in this NPC initiating offensive combat MUST check `RetreatState` before proceeding.** If `RetreatState == "Retreating"` or `RetreatState == "Recovering"`, the attack command must be rejected. Note: this rule applies to the NPC *initiating* attacks — Recovering NPCs are still valid *targets* for other NPCs (they are killable, just cannot fight back).
+
+This includes but is not limited to:
+- `Combat.addManualTarget()` — reject if attacker is Retreating or Recovering
+- `Combat.noteHit()` — must not enqueue or trigger retaliation for an NPC whose `RetreatState` is `"Retreating"` or `"Recovering"`
+- `NPCTargetingHandler` second-click — reject if attacker is Retreating or Recovering
+- Any future attack entry point added to the codebase
+
+When adding new attack vectors, implementers MUST add a `RetreatState` guard. Document this rule as a comment at the top of `Combat.addManualTarget()` for discoverability.
+
 ---
 
 ## Invulnerability (Retreating State)
@@ -195,6 +247,21 @@ if NPCMovementSystem.isRetreating(target) then
     -- skip this target entirely
 end
 ```
+
+### Damage-Time Guard (Required)
+
+Target filtering in `getAllTargets` is necessary but **not sufficient**. A target can begin retreating after the target list is built but before `fireMultiLaser()` applies damage in the same tick. To close this gap:
+
+**Inside `fireMultiLaser()`** (line ~233 of `NPCCombatSystem.luau`), before calling `targetHumanoid:TakeDamage()`, add:
+
+```lua
+local targetNpcModel = targetHumanoid.Parent
+if targetNpcModel and targetNpcModel:GetAttribute("RetreatState") == "Retreating" then
+    continue -- skip damage, NPC became invulnerable since target list was built
+end
+```
+
+This is the **last line of defense** — even if all upstream filters work correctly, this guard prevents same-tick race damage.
 
 **Recovering NPCs are NOT invulnerable** — `canBeAttacked()` must return `true` for Recovering state. Only `Retreating` = invulnerable.
 
@@ -217,12 +284,27 @@ if humanoid.Health / humanoid.MaxHealth > RECOVERY_THRESHOLD then
 end
 ```
 
+**Re-entrancy guard:** Before connecting a new `HealthChanged` listener, check if one is already connected for this NPC via a `recoveryConnections[npcModel]` table. If so, disconnect the old one first. This prevents listener stacking if a logic bug causes double entry into Recovering state.
+
+```lua
+-- In OnRetreatArrived callback:
+if recoveryConnections[npcModel] then
+    recoveryConnections[npcModel]:Disconnect()
+    recoveryConnections[npcModel] = nil
+end
+recoveryConnections[npcModel] = humanoid.HealthChanged:Connect(function(newHealth)
+    -- ... recovery check ...
+end)
+```
+
 **Listener cleanup triggers:**
 - Normal recovery (health crosses threshold)
 - NPC death
 - NPC destruction (`.Destroying`)
 - Ownership transfer
 - Any forced cleanup/reset
+
+All cleanup paths must call `recoveryConnections[npcModel]:Disconnect()` and set `recoveryConnections[npcModel] = nil`.
 
 **Retreat retry cooldown cleanup:** Any retreat retry cooldown entry for the NPC must also be cleared on death, destruction, ownership transfer, or forced cleanup.
 
@@ -260,14 +342,30 @@ These never overwrite each other. They coordinate via callback (`OnRetreatArrive
 
 ---
 
+## OnRetreatArrived Callback Contract
+
+**Registration:** `NPCCombatSystem` sets exactly one callback handler via `NPCMovementSystem.OnRetreatArrived = function(npcModel) ... end` during module initialization (not per-NPC). This is a **module-level function reference**, not a BindableEvent or per-NPC signal.
+
+**Invocation:** `NPCMovementSystem.startHealthRetreat()` calls `OnRetreatArrived(npcModel)` exactly once when the NPC arrives at the retreat tile. The movement system must NOT call it more than once per retreat (guard with a `retreatCallbackFired` flag per movement session).
+
+**Idempotency and safety guards:** The callback implementation in NPCCombatSystem MUST:
+1. Verify `npcModel.Parent ~= nil` (NPC not destroyed during transit)
+2. Verify humanoid exists and `humanoid.Health > 0` (NPC not killed during transit)
+3. Verify `npcModel:GetAttribute("RetreatState") == "Retreating"` (not already transitioned by cleanup)
+4. If any guard fails: release retreat tile reservation, clean up, and return without entering Recovering state
+
+**Destruction during transit:** If the NPC is destroyed before arrival, the movement system's existing cleanup (via `.Destroying` connection) must release the retreat reservation. The callback must NOT fire for destroyed NPCs.
+
+---
+
 ## Integration Points (File Locations)
 
 | File | Changes |
 |------|---------|
-| `src/shared/NPCCombatSystem.luau` | Add `tryTriggerRetreat()`, `disengageForRetreat()`. Reuse existing `Combat.getAttackerCount()` and `Combat.getThreatCount()` (do not re-add). Call `tryTriggerRetreat()` in combat loop (after health validation, before attack execution). Handle `OnRetreatArrived` callback (set Recovering state, enable regen, show skull, attach HealthChanged listener). Block auto-retaliate for Recovering NPCs. Add retreat cooldown tracking. Add `reservedRetreatTiles` table. |
+| `src/shared/NPCCombatSystem.luau` | Add `tryTriggerRetreat()`, `disengageForRetreat()`. Reuse existing `Combat.getAttackerCount()` and `Combat.getThreatCount()` (do not re-add). Call `tryTriggerRetreat()` in combat loop (after health validation, before attack execution). Handle `OnRetreatArrived` callback (set Recovering state, enable regen, show skull, attach HealthChanged listener). Block auto-retaliate for Recovering NPCs. Add retreat cooldown tracking. Add `reservedRetreatTiles` + `npcReservedTile` tables with centralized `reserveRetreatTile()`/`releaseRetreatReservation()` helpers. Add `recoveryConnections` table. Add damage-time guard in `fireMultiLaser()`. Add public `cleanupRetreatState(npcModel)` API (wraps `releaseRetreatReservation` + `recoveryConnections` disconnect + skull hide). In `unregisterNPC()`: call `cleanupRetreatState(npcModel)` as defense-in-depth. |
 | `src/shared/NPCMovementSystem.luau` | Add `startHealthRetreat(npc, tilePart)` function (similar to existing movement but sets internal state to "Retreating" for invulnerability). Fire `OnRetreatArrived(npcModel)` callback on arrival. Ensure `canBeAttacked()` returns `true` for Recovering NPCs (only Retreating = invulnerable). |
 | `src/server/NPCTargetingHandler.server.luau` | Guard second-click targeting against `RetreatState == "Recovering"`. |
-| `src/server/NPCSpawner.luau` | Initialize `RetreatState = "None"` attribute on spawn. Add reservation release + HealthChanged listener disconnect to death/destroy cleanup. |
+| `src/server/NPCSpawner.luau` | Initialize `RetreatState = "None"` attribute on spawn. In death/destroy cleanup: call `Combat.cleanupRetreatState(npcModel)` (a public API that internally calls `releaseRetreatReservation`, disconnects `recoveryConnections`, and hides skull GUI). NPCSpawner must NOT directly access Combat's internal tables. |
 | `src/shared/TileManager.luau` | No changes (existing occupancy API suffices). |
 | `src/shared/TileAdjacencyManager.luau` | No changes (existing adjacency query API suffices). |
 
@@ -277,10 +375,11 @@ These never overwrite each other. They coordinate via callback (`OnRetreatArrive
 
 ### In NPCCombatSystem:
 ```lua
-Combat.tryTriggerRetreat(npcModel) → boolean   -- NEW
-Combat.disengageForRetreat(npcModel) → void    -- NEW
-Combat.getAttackerCount(npcModel) → number     -- EXISTING (reuse as-is)
-Combat.getThreatCount(npcModel) → number       -- EXISTING (reuse as-is)
+Combat.tryTriggerRetreat(npcModel) → boolean       -- NEW
+Combat.disengageForRetreat(npcModel) → void        -- NEW
+Combat.cleanupRetreatState(npcModel) → void        -- NEW (public API for external cleanup: resets RetreatState to "None", releases reservation, disconnects recovery listener, hides skull, clears cooldown. Idempotent — safe to call multiple times, must not error if no reservation/listener/skull/cooldown state currently exists.)
+Combat.getAttackerCount(npcModel) → number         -- EXISTING (reuse as-is)
+Combat.getThreatCount(npcModel) → number           -- EXISTING (reuse as-is)
 ```
 
 ### In NPCMovementSystem:
@@ -288,6 +387,11 @@ Combat.getThreatCount(npcModel) → number       -- EXISTING (reuse as-is)
 NPCMovementSystem.startHealthRetreat(npcModel, targetTilePart) → (boolean, string?)
 -- Returns (success, errorMsg). Sets internal state to "Retreating".
 -- On arrival: fires OnRetreatArrived callback, updates tile occupancy.
+```
+
+### In TileOwnershipManager (existing, no changes):
+```lua
+TileOwnershipManager.tileEffectivelyBelongsTo(tilePart, countryName) → boolean  -- EXISTING (retreat tile filtering)
 ```
 
 ---
@@ -316,7 +420,7 @@ These are placeholder values — tune based on playtesting.
 | NPC retreating when owner leaves game | Movement completes, enters Recovering normally under new country-owned state |
 | No enemy NPCs visible for scoring | All valid candidates scored equally, picked by deterministic tie-break (lowest tileId) |
 | Enemy attacks Recovering NPC | Allowed — NPC is killable but cannot fight back |
-| Retreat destination becomes occupied during transit | If the reserved retreat destination becomes invalid during transit (e.g. occupied by another NPC), v1 uses the existing movement fallback: the NPC returns to its origin tile and still enters Recovering there. This is an intentional simplification for v1, not a second retreat-candidate search mid-transit. |
+| Retreat destination becomes occupied during transit | If the reserved retreat destination becomes invalid during transit (e.g. occupied by another NPC), v1 uses the existing movement fallback: the NPC returns to its origin tile and still enters Recovering there. **Known v1 risks:** (1) Origin tile may now be enemy-controlled. (2) Player may not expect snap-back to a dangerous position. (3) If origin tile is also occupied, behavior depends on movement collision handling. These are accepted v1 compromises. **v2 could:** re-run tile selection from origin on fallback, or recover in-place without tile assignment. |
 
 ---
 
@@ -378,3 +482,4 @@ These are placeholder values — tune based on playtesting.
 - Different thresholds per NPC type
 - Retreat sound/VFX beyond skull GUI
 - Allied territory as valid retreat destination
+- Fallback re-evaluation when retreat destination becomes invalid mid-transit (v1 snaps to origin; v2 could re-search)

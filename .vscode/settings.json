@@ -1,4 +1,7 @@
 {
-    "luau-lsp.plugin.enabled": true,
-    "luau-lsp.sourcemap.useVSCodeWatcher": true
+    "luau-lsp.studioPlugin.enabled": true,
+    "luau-lsp.sourcemap.useVSCodeWatcher": true,
+    "luau-lsp.platform.type": "roblox",
+    "luau-lsp.sourcemap.enabled": true,
+    "luau-lsp.sourcemap.rojoProjectFile": "default.project.json"
 }

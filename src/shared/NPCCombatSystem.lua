@@ -6,12 +6,19 @@
 -- Maid-owned lifecycle signals, idempotent registerNPC, ordered unregisterNPC,
 -- NPCMovementSystem.OnOwnerChanged wired into transferOwnership
 
-local PathfindingService = game:GetService("PathfindingService")
+local _PathfindingService = game:GetService("PathfindingService")
 local Debris = game:GetService("Debris")
-local RunService = game:GetService("RunService")
-local DiplomacyManager = require(game.ServerScriptService:WaitForChild("DiplomacyManager", 10))
-
+local _RunService = game:GetService("RunService")
 local Combat = {}
+
+-- Lazy-load DiplomacyManager to avoid circular dependency
+local DiplomacyManager = nil
+local function getDiplomacyManager()
+	if not DiplomacyManager then
+		DiplomacyManager = require(game.ServerScriptService:WaitForChild("DiplomacyManager", 10))
+	end
+	return DiplomacyManager
+end
 
 -- Lazy-load TileAdjacencyManager to avoid circular dependency
 local TileAdjacencyManager = nil
@@ -24,7 +31,7 @@ end
 
 -- Lazy-load TileOwnershipManager to avoid circular dependency
 local TileOwnershipManager = nil
-local function getTileOwnershipManager()
+local function _getTileOwnershipManager()
 	if not TileOwnershipManager then
 		TileOwnershipManager = require(game.ServerScriptService:WaitForChild("TileOwnershipManager", 10))
 	end
@@ -249,7 +256,7 @@ local function fireMultiLaser(npcModel, targetHumanoids, beamColor)
 	end
 end
 
-local function visualizePath(path, modelName)
+local function _visualizePath(path, modelName)
 	if not DEBUG then return end
 
 	for key, part in pairs(debugParts) do
@@ -609,7 +616,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, target)
 
 					-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-					local canFight = DiplomacyManager.canNPCAttack(npcModel, target)
+					local canFight = getDiplomacyManager().canNPCAttack(npcModel, target)
 
 					if targetHumanoid and targetHumanoid.Health > 0 and canFight and isAdjacent then
 						table.insert(allValidTargets, targetHumanoid)
@@ -641,7 +648,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 						local isAdjacent = areNPCsOnAdjacentTiles(npcModel, threat)
 
 						-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-						local canFight = DiplomacyManager.canNPCAttack(npcModel, threat)
+						local canFight = getDiplomacyManager().canNPCAttack(npcModel, threat)
 
 						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
 							-- Check if not already in targets list
@@ -681,7 +688,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 				if att and att.Parent then
 					local attHumanoid = att:FindFirstChildOfClass("Humanoid")
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, att)
-					local canFight = DiplomacyManager.canNPCAttack(npcModel, att)
+					local canFight = getDiplomacyManager().canNPCAttack(npcModel, att)
 					if attHumanoid and attHumanoid.Health > 0 and canFight and isAdjacent then
 						table.insert(allValidTargets, attHumanoid)
 					else
@@ -779,7 +786,7 @@ function Combat.noteAttackerTargeting(attackerModel, defenderModel)
 
 	local found = false
 	for _, v in ipairs(defenderAttackers[defenderModel]) do
-		if v == attackerModel then found = true break end
+		if v == attackerModel then found = true; break end
 	end
 
 	if not found then
@@ -799,7 +806,7 @@ function Combat.noteTargetingAttacker(aggressorModel, victimAttackerModel)
 
 	local found = false
 	for _, v in ipairs(attackerThreats[victimAttackerModel]) do
-		if v == aggressorModel then found = true break end
+		if v == aggressorModel then found = true; break end
 	end
 
 	if not found then
@@ -893,7 +900,7 @@ function Combat.attackAttacker(attackerModel, targetAttackerModel)
 	if not npcOwners[attackerModel] then return end
 
 	-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-	if not DiplomacyManager.canNPCAttack(attackerModel, targetAttackerModel) then
+	if not getDiplomacyManager().canNPCAttack(attackerModel, targetAttackerModel) then
 		return -- Can't attack (same country, allied, or not at war)
 	end
 
