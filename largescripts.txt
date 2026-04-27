@@ -1,5 +1,5 @@
 
---- src/shared/TileAdjacencyManager.luau ---
+--- src/shared/TileAdjacencyManager.lua ---
 -- TileAdjacencyManager (ModuleScript in ServerScriptService) - EVIDENCE-FIRST PIPELINE
 -- Two-phase adjacency: Phase 1 raster, Phase 2 extended. Both use evidence-first classification.
 -- Distance creates candidacy; raycast evidence determines land vs strait vs reject.
@@ -1252,42 +1252,61 @@ else
 end
 
 
--- Intervening tile detection using raster footprints.
--- Samples 9 fractions along the edge-to-edge path and checks CellToTilesMap.
--- Returns true if 25% or more of samples find a third tile between tileA and tileB.
+-- Geometric point-in-bounds check honoring CFrame. Degenerates to AABB for
+-- axis-aligned parts; correct for rotated parts too.
+local function isPointInPartBounds(point, part)
+	local localPoint = part.CFrame:PointToObjectSpace(point)
+	local halfSize = part.Size * 0.5
+	return math.abs(localPoint.X) <= halfSize.X
+		and math.abs(localPoint.Y) <= halfSize.Y
+		and math.abs(localPoint.Z) <= halfSize.Z
+end
+
+-- Intervening tile detection: raster broadphase + geometric narrowphase.
+-- Phase 1 (broadphase): 9 samples along the edge-to-edge line collect candidate
+-- tiles from the raster grid -- fast, but at sub-cell distances it false-positives
+-- on corner-touching neighbors (T-junction artifact).
+-- Phase 2 (narrowphase): a candidate truly intervenes only if the line's
+-- geometric midpoint lies inside its bounding box. This preserves real thin
+-- interveners (Liechtenstein, micro-municipalities) while rejecting corner-share
+-- false positives that share a raster cell but not the actual path.
 hasInterveningTileBetween = function(tileA, tileB, cellToTilesLookup)
 	local ptA, ptB, edgeDist = findClosestEdgePoints(tileA, tileB)
 	if not ptA or not ptB or edgeDist <= 0.5 then
 		return false
 	end
 
-	local interveningCount = 0
-	local totalSamples = 0
+	local candidateInterveners = {}
+	local foundAny = false
 
 	for _, frac in ipairs({0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}) do
 		local sampleX = ptA.X + (ptB.X - ptA.X) * frac
 		local sampleZ = ptA.Z + (ptB.Z - ptA.Z) * frac
 		local sCx = math.floor(sampleX / RASTER_CELL_SIZE)
 		local sCz = math.floor(sampleZ / RASTER_CELL_SIZE)
-		local sKey = cellKey(sCx, sCz)
-		local tilesAtSample = cellToTilesLookup[sKey]
-		totalSamples = totalSamples + 1
-
-		local foundIntervening = false
+		local tilesAtSample = cellToTilesLookup[cellKey(sCx, sCz)]
 		if tilesAtSample then
 			for _, sTile in ipairs(tilesAtSample) do
 				if sTile ~= tileA and sTile ~= tileB then
-					foundIntervening = true
-					break
+					candidateInterveners[sTile] = true
+					foundAny = true
 				end
 			end
 		end
-		if foundIntervening then
-			interveningCount = interveningCount + 1
+	end
+
+	if not foundAny then
+		return false
+	end
+
+	local midPoint = ptA:Lerp(ptB, 0.5)
+	for candidate in pairs(candidateInterveners) do
+		if isPointInPartBounds(midPoint, candidate) then
+			return true
 		end
 	end
 
-	return interveningCount >= math.ceil(totalSamples * 0.25)
+	return false
 end
 
 
@@ -2687,7 +2706,7 @@ calculateSafeCenters()
 
 return TileAdjacencyManager
 
---- src/shared/NPCMovementSystem.luau ---
+--- src/shared/NPCMovementSystem.lua ---
 -- NPCMovementSystem (ModuleScript in ServerScriptService)
 -- Backwards-compatible with your original API
 -- Added: teleport throttle, stuck detection + retry/backoff, OnOwnerChanged, safe-center validation
@@ -4819,7 +4838,7 @@ task.spawn(init)
 
 return NPCMovementSystem
 
---- src/shared/NPCCombatSystem.luau ---
+--- src/shared/NPCCombatSystem.lua ---
 -- Module: NPCCombatSystem (COUNTRY PERSISTENCE VERSION)
 -- NPCs can now be transferred between players when countries change hands
 -- Country-owned NPCs (no active player) remain idle until claimed
@@ -4828,12 +4847,19 @@ return NPCMovementSystem
 -- Maid-owned lifecycle signals, idempotent registerNPC, ordered unregisterNPC,
 -- NPCMovementSystem.OnOwnerChanged wired into transferOwnership
 
-local PathfindingService = game:GetService("PathfindingService")
+local _PathfindingService = game:GetService("PathfindingService")
 local Debris = game:GetService("Debris")
-local RunService = game:GetService("RunService")
-local DiplomacyManager = require(game.ServerScriptService:WaitForChild("DiplomacyManager", 10))
-
+local _RunService = game:GetService("RunService")
 local Combat = {}
+
+-- Lazy-load DiplomacyManager to avoid circular dependency
+local DiplomacyManager = nil
+local function getDiplomacyManager()
+	if not DiplomacyManager then
+		DiplomacyManager = require(game.ServerScriptService:WaitForChild("DiplomacyManager", 10))
+	end
+	return DiplomacyManager
+end
 
 -- Lazy-load TileAdjacencyManager to avoid circular dependency
 local TileAdjacencyManager = nil
@@ -4846,7 +4872,7 @@ end
 
 -- Lazy-load TileOwnershipManager to avoid circular dependency
 local TileOwnershipManager = nil
-local function getTileOwnershipManager()
+local function _getTileOwnershipManager()
 	if not TileOwnershipManager then
 		TileOwnershipManager = require(game.ServerScriptService:WaitForChild("TileOwnershipManager", 10))
 	end
@@ -5071,7 +5097,7 @@ local function fireMultiLaser(npcModel, targetHumanoids, beamColor)
 	end
 end
 
-local function visualizePath(path, modelName)
+local function _visualizePath(path, modelName)
 	if not DEBUG then return end
 
 	for key, part in pairs(debugParts) do
@@ -5431,7 +5457,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, target)
 
 					-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-					local canFight = DiplomacyManager.canNPCAttack(npcModel, target)
+					local canFight = getDiplomacyManager().canNPCAttack(npcModel, target)
 
 					if targetHumanoid and targetHumanoid.Health > 0 and canFight and isAdjacent then
 						table.insert(allValidTargets, targetHumanoid)
@@ -5463,7 +5489,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 						local isAdjacent = areNPCsOnAdjacentTiles(npcModel, threat)
 
 						-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-						local canFight = DiplomacyManager.canNPCAttack(npcModel, threat)
+						local canFight = getDiplomacyManager().canNPCAttack(npcModel, threat)
 
 						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
 							-- Check if not already in targets list
@@ -5503,7 +5529,7 @@ function Combat.registerNPC(npcModel, ownerPlayer, role)
 				if att and att.Parent then
 					local attHumanoid = att:FindFirstChildOfClass("Humanoid")
 					local isAdjacent = areNPCsOnAdjacentTiles(npcModel, att)
-					local canFight = DiplomacyManager.canNPCAttack(npcModel, att)
+					local canFight = getDiplomacyManager().canNPCAttack(npcModel, att)
 					if attHumanoid and attHumanoid.Health > 0 and canFight and isAdjacent then
 						table.insert(allValidTargets, attHumanoid)
 					else
@@ -5601,7 +5627,7 @@ function Combat.noteAttackerTargeting(attackerModel, defenderModel)
 
 	local found = false
 	for _, v in ipairs(defenderAttackers[defenderModel]) do
-		if v == attackerModel then found = true break end
+		if v == attackerModel then found = true; break end
 	end
 
 	if not found then
@@ -5621,7 +5647,7 @@ function Combat.noteTargetingAttacker(aggressorModel, victimAttackerModel)
 
 	local found = false
 	for _, v in ipairs(attackerThreats[victimAttackerModel]) do
-		if v == aggressorModel then found = true break end
+		if v == aggressorModel then found = true; break end
 	end
 
 	if not found then
@@ -5715,7 +5741,7 @@ function Combat.attackAttacker(attackerModel, targetAttackerModel)
 	if not npcOwners[attackerModel] then return end
 
 	-- Use country-based check so country-owned (nil-owner) NPCs are handled correctly
-	if not DiplomacyManager.canNPCAttack(attackerModel, targetAttackerModel) then
+	if not getDiplomacyManager().canNPCAttack(attackerModel, targetAttackerModel) then
 		return -- Can't attack (same country, allied, or not at war)
 	end
 
@@ -5746,7 +5772,8 @@ end
 
 return Combat
 
---- src/shared/TileOwnershipManager.luau ---
+
+--- src/shared/TileOwnershipManager.lua ---
 -- TileOwnershipManager (ModuleScript in ServerScriptService)
 -- Occupation stored by COUNTRY (not player) - persists when players leave
 -- Capital capture guard + conquered state check
@@ -6634,7 +6661,7 @@ if DEBUG then print("[TileOwnershipManager] Initialization complete") end
 
 return TileOwnershipManager
 
---- src/server/CountryManager.server.luau ---
+--- src/server/CountryManager.server.lua ---
 -- CountryManager (ServerScriptService)
 -- Wars and occupied territory persist when player leaves
 -- New player inherits wars and occupied tiles
@@ -7289,7 +7316,7 @@ InitializationComplete:FireAllClients()
 if DEBUG then
 	print("DEBUG: Map setup complete. CountryOwners table populated.")
 end
---- src/shared/TileManager.luau ---
+--- src/shared/TileManager.lua ---
 -- TileManager (ModuleScript)
 -- Now uses centralized TileKeyUtils for consistent tile key generation
 -- Added: Global tile occupation tracking for movement system
@@ -7851,7 +7878,7 @@ initializeAllCountries()
 
 return TileManager
 
---- src/shared/DiplomacyManager.luau ---
+--- src/shared/DiplomacyManager.lua ---
 -- DiplomacyManager
 -- Added duplicate war declaration prevention
 -- Wars persist when players leave - new player inherits wars
@@ -8397,7 +8424,7 @@ end
 
 return DiplomacyManager
 
---- src/server/NPCTargetingHandler.server.luau ---
+--- src/server/NPCTargetingHandler.server.lua ---
 -- NPCTargetingHandler (MULTI-TARGET + MOVEMENT VERSION)
 -- Added tile click detection for NPC movement system
 -- Click NPC head = select for targeting
@@ -8883,7 +8910,7 @@ NPCMoveToTileEvent.OnServerEvent:Connect(function(player, tilePart)
 	handleTileClick(player, tilePart)
 end)
 
---- src/server/DiplomacyServer.server.luau ---
+--- src/server/DiplomacyServer.server.lua ---
 -- DiplomacyServer
 -- Prevents duplicate war declarations
 -- Better validation and error messages
@@ -8900,6 +8927,8 @@ local Players = game:GetService("Players")
 local DiplomacyManager = require(ServerScriptService:WaitForChild("DiplomacyManager", 10))
 local ServerState = require(ServerScriptService:WaitForChild("ServerState", 10))
 local TileOwnershipManager = require(ServerScriptService:WaitForChild("TileOwnershipManager", 10))
+local TileAdjacencyManager = require(ServerScriptService:WaitForChild("TileAdjacencyManager", 10))
+local CountryNPCRegistry = require(ServerScriptService:WaitForChild("CountryNPCRegistry", 10))
 
 -- 2. REQUIREMENTS (Remotes)
 local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
@@ -8966,6 +8995,24 @@ DiplomacyManager.setNAPExpiredCallback(function(countryA, countryB)
     if DEBUG then print("⏰ NAP EXPIRED callback fired: " .. countryA .. " / " .. countryB) end
 end)
 
+-- HELPER: Check if a country has any NPCs currently on allied territory
+local function hasUnitsOnAlliedTerritory(playerCountry)
+    local npcs = CountryNPCRegistry.getNPCs(playerCountry)
+    for _, npcModel in ipairs(npcs) do
+        local tileId = npcModel:GetAttribute("CurrentTileId") or npcModel:GetAttribute("TileKey")
+        if tileId then
+            local tilePart = TileAdjacencyManager.getTileFromKey(tileId)
+            if tilePart then
+                local tileCountry = TileAdjacencyManager.getTileCountry(tilePart)
+                if tileCountry and tileCountry ~= playerCountry and DiplomacyManager.areCountriesAllied(playerCountry, tileCountry) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 ---------------------------------------------------------
 -- PART 1: WAR LOGIC (Instant Action)
 ---------------------------------------------------------
@@ -9019,6 +9066,12 @@ DeclareWarEvent.OnServerEvent:Connect(function(player, targetCountryName)
             GlobalNotificationEvent:FireClient(player, "❌ You cannot declare war on yourself.", Color3.fromRGB(255, 100, 100))
             return
         end
+    end
+
+    -- Check if player has units on allied territory — must withdraw first
+    if hasUnitsOnAlliedTerritory(playerCountry) then
+        DiplomacyReminderEvent:FireClient(player, targetCountryName, "WithdrawUnits")
+        return
     end
 
     -- Check if allied with target (must break alliance first)
@@ -9174,6 +9227,14 @@ local function processRequest(senderPlayer, targetCountryName, requestType)
         end
     end
 
+    -- Prevent duplicate alliance requests when already allied
+    if requestType == "Alliance" then
+        if DiplomacyManager.areCountriesAllied(senderCountry, targetCountryName) then
+            GlobalNotificationEvent:FireClient(senderPlayer, "🤝 You are already allied with " .. targetCountryName .. "!", Color3.fromRGB(255, 200, 0))
+            return
+        end
+    end
+
     -- Prevent duplicate NAP requests when one is already active
     if requestType == "NAP" then
         if DiplomacyManager.hasNonAggressionPact(senderCountry, targetCountryName) then
@@ -9319,308 +9380,334 @@ DiplomacyResponse.OnServerEvent:Connect(function(player, requestId, accepted)
     end
 end)
 
---- src/playerscripts/TileCursor.client.luau ---
--- TileCursor LocalScript
--- Combines:
---  - LRU caching & eviction (from v5)
---  - Strict disabling of Highlight/SelectionBox when not in use (from v12)
---  - Name/size filters, safe clone of cursor, robust cleanup
-
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+--- src/client/DiplomacyGui.client.lua ---
+-- LocalScript inside DiplomacyGui
+local DEBUG = false
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local Mouse = Players.LocalPlayer:GetMouse()
 
-local Player = Players.LocalPlayer
-local Mouse = Player:GetMouse()
-
---------------------------------------------------------------------------------
--- CONFIG
---------------------------------------------------------------------------------
-local DEBUG_HOVER = false
-local MAX_TILE_SIZE = 300
-local CACHE_MAX_SIZE = 500
-local CACHE_EVICT_COUNT = 250 -- how many oldest entries to evict when full
-local MAX_HIERARCHY_DEPTH = 20
-
-local IGNORE_NAMES = {
-	["ocean"] = true, ["water"] = true, ["sea"] = true,
-	["background"] = true, ["baseplate"] = true, ["base"] = true,
-	["hitbox"] = true, ["bounds"] = true, ["map"] = true,
-	["visuals"] = true, ["meshes"] = true, ["terrain"] = true,
-	["folder"] = true, ["countries"] = true, ["oceanfront"] = true
-}
-
---------------------------------------------------------------------------------
--- ASSETS
---------------------------------------------------------------------------------
-local OriginalCursor = ReplicatedStorage:WaitForChild("TileCursor", 10)
-if not OriginalCursor then
-	warn("[TileCursor] CRITICAL: TileCursor not found in ReplicatedStorage")
-	return
-end
-
--- Make a local clone so we can safely toggle/Destroy it without affecting other clients
-local Cursor = OriginalCursor:Clone()
-Cursor.Name = "LocalTileCursor"
-Cursor.Parent = Workspace
-
--- Ensure cursor starts OFF (prevents highlight parent fallback)
-if Cursor:IsA("Highlight") then
-	Cursor.Enabled = false
-elseif Cursor:IsA("SelectionBox") then
-	Cursor.Visible = false
-end
-
+-- Get reference to EuropeMap
 local EuropeMap = Workspace:WaitForChild("EuropeMap", 10)
-if not EuropeMap then
-	warn("[TileCursor] EuropeMap not found in Workspace")
-	-- keep script alive, but nothing to highlight
-end
 
---------------------------------------------------------------------------------
--- CACHE (LRU)
---------------------------------------------------------------------------------
--- countryModelCache[part] = { countryModel = Model or false, lastAccess = number }
-local countryModelCache = {}
-local cacheAccessOrder = {} -- array of parts, oldest at index 1
+-- 1. WAIT FOR JOIN SUCCESS
+local JoinSuccess = ReplicatedStorage:WaitForChild("JoinSuccess", 10)
+local gui = script.Parent
+gui.Enabled = false -- Keep it off until we join
 
-local function touchCacheEntry(part)
-	-- remove existing occurrence
-	for i = #cacheAccessOrder, 1, -1 do
-		if cacheAccessOrder[i] == part then
-			table.remove(cacheAccessOrder, i)
-			break
-		end
-	end
-	table.insert(cacheAccessOrder, part) -- newest on the end
-end
-
-local function evictOldestEntries()
-	while #cacheAccessOrder > CACHE_MAX_SIZE do
-		-- remove CACHE_EVICT_COUNT or until under limit
-		local removed = 0
-		for i = 1, CACHE_EVICT_COUNT do
-			if #cacheAccessOrder == 0 then break end
-			local oldPart = table.remove(cacheAccessOrder, 1)
-			if oldPart then
-				countryModelCache[oldPart] = nil
-			end
-			removed = removed + 1
-		end
-		-- safety: if nothing removed, break to avoid infinite loop
-		if removed == 0 then break end
-	end
-end
-
---------------------------------------------------------------------------------
--- UTIL
---------------------------------------------------------------------------------
-local function isIgnored(name)
-	if not name then return false end
-	return IGNORE_NAMES[string.lower(name)] == true
-end
-
-local function validatePartCandidate(part)
-	if not part or not part:IsA("BasePart") then return false end
-	if isIgnored(part.Name) then return false end
-	-- size check: ignore huge parts that are likely background/baseplates
-	-- use absolute magnitudes of X and Z
-	if part.Size and (part.Size.X > MAX_TILE_SIZE or part.Size.Z > MAX_TILE_SIZE) then
-		return false
-	end
-	-- ignore fully transparent parts
-	if part.Transparency and part.Transparency >= 1 then
-		return false
-	end
-	return true
-end
-
---------------------------------------------------------------------------------
--- getCountryModel: walk up to find a model whose parent is EuropeMap
--- Returns Model or nil. Uses cache (LRU).
---------------------------------------------------------------------------------
-local function getCountryModel(part)
-	if not part or not validatePartCandidate(part) then
-		return nil
-	end
-
-	-- cache check
-	local cached = countryModelCache[part]
-	if cached ~= nil then
-		-- update LRU order
-		touchCacheEntry(part)
-		cached.lastAccess = tick()
-		return cached.countryModel or nil
-	end
-
-	-- if the part is directly a child of EuropeMap, treat as non-country tile
-	if part.Parent == EuropeMap then
-		countryModelCache[part] = { countryModel = false, lastAccess = tick() }
-		touchCacheEntry(part)
-		evictOldestEntries()
-		return nil
-	end
-
-	-- walk up
-	local current = part.Parent
-	local depth = 0
-	while current and current ~= EuropeMap and current ~= Workspace and depth < MAX_HIERARCHY_DEPTH do
-		-- if we found a direct child of EuropeMap
-		if current.Parent == EuropeMap then
-			-- validate name
-			if isIgnored(current.Name) then
-				countryModelCache[part] = { countryModel = false, lastAccess = tick() }
-				touchCacheEntry(part)
-				evictOldestEntries()
-				return nil
-			end
-			-- accept as country model
-			countryModelCache[part] = { countryModel = current, lastAccess = tick() }
-			touchCacheEntry(part)
-			evictOldestEntries()
-			return current
-		end
-		current = current.Parent
-		depth = depth + 1
-	end
-
-	-- nothing found — cache negative result
-	countryModelCache[part] = { countryModel = false, lastAccess = tick() }
-	touchCacheEntry(part)
-	evictOldestEntries()
-	return nil
-end
-
---------------------------------------------------------------------------------
--- Cache invalidation: remove entries when parts are removed from EuropeMap
---------------------------------------------------------------------------------
-local descRemovingConn
-local function setupCacheInvalidation()
-	if not EuropeMap then return end
-	descRemovingConn = EuropeMap.DescendantRemoving:Connect(function(desc)
-		if desc and desc:IsA("BasePart") then
-			if countryModelCache[desc] ~= nil then
-				countryModelCache[desc] = nil
-			end
-			-- remove from access order
-			for i = #cacheAccessOrder, 1, -1 do
-				if cacheAccessOrder[i] == desc then
-					table.remove(cacheAccessOrder, i)
-					break
-				end
-			end
-		end
-	end)
-end
-
---------------------------------------------------------------------------------
--- Visual control helpers (handles both Highlight and SelectionBox)
---------------------------------------------------------------------------------
-local function disableCursorVisuals()
-	if not Cursor then return end
-	if Cursor:IsA("Highlight") then
-		-- Ensure parent highlight does not silently highlight parent when adornee is nil
-		Cursor.Adornee = nil
-		Cursor.Enabled = false
-	elseif Cursor:IsA("SelectionBox") then
-		Cursor.Adornee = nil
-		Cursor.Visible = false
-	else
-		-- fallback: try to nil adornee
-		pcall(function() Cursor.Adornee = nil end)
-	end
-end
-
-local function enableCursorVisuals(targetPart)
-	if not Cursor then return end
-	Cursor.Adornee = targetPart
-	if Cursor:IsA("Highlight") then
-		Cursor.Enabled = true
-	elseif Cursor:IsA("SelectionBox") then
-		Cursor.Visible = true
-	end
-end
-
---------------------------------------------------------------------------------
--- Main render loop
---------------------------------------------------------------------------------
-local renderConn
-local lastTarget = nil
-local lastResult = nil -- for debug printing reduction
-
-local function onRenderStepped()
-	local target = Mouse.Target
-
-	-- fast path: unchanged
-	if target == lastTarget then return end
-	lastTarget = target
-
-	if target and target:IsA("BasePart") then
-		local countryModel = getCountryModel(target)
-
-		if countryModel then
-			-- enable visuals on the exact hovered part (avoids whole-model highlight)
-			enableCursorVisuals(target)
-
-			if DEBUG_HOVER and lastResult ~= countryModel then
-				print("✅ HIT:", countryModel.Name, "part:", target.Name)
-				lastResult = countryModel
-			end
-		else
-			-- nothing relevant, turn off visuals
-			disableCursorVisuals()
-			if DEBUG_HOVER and lastResult ~= "void" then
-				-- optional debug: print("❌ IGNORED: " .. (target and target.Name or "nil"))
-				lastResult = "void"
-			end
-		end
-	else
-		-- sky / no target
-		disableCursorVisuals()
-		lastResult = "nil"
-	end
-end
-
---------------------------------------------------------------------------------
--- Cleanup: disconnect everything & destroy the cloned cursor
---------------------------------------------------------------------------------
-local function cleanup()
-	-- Disconnect render
-	if renderConn then
-		renderConn:Disconnect()
-		renderConn = nil
-	end
-	-- DescendantRemoving
-	if descRemovingConn then
-		descRemovingConn:Disconnect()
-		descRemovingConn = nil
-	end
-	-- Clear cache tables
-	countryModelCache = {}
-	cacheAccessOrder = {}
-
-	-- Destroy cursor clone safely
-	if Cursor and Cursor.Parent then
-		pcall(function() Cursor:Destroy() end)
-	end
-	Cursor = nil
-end
-
---------------------------------------------------------------------------------
--- Setup connections & start
---------------------------------------------------------------------------------
-script.Destroying:Connect(cleanup)
--- If the player is removed (server-side), also cleanup locally
-local playerRemConn
-playerRemConn = Players.PlayerRemoving:Connect(function(removedPlayer)
-	if removedPlayer == Player then
-		cleanup()
-		if playerRemConn then playerRemConn:Disconnect() end
-	end
+JoinSuccess.Event:Connect(function()
+    gui.Enabled = true -- Turn on the war/alliance buttons
+    if DEBUG then print("Diplomacy GUI Activated!") end
 end)
 
-setupCacheInvalidation()
-renderConn = RunService.RenderStepped:Connect(onRenderStepped)
+-- 2. GET REMOTES
+-- Wait longer for server-created RemoteEvents
+local DiplomacyRequest = ReplicatedStorage:WaitForChild("DiplomacyRequest", 30)
+local DiplomacyResponse = ReplicatedStorage:WaitForChild("DiplomacyResponse", 30)
+local DeclareWarEvent = ReplicatedStorage:WaitForChild("DeclareWarEvent", 10)
+local SendRequestEvent = ReplicatedStorage:WaitForChild("SendRequestEvent", 10)
+local BreakAllianceEvent = ReplicatedStorage:WaitForChild("BreakAllianceEvent", 10)
+local DiplomacyReminderEvent = ReplicatedStorage:WaitForChild("DiplomacyReminderEvent", 10)
 
-if DEBUG_HOVER then print("[TileCursor] Initialized. DEBUG_HOVER =", DEBUG_HOVER) end
+if not DiplomacyRequest then
+    warn("[DiplomacyGui] DiplomacyRequest RemoteEvent not found!")
+    return
+end
+
+if not DiplomacyResponse then
+    warn("[DiplomacyGui] DiplomacyResponse RemoteEvent not found!")
+    return
+end
+
+-- 3. UI REFERENCES
+local warPanel = gui:WaitForChild("WarPanel", 10)
+local popup = gui:WaitForChild("RequestPopup", 10)
+
+-- Buttons inside WarPanel
+local declareWarBtn = warPanel:WaitForChild("DeclareWar", 10)
+local allianceBtn = warPanel:WaitForChild("FormAlliance", 10)
+local peaceBtn = warPanel:WaitForChild("SignPeace", 10)
+local breakAllianceBtn = warPanel:WaitForChild("BreakAlliance", 10)
+
+-- NAP Button (using FindFirstChild so the script doesn't hang if it is missing)
+local napBtn = warPanel:FindFirstChild("FormNAP")
+
+-- Popup Elements
+local messageLabel = popup:WaitForChild("Message", 10)
+local acceptBtn = popup:WaitForChild("ButtonContainer", 10).AcceptButton
+local declineBtn = popup:WaitForChild("ButtonContainer", 10).DeclineButton
+
+-- ReminderPopup Elements
+local reminderPopup = gui:WaitForChild("ReminderPopup", 5)
+local reminderMessage = reminderPopup and reminderPopup:WaitForChild("Message", 5)
+local reminderOkayBtn = reminderPopup and reminderPopup:WaitForChild("ButtonContainer", 5):WaitForChild("OkayButton", 5)
+
+if not reminderPopup then
+    warn("[DiplomacyGui] ReminderPopup not found - diplomacy reminders will not be displayed.")
+end
+
+-- STATE VARIABLE (Prevents multiple clicks stacking up)
+local currentConnection = nil
+
+-- Returns the effective owner of a tile.
+-- OwnerCountry is set on BOTH capture and annexation (server-side).
+-- BasePart attributes replicate to clients automatically.
+local function getCountryFromPart(part)
+    if not part or not part:IsA("BasePart") then return nil end
+
+    -- Check OwnerCountry attribute first (set on captured/annexed tiles)
+    local ownerAttr = part:GetAttribute("OwnerCountry")
+    if ownerAttr and ownerAttr ~= "" then
+        return ownerAttr
+    end
+
+    -- Fallback: walk hierarchy (tile was never captured/annexed)
+    local current = part.Parent
+    while current and current ~= EuropeMap and current ~= Workspace do
+        if current.Parent == EuropeMap then
+            return current.Name
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+-- HELPER: Function to handle map clicking
+local function startMapSelection(actionType, specificEvent)
+    -- If we were already selecting something, stop that first
+    if currentConnection then currentConnection:Disconnect() end
+
+    if DEBUG then print("Select a country on the map for: " .. actionType) end
+
+    currentConnection = Mouse.Button1Down:Connect(function()
+        local target = Mouse.Target
+
+        -- Use robust country detection that handles nested parts
+        local targetCountry = getCountryFromPart(target)
+        if targetCountry then
+            if actionType == "WAR" then
+                specificEvent:FireServer(targetCountry)
+                if DEBUG then print("Sent War Declaration: " .. targetCountry) end
+
+            elseif actionType == "ALLIANCE" then
+                specificEvent:FireServer(targetCountry, "Alliance")
+                if DEBUG then print("Sent Alliance Request: " .. targetCountry) end
+
+            elseif actionType == "PEACE" then
+                specificEvent:FireServer(targetCountry, "Peace")
+                if DEBUG then print("Sent Peace Offer: " .. targetCountry) end
+
+            elseif actionType == "BREAKALLIANCE" then
+                specificEvent:FireServer(targetCountry)
+                if DEBUG then print("Sent Break Alliance: " .. targetCountry) end
+                
+            elseif actionType == "NAP" then
+                specificEvent:FireServer(targetCountry, "NAP")
+                if DEBUG then print("Sent NAP Request: " .. targetCountry) end
+            end
+
+            -- Stop listening after one click
+            if currentConnection then
+                currentConnection:Disconnect()
+                currentConnection = nil
+            end
+        end
+    end)
+end
+
+---------------------------------------------------------
+-- PART 1: BUTTON LISTENERS (Your Button Logic)
+---------------------------------------------------------
+
+declareWarBtn.MouseButton1Click:Connect(function()
+    startMapSelection("WAR", DeclareWarEvent)
+end)
+
+allianceBtn.MouseButton1Click:Connect(function()
+    startMapSelection("ALLIANCE", SendRequestEvent)
+end)
+
+peaceBtn.MouseButton1Click:Connect(function()
+    startMapSelection("PEACE", SendRequestEvent)
+end)
+
+breakAllianceBtn.MouseButton1Click:Connect(function()
+    startMapSelection("BREAKALLIANCE", BreakAllianceEvent)
+end)
+
+-- NAP Button Listener
+if napBtn then
+    napBtn.MouseButton1Click:Connect(function()
+        startMapSelection("NAP", SendRequestEvent)
+    end)
+end
+
+---------------------------------------------------------
+-- PART 2: POPUP LISTENER (Your Request Logic)
+---------------------------------------------------------
+
+-- Changed from OnClientInvoke to OnClientEvent + DiplomacyResponse
+-- This prevents the "OnFireClient can only be used on the server" error
+DiplomacyRequest.OnClientEvent:Connect(function(senderName, requestType, requestId)
+    -- Update the UI text
+    if requestType == "Alliance" then
+        messageLabel.Text = senderName .. " wants to form an ALLIANCE!"
+        messageLabel.TextColor3 = Color3.fromRGB(100, 255, 100) -- Green text
+    elseif requestType == "Peace" then
+        messageLabel.Text = senderName .. " is offering a PEACE TREATY."
+        messageLabel.TextColor3 = Color3.fromRGB(100, 200, 255) -- Blue text
+    elseif requestType == "NAP" then
+        messageLabel.Text = senderName .. " offers a NON-AGGRESSION PACT."
+        messageLabel.TextColor3 = Color3.fromRGB(200, 200, 255) -- Light Blue/Purple text
+    end
+
+    popup.Visible = true
+
+    -- Variable to store choice
+    local choice = nil
+
+    -- Connect buttons purely for this specific request
+    local conn1, conn2
+    conn1 = acceptBtn.MouseButton1Click:Connect(function() choice = true end)
+    conn2 = declineBtn.MouseButton1Click:Connect(function() choice = false end)
+
+    -- Wait here until player clicks or popup is destroyed
+    while choice == nil and popup.Parent do
+        task.wait(0.1)
+    end
+
+    -- Cleanup
+    conn1:Disconnect()
+    conn2:Disconnect()
+    if popup.Parent then
+        popup.Visible = false
+    end
+
+    -- Send response back to server via DiplomacyResponse RemoteEvent
+    if choice ~= nil then
+        DiplomacyResponse:FireServer(requestId, choice)
+    end
+end)
+
+---------------------------------------------------------
+-- PART 3: REMINDER POPUP (War declared / Alliance broken)
+---------------------------------------------------------
+-- Queue so that rapid-fire reminders show one at a time instead of
+-- stomping each other.  Each entry is { message, textColor }.
+local reminderQueue = {}
+local reminderActive = false
+
+local function processReminderQueue()
+    if reminderActive or #reminderQueue == 0 or not reminderPopup then return end
+    reminderActive = true
+
+    local entry = table.remove(reminderQueue, 1)
+    reminderMessage.Text = entry.message
+    reminderMessage.TextColor3 = entry.color
+    reminderPopup.Visible = true
+
+    -- Wait for the player to dismiss, or bail if the GUI gets destroyed
+    -- (e.g. character reset with ResetOnSpawn = true removes the ScreenGui)
+    local dismissed = false
+    local conn = reminderOkayBtn.MouseButton1Click:Connect(function()
+        dismissed = true
+    end)
+
+    while not dismissed and reminderPopup.Parent do
+        task.wait(0.1)
+    end
+
+    conn:Disconnect()
+    -- Guard: the popup may have been destroyed while we were waiting
+    if reminderPopup.Parent then
+        reminderPopup.Visible = false
+    end
+    reminderActive = false
+
+    -- Show the next queued reminder, if any
+    if #reminderQueue > 0 then
+        task.defer(processReminderQueue)
+    end
+end
+
+if DiplomacyReminderEvent then
+    DiplomacyReminderEvent.OnClientEvent:Connect(function(aggressorCountry, eventType, extraData)
+        local message, color
+
+        if eventType == "War" then
+            message = "⚔️ " .. aggressorCountry .. " has declared war on you!"
+            color = Color3.fromRGB(255, 80, 80)
+        elseif eventType == "BreakAlliance" then
+            message = "💔 " .. aggressorCountry .. " has broken their alliance with you!"
+            color = Color3.fromRGB(255, 180, 50)
+        elseif eventType == "AllianceAccepted" then
+            message = "🤝 " .. aggressorCountry .. " has accepted your alliance!"
+            color = Color3.fromRGB(100, 255, 100)
+        elseif eventType == "PeaceAccepted" then
+            message = "🕊️ " .. aggressorCountry .. " has signed your peace treaty!"
+            color = Color3.fromRGB(100, 200, 255)
+        elseif eventType == "NAPAccepted" then
+            message = "📜 " .. aggressorCountry .. " has accepted your Non-Aggression Pact!"
+            color = Color3.fromRGB(200, 200, 255)
+        elseif eventType == "NAPExpired" then
+            message = "⏰ Your truce with " .. aggressorCountry .. " has expired!"
+            color = Color3.fromRGB(255, 200, 100)
+        elseif eventType == "WithdrawUnits" then
+            message = "⚠️ You have units on allied territory! Withdraw them before declaring war."
+            color = Color3.fromRGB(255, 170, 50)
+        elseif eventType == "InsufficientManpower" then
+            local requiredCost = 10000
+            local currentManpower = 0
+            if typeof(extraData) == "table" then
+                requiredCost = extraData.cost or 10000
+                currentManpower = extraData.currentManpower or 0
+            elseif tonumber(extraData) then
+                requiredCost = tonumber(extraData)
+            end
+
+            local shortfall = requiredCost - currentManpower
+            local MANPOWER_PER_INTERVAL = 100
+            local INTERVAL_SECONDS = 3
+            local secondsRemaining = math.ceil((shortfall / MANPOWER_PER_INTERVAL) * INTERVAL_SECONDS)
+
+            local timeStr = ""
+            if secondsRemaining >= 3600 then
+                local hours = math.floor(secondsRemaining / 3600)
+                local mins = math.floor((secondsRemaining % 3600) / 60)
+                local secs = secondsRemaining % 60
+                if mins > 0 and secs > 0 then
+                    timeStr = hours .. "h " .. mins .. "m " .. secs .. "s"
+                elseif mins > 0 then
+                    timeStr = hours .. "h " .. mins .. "m"
+                elseif secs > 0 then
+                    timeStr = hours .. "h " .. secs .. "s"
+                else
+                    timeStr = hours .. "h"
+                end
+            elseif secondsRemaining >= 60 then
+                local mins = math.floor(secondsRemaining / 60)
+                local secs = secondsRemaining % 60
+                if secs > 0 then
+                    timeStr = mins .. "m " .. secs .. "s"
+                else
+                    timeStr = mins .. "m"
+                end
+            else
+                timeStr = secondsRemaining .. "s"
+            end
+
+            message = "⚠️ Not enough manpower! You need " .. requiredCost .. " 👤. Time until enough: " .. timeStr
+            color = Color3.fromRGB(255, 170, 50)
+        else
+            -- Unknown type — log and ignore rather than show a blank popup
+            warn("[DiplomacyGui] Unknown reminder type: " .. tostring(eventType))
+            return
+        end
+
+        table.insert(reminderQueue, { message = message, color = color })
+        task.defer(processReminderQueue)
+    end)
+else
+    warn("[DiplomacyGui] DiplomacyReminderEvent not found - reminders will not function.")
+end

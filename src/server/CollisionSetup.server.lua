@@ -3,6 +3,7 @@
 
 local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
 -- Create collision groups
 PhysicsService:RegisterCollisionGroup("NPCs")
@@ -76,6 +77,17 @@ Players.PlayerRemoving:Connect(function(player)
 		playerDescAddedConns[player] = nil
 	end
 end)
+
+-- Map geometry has no Touched listeners; keeping CanTouch on leaves 600+ static
+-- parts in the touch broadphase for nothing. One-shot at startup.
+local mapFolder = Workspace:WaitForChild("EuropeMap", 10)
+if mapFolder then
+	for _, part in ipairs(mapFolder:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.CanTouch = false
+		end
+	end
+end
 
 -- Setup existing players
 for _, player in ipairs(Players:GetPlayers()) do

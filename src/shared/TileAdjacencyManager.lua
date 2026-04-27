@@ -1250,42 +1250,61 @@ else
 end
 
 
--- Intervening tile detection using raster footprints.
--- Samples 9 fractions along the edge-to-edge path and checks CellToTilesMap.
--- Returns true if 25% or more of samples find a third tile between tileA and tileB.
+-- Geometric point-in-bounds check honoring CFrame. Degenerates to AABB for
+-- axis-aligned parts; correct for rotated parts too.
+local function isPointInPartBounds(point, part)
+	local localPoint = part.CFrame:PointToObjectSpace(point)
+	local halfSize = part.Size * 0.5
+	return math.abs(localPoint.X) <= halfSize.X
+		and math.abs(localPoint.Y) <= halfSize.Y
+		and math.abs(localPoint.Z) <= halfSize.Z
+end
+
+-- Intervening tile detection: raster broadphase + geometric narrowphase.
+-- Phase 1 (broadphase): 9 samples along the edge-to-edge line collect candidate
+-- tiles from the raster grid -- fast, but at sub-cell distances it false-positives
+-- on corner-touching neighbors (T-junction artifact).
+-- Phase 2 (narrowphase): a candidate truly intervenes only if the line's
+-- geometric midpoint lies inside its bounding box. This preserves real thin
+-- interveners (Liechtenstein, micro-municipalities) while rejecting corner-share
+-- false positives that share a raster cell but not the actual path.
 hasInterveningTileBetween = function(tileA, tileB, cellToTilesLookup)
 	local ptA, ptB, edgeDist = findClosestEdgePoints(tileA, tileB)
 	if not ptA or not ptB or edgeDist <= 0.5 then
 		return false
 	end
 
-	local interveningCount = 0
-	local totalSamples = 0
+	local candidateInterveners = {}
+	local foundAny = false
 
 	for _, frac in ipairs({0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}) do
 		local sampleX = ptA.X + (ptB.X - ptA.X) * frac
 		local sampleZ = ptA.Z + (ptB.Z - ptA.Z) * frac
 		local sCx = math.floor(sampleX / RASTER_CELL_SIZE)
 		local sCz = math.floor(sampleZ / RASTER_CELL_SIZE)
-		local sKey = cellKey(sCx, sCz)
-		local tilesAtSample = cellToTilesLookup[sKey]
-		totalSamples = totalSamples + 1
-
-		local foundIntervening = false
+		local tilesAtSample = cellToTilesLookup[cellKey(sCx, sCz)]
 		if tilesAtSample then
 			for _, sTile in ipairs(tilesAtSample) do
 				if sTile ~= tileA and sTile ~= tileB then
-					foundIntervening = true
-					break
+					candidateInterveners[sTile] = true
+					foundAny = true
 				end
 			end
 		end
-		if foundIntervening then
-			interveningCount = interveningCount + 1
+	end
+
+	if not foundAny then
+		return false
+	end
+
+	local midPoint = ptA:Lerp(ptB, 0.5)
+	for candidate in pairs(candidateInterveners) do
+		if isPointInPartBounds(midPoint, candidate) then
+			return true
 		end
 	end
 
-	return interveningCount >= math.ceil(totalSamples * 0.25)
+	return false
 end
 
 

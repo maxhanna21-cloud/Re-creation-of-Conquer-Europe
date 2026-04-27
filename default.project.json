@@ -16,6 +16,7 @@
       "TileOwnershipManager": { "$path": "src/shared/TileOwnershipManager.lua" },
       "UnitManager": { "$path": "src/shared/UnitManager.lua" },
       "Auto-Fix": { "$path": "src/server/Auto-Fix.server.lua" },
+      "ClassicDeathScript": { "$path": "src/server/ClassicDeathScript.server.lua" },
       "CollisionSetup": { "$path": "src/server/CollisionSetup.server.lua" },
       "CountryManager": { "$path": "src/server/CountryManager.server.lua" },
       "Diagnostics": { "$path": "src/server/Diagnostics.server.lua" },

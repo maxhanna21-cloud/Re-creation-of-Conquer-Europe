@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> This file covers **codebase architecture and development workflow**. See `roblox-lead-systems-architect-skill` for coding rules and non-negotiables. This file and that skill are strictly complementary — read both.
+> **MANDATORY:** This file covers **codebase architecture** while the `roblox-lead-systems-architect-skill` covers **coding rules and non-negotiables**. You MUST load and adhere to the architect-skill before any implementation; it governs **HOW** you write code, while this file governs **WHERE** and **WHAT** you are going to write. They are strictly complementary.
 
 
 ## Project Layout → Roblox Hierarchy
