@@ -85,35 +85,41 @@ local playerClaimTime = {}
 -- Manpower Calculation System
 ---------------------------------------------------
 
-local function calculateStartingManpower(stats, globalMins, globalMaxes, weights)
-	-- Normalization: Scales values to a 0.0 - 1.0 range
-	local function normalize(value, minVal, maxVal)
-		if maxVal <= minVal then return 0.5 end 
-		return math.clamp((value - minVal) / (maxVal - minVal), 0, 1)
+-- RANK_BLEND controls the balance between two normalization strategies:
+--   0.0 = Pure min-max (raw value gaps preserved — big countries dominate)
+--   1.0 = Pure rank-based (evenly spaced — small countries catch up)
+--   0.5 = 50/50 blend (recommended starting point)
+local RANK_BLEND = 0.25
+
+-- Min-max normalization: scales raw values to 0.0 - 1.0 preserving proportional gaps
+local function normalizeMinMax(value: number, minVal: number, maxVal: number): number
+	if maxVal <= minVal then return 0.5 end
+	return math.clamp((value - minVal) / (maxVal - minVal), 0, 1)
+end
+
+-- Rank-based normalization: converts raw values to evenly-spaced ranks (0.0 to 1.0)
+local function buildRankMap(finalStats: {[string]: {population: number, tileCount: number, totalArea: number}}, metric: string): {[string]: number}
+	local sorted = {}
+	for countryName, stats in pairs(finalStats) do
+		table.insert(sorted, { name = countryName, value = (stats :: any)[metric] })
 	end
+	table.sort(sorted, function(a, b) return a.value < b.value end)
 
-	local normPop = normalize(stats.population, globalMins.population, globalMaxes.population)
-	local normTiles = normalize(stats.tileCount, globalMins.tileCount, globalMaxes.tileCount)
-	local normArea = normalize(stats.totalArea, globalMins.totalArea, globalMaxes.totalArea)
-
-	-- Weighted score determines where the country sits on the 5k - 90k spectrum
-	local finalScore = (normPop * weights.population) + 
-					   (normTiles * weights.tileCount) + 
-					   (normArea * weights.totalArea)
-
-	local MIN_MANPOWER = 5000
-	local MAX_MANPOWER = 90000
-
-	return math.floor(MIN_MANPOWER + ((MAX_MANPOWER - MIN_MANPOWER) * finalScore))
+	local count = #sorted
+	local rankMap = {}
+	for rank, entry in ipairs(sorted) do
+		rankMap[entry.name] = if count > 1 then (rank - 1) / (count - 1) else 0.5
+	end
+	return rankMap
 end
 
 local function calculateAllStartingManpower()
 	local startingManpower = {}
 	local finalStats = {}
-	
+
 	-- Pull physical stats already calculated by TileManager
 	local physicalStats = TileManager.getAllCountryTileStats()
-	
+
 	local globalMins = { population = math.huge, tileCount = math.huge, totalArea = math.huge }
 	local globalMaxes = { population = 0, tileCount = 0, totalArea = 0 }
 	local countryCount = 0
@@ -131,15 +137,14 @@ local function calculateAllStartingManpower()
 				totalArea = stats.totalArea
 			}
 
-			-- Update Global Extremes for normalization
 			globalMins.population = math.min(globalMins.population, population)
 			globalMaxes.population = math.max(globalMaxes.population, population)
 			globalMins.tileCount = math.min(globalMins.tileCount, stats.tileCount)
 			globalMaxes.tileCount = math.max(globalMaxes.tileCount, stats.tileCount)
 			globalMins.totalArea = math.min(globalMins.totalArea, stats.totalArea)
 			globalMaxes.totalArea = math.max(globalMaxes.totalArea, stats.totalArea)
-			
-			countryCount = countryCount + 1
+
+			countryCount += 1
 		end
 	end
 
@@ -148,20 +153,42 @@ local function calculateAllStartingManpower()
 		return startingManpower
 	end
 
-	-- 2. Define Weights
+	-- 2. Build rank maps (ascending: smallest = 0.0, largest = 1.0)
+	local popRanks = buildRankMap(finalStats, "population")
+	local tileRanks = buildRankMap(finalStats, "tileCount")
+	local areaRanks = buildRankMap(finalStats, "totalArea")
+
+	-- 3. Define Weights
 	local weights = {
 		totalArea = 0.35,  -- 35% weight on physical landmass (Secondary)
 		population = 0.50, -- 50% weight on population (Primary)
 		tileCount = 0.15   -- 15% weight on administrative density (Modifier)
 	}
 
-	-- 3. Run final calculations
+	local MIN_MANPOWER = 5000
+	local MAX_MANPOWER = 90000
+
+	-- 4. Blend min-max and rank scores, then apply weights
 	for countryName, stats in pairs(finalStats) do
-		local manpower = calculateStartingManpower(stats, globalMins, globalMaxes, weights)
+		-- Min-max scores (preserves raw gaps)
+		local mmPop = normalizeMinMax(stats.population, globalMins.population, globalMaxes.population)
+		local mmTiles = normalizeMinMax(stats.tileCount, globalMins.tileCount, globalMaxes.tileCount)
+		local mmArea = normalizeMinMax(stats.totalArea, globalMins.totalArea, globalMaxes.totalArea)
+
+		-- Blended scores: lerp between min-max and rank
+		local blendPop = (1 - RANK_BLEND) * mmPop + RANK_BLEND * popRanks[countryName]
+		local blendTiles = (1 - RANK_BLEND) * mmTiles + RANK_BLEND * tileRanks[countryName]
+		local blendArea = (1 - RANK_BLEND) * mmArea + RANK_BLEND * areaRanks[countryName]
+
+		local finalScore = (blendPop * weights.population)
+			+ (blendTiles * weights.tileCount)
+			+ (blendArea * weights.totalArea)
+
+		local manpower = math.floor(MIN_MANPOWER + ((MAX_MANPOWER - MIN_MANPOWER) * finalScore))
 		startingManpower[countryName] = manpower
 		if DEBUG then
-			print(string.format("[CountryManager] %s Manpower: %d (Pop: %d, Tiles: %d, Area: %.0f)",
-				countryName, manpower, stats.population, stats.tileCount, stats.totalArea))
+			print(string.format("[CountryManager] %s Manpower: %d | Blend(%.0f%%) — Pop: %.2f, Tiles: %.2f, Area: %.2f",
+				countryName, manpower, RANK_BLEND * 100, blendPop, blendTiles, blendArea))
 		end
 	end
 
