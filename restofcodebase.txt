@@ -870,3 +870,1265 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 
 return UnitManager
+--- src/shared/TileKeyUtils.lua ---
+-- TileKeyUtils (ModuleScript)
+local TileKeyUtils = {}
+
+local TILE_GRID_SIZE = 1 -- Keep 1-stud for high precision on irregular tiles
+
+function TileKeyUtils.getTileKey(position)
+	-- Using math.round for consistent "fingerprinting" of a position
+	local x = math.round(position.X)
+	local z = math.round(position.Z)
+	return x .. "," .. z
+end
+
+-- New Helper: Returns the rounded Vector3 so UnitManager can compare distances accurately
+function TileKeyUtils.getRoundedPosition(position)
+	return Vector3.new(math.round(position.X), position.Y, math.round(position.Z))
+end
+
+-- Parse a tile key back into X, Z coordinates
+function TileKeyUtils.parseKey(tileKey)
+	if not tileKey or type(tileKey) ~= "string" then
+		return nil, nil
+	end
+
+	local x, z = tileKey:match("^(-?%d+),(-?%d+)$")
+	if x and z then
+		return tonumber(x), tonumber(z)
+	end
+	return nil, nil
+end
+
+-- Get tile key from a BasePart (tile)
+-- Uses the spawn position (top center of tile + offset)
+function TileKeyUtils.getTileKeyFromPart(tilePart)
+	if not tilePart or not tilePart:IsA("BasePart") then 
+		return nil 
+	end
+
+	-- Use spawn position like elsewhere (top of tile + 3 studs)
+	local spawnPos = tilePart.Position + Vector3.new(0, tilePart.Size.Y / 2 + 3, 0)
+	return TileKeyUtils.getTileKey(spawnPos)
+end
+
+-- Check if two tile keys are the same
+function TileKeyUtils.areKeysEqual(keyA, keyB)
+	return keyA == keyB
+end
+
+-- Validate that a tile key is properly formatted
+function TileKeyUtils.isValidKey(tileKey)
+	if not tileKey or type(tileKey) ~= "string" then
+		return false
+	end
+
+	local x, z = TileKeyUtils.parseKey(tileKey)
+	return x ~= nil and z ~= nil
+end
+
+return TileKeyUtils
+--- src/shared/ServerState.lua ---
+-- ServerState (ModuleScript in ServerScriptService)
+-- Centralized registry for shared server data
+-- Now includes CountryCoins, CountryManpower, AND OccupiedTerritories
+
+-- Module-level service references (evaluated once at require time, zero per-call overhead)
+local RunService = game:GetService("RunService")
+
+-- Rate-limit tracker for resolveTarget unknown-value warnings (one warn per unique pair)
+local _warnedUnknown = {}
+
+local ServerState = {
+	CountryOwners = {},
+	CountryCoins = {},       -- { ["France"] = 150, ["Germany"] = 0, ... }
+	CountryManpower = {},    -- { ["France"] = 5000, ["Germany"] = 0, ... }
+	OccupiedTerritories = {}, -- NEW: { [tilePart] = { occupier = Player, originalCountry = "Germany" } }
+	PendingDiplomacyRequests = {} -- FIX: { [requestId] = { ... } }
+}
+
+---------------------------------------------------
+-- Country Owners
+---------------------------------------------------
+
+function ServerState.setCountryOwners(ownersTable)
+	ServerState.CountryOwners = ownersTable
+end
+
+function ServerState.getCountryOwners()
+	-- CONTRACT: returns the actual CountryOwners table by reference (not a copy).
+	-- All callers read the same live table. Do NOT change this to return a copy —
+	-- doing so would let resolveTarget() and other callers silently diverge.
+	return ServerState.CountryOwners
+end
+
+-- FIX: Resolve the actual controlling player for a country, following conquest chains
+-- Example: France → Conquered_Germany → Conquered_Poland → PlayerPolish
+-- Returns: Player instance if chain resolves to a player, nil otherwise
+-- CRITICAL for multi-conquest scenarios (Bug 1 + Bug 2 fixes)
+function ServerState.resolveCountryOwner(countryName)
+	local seen = {} -- Cycle detection
+
+	while true do
+		local owner = ServerState.CountryOwners[countryName]
+
+		-- If we found a Player, return it
+		if typeof(owner) == "Instance" and owner:IsA("Player") then
+			return owner
+		end
+
+		-- If it's not a string, we can't resolve further
+		if type(owner) ~= "string" then
+			return nil  -- Unowned or invalid
+		end
+
+		-- Try to extract the conquering country from "Conquered_X" format
+		local conquerorCountry = owner:match("^Conquered_(.+)$")
+		if not conquerorCountry then
+			return nil  -- Not a conquest string
+		end
+
+		-- Cycle detection (shouldn't happen, but defensive)
+		if seen[conquerorCountry] then
+			warn("[ServerState] Cycle detected in conquest chain: " .. countryName)
+			return nil
+		end
+		seen[conquerorCountry] = true
+
+		-- Follow the chain to the conquering country
+		countryName = conquerorCountry
+	end
+end
+
+-- SERVER-ONLY: Resolve a country name through "Conquered_X" chains, returning
+-- BOTH the canonical controlling country name AND the controlling Player (or nil).
+--
+-- Allowed CountryOwners values: Player instance | "Unowned" | "Conquered_X"
+-- Unknown string values are warned once and returned as (countryName, nil) so
+-- callers can still show a meaningful error instead of an opaque nil failure.
+--
+-- Returns: (canonicalCountryName: string, controllingPlayer: Player|nil)
+--          (nil, nil) only on cycle detection or invalid input.
+function ServerState.resolveTarget(countryName)
+	-- Server-only guard (module-level RunService, zero per-call overhead)
+	if RunService:IsClient() then
+		error("[ServerState.resolveTarget] This function is server-only and must not be called on the client.")
+	end
+
+	-- Input validation
+	if type(countryName) ~= "string" or countryName == "" then
+		warn("[ServerState.resolveTarget] Invalid countryName: " .. tostring(countryName))
+		return nil, nil
+	end
+
+	local owners = ServerState.getCountryOwners()  -- stable backing table by reference
+	local seen = {}
+
+	while true do
+		-- Cycle guard on the CURRENT node (before following any link)
+		if seen[countryName] then
+			warn(("[ServerState.resolveTarget] Cycle detected at: %s"):format(countryName))
+			return nil, nil
+		end
+		seen[countryName] = true
+
+		local owner = owners[countryName]
+
+		if typeof(owner) == "Instance" and owner:IsA("Player") then
+			return countryName, owner        -- player-owned: both values known
+		end
+		if type(owner) ~= "string" then
+			return countryName, nil          -- nil or unknown type: name resolved, no player
+		end
+		if owner == "Unowned" then
+			return countryName, nil          -- unowned country
+		end
+
+		local conqueror = owner:match("^Conquered_(.+)$")
+		if not conqueror then
+			-- Unknown string — warn once per (countryName, owner) pair to avoid log spam
+			local warnKey = countryName .. "|" .. owner
+			if not _warnedUnknown[warnKey] then
+				_warnedUnknown[warnKey] = true
+				warn(("[ServerState.resolveTarget] Unknown owner value for '%s': '%s'")
+					:format(countryName, owner))
+			end
+			return countryName, nil
+		end
+
+		countryName = conqueror  -- follow the chain
+	end
+end
+
+function ServerState.isCountryUnowned(countryName)
+	local owners = ServerState.getCountryOwners()
+	return owners[countryName] == "Unowned"
+end
+
+---------------------------------------------------
+-- Country Coins
+---------------------------------------------------
+
+function ServerState.setCountryCoins(countryName, amount)
+	ServerState.CountryCoins[countryName] = amount
+end
+
+function ServerState.getCountryCoins(countryName)
+	return ServerState.CountryCoins[countryName] or 0
+end
+
+function ServerState.addCountryCoins(countryName, amount)
+	ServerState.CountryCoins[countryName] = (ServerState.CountryCoins[countryName] or 0) + amount
+	return ServerState.CountryCoins[countryName]
+end
+
+function ServerState.getAllCountryCoins()
+	return ServerState.CountryCoins
+end
+
+function ServerState.initializeCountryCoins(countryName, startingAmount)
+	if ServerState.CountryCoins[countryName] == nil then
+		ServerState.CountryCoins[countryName] = startingAmount or 0
+	end
+end
+
+---------------------------------------------------
+-- Country Manpower
+---------------------------------------------------
+
+function ServerState.setCountryManpower(countryName, amount)
+	ServerState.CountryManpower[countryName] = amount
+end
+
+function ServerState.getCountryManpower(countryName)
+	return ServerState.CountryManpower[countryName] or 0
+end
+
+function ServerState.addCountryManpower(countryName, amount)
+	ServerState.CountryManpower[countryName] = (ServerState.CountryManpower[countryName] or 0) + amount
+	return ServerState.CountryManpower[countryName]
+end
+
+function ServerState.getAllCountryManpower()
+	return ServerState.CountryManpower
+end
+
+function ServerState.initializeCountryManpower(countryName, startingAmount)
+	if ServerState.CountryManpower[countryName] == nil then
+		ServerState.CountryManpower[countryName] = startingAmount or 0
+	end
+end
+
+---------------------------------------------------
+-- NEW: Occupied Territories
+---------------------------------------------------
+
+-- Add an occupied territory
+function ServerState.addOccupiedTerritory(tilePart, occupier, originalCountry)
+	ServerState.OccupiedTerritories[tilePart] = {
+		occupier = occupier,
+		originalCountry = originalCountry
+	}
+end
+
+-- Remove an occupied territory
+function ServerState.removeOccupiedTerritory(tilePart)
+	ServerState.OccupiedTerritories[tilePart] = nil
+end
+
+-- Get occupation data for a tile
+function ServerState.getOccupiedTerritory(tilePart)
+	return ServerState.OccupiedTerritories[tilePart]
+end
+
+-- Get all occupied territories
+function ServerState.getAllOccupiedTerritories()
+	return ServerState.OccupiedTerritories
+end
+
+-- Check if a tile is occupied
+function ServerState.isTileOccupied(tilePart)
+	return ServerState.OccupiedTerritories[tilePart] ~= nil
+end
+
+-- Get all tiles occupied by a specific player
+function ServerState.getPlayerOccupiedTerritories(player)
+	local tiles = {}
+	for tilePart, data in pairs(ServerState.OccupiedTerritories) do
+		if data.occupier == player then
+			table.insert(tiles, tilePart)
+		end
+	end
+	return tiles
+end
+
+-- Clear all occupied territories for a player
+-- FIX: Collect keys first to avoid modifying table during iteration
+function ServerState.clearPlayerOccupiedTerritories(player)
+	local tilesToRemove = {}
+	for tilePart, data in pairs(ServerState.OccupiedTerritories) do
+		if data.occupier == player then
+			table.insert(tilesToRemove, tilePart)
+		end
+	end
+	for _, tilePart in ipairs(tilesToRemove) do
+		ServerState.OccupiedTerritories[tilePart] = nil
+	end
+end
+
+-- Get count of territories a player has occupied
+function ServerState.getPlayerOccupiedCount(player)
+	local count = 0
+	for _, data in pairs(ServerState.OccupiedTerritories) do
+		if data.occupier == player then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+---------------------------------------------------
+-- FIX: Pending Diplomacy Requests
+---------------------------------------------------
+
+-- Store a pending diplomacy request
+function ServerState.setPendingDiplomacyRequest(requestId, requestData)
+	ServerState.PendingDiplomacyRequests[requestId] = requestData
+end
+
+-- Get a pending diplomacy request
+function ServerState.getPendingDiplomacyRequest(requestId)
+	return ServerState.PendingDiplomacyRequests[requestId]
+end
+
+-- Clear a pending diplomacy request
+function ServerState.clearPendingDiplomacyRequest(requestId)
+	ServerState.PendingDiplomacyRequests[requestId] = nil
+end
+
+return ServerState
+--- src/playerscripts/NPCVisualsHandler.client.lua ---
+-- LocalScript: NPCVisualsHandler (Place in StarterPlayerScripts)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+local SelectionVisualEvent = ReplicatedStorage:WaitForChild("SelectionVisualEvent", 10)
+
+-- Config
+local SELECTION_COLOR = Color3.fromRGB(0, 255, 0)
+local HIGHLIGHT_TRANSPARENCY = 0.8
+
+-- State
+local SelectedNPCs = {} -- npcModel -> true
+local Highlighting = {} -- npcModel -> Highlight
+
+-- Optimization: Track all NPCs to handle bulk updates if needed
+local RegisteredNPCs = {}
+
+local function createHighlight(npcModel)
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = SELECTION_COLOR
+	highlight.OutlineColor = SELECTION_COLOR
+	highlight.Adornee = npcModel
+	highlight.FillTransparency = HIGHLIGHT_TRANSPARENCY
+	highlight.Enabled = true
+	highlight.Parent = npcModel
+	return highlight
+end
+
+local function toggleHighlight(npcModel, shouldHighlight)
+	if not npcModel or not npcModel.Parent then return end
+
+	if shouldHighlight then
+		SelectedNPCs[npcModel] = true
+		if not Highlighting[npcModel] then
+			Highlighting[npcModel] = createHighlight(npcModel)
+			
+			-- Clean up when NPC is destroyed
+			npcModel.Destroying:Once(function()
+				Highlighting[npcModel] = nil
+				SelectedNPCs[npcModel] = nil
+			end)
+		else
+			Highlighting[npcModel].Enabled = true
+		end
+	else
+		SelectedNPCs[npcModel] = nil
+		if Highlighting[npcModel] then
+			Highlighting[npcModel].Enabled = false
+		end
+	end
+end
+
+-- Task Scheduler Optimization Loop
+local function onHeartbeat(_dt)
+	-- Serial phase: Apply visual updates
+	-- If we had custom selection rings (Parts), we would use BulkMoveTo here:
+	-- workspace:BulkMoveTo(models, cframes, Enum.BulkMoveMode.FireCFrameChanged)
+end
+
+RunService.Heartbeat:Connect(onHeartbeat)
+
+SelectionVisualEvent.OnClientEvent:Connect(function(npcModel, shouldHighlight)
+	toggleHighlight(npcModel, shouldHighlight)
+end)
+
+-- Initialize with existing NPCs
+for _, npc in ipairs(CollectionService:GetTagged("RegisteredNPC")) do
+	RegisteredNPCs[npc] = true
+end
+
+CollectionService:GetInstanceAddedSignal("RegisteredNPC"):Connect(function(npc)
+	RegisteredNPCs[npc] = true
+end)
+
+CollectionService:GetInstanceRemovedSignal("RegisteredNPC"):Connect(function(npc)
+	RegisteredNPCs[npc] = nil
+	if Highlighting[npc] then
+		Highlighting[npc]:Destroy()
+		Highlighting[npc] = nil
+	end
+	SelectedNPCs[npc] = nil
+end)
+
+print("[NPCVisualsHandler] Task-optimized visuals active.")
+
+--- src/playerscripts/TileVisualEffects.client.lua ---
+-- TileVisualEffects (client)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local TileCapturedEvent = ReplicatedStorage:WaitForChild("TileCapturedEvent", 10)
+local EUROPE_MAP = Workspace:WaitForChild("EuropeMap", 10)
+
+-- Config
+local TWEEN_TIME = 0.8 -- Duration of the color transition
+
+-- Cache
+local CountryColors = {}
+-- ActiveTransitions: part -> { startColor: Color3, targetColor: Color3, elapsed: number }
+local ActiveTransitions = {}
+
+-- Helper: get a representative BasePart color for a country model
+local function getFirstBasePartColor(countryModel)
+	if not countryModel then return nil end
+
+	local container = countryModel:FindFirstChild("Parts") or countryModel:FindFirstChild("Tiles")
+	if container and typeof(container.GetChildren) == "function" then
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("BasePart") then
+				return child.Color
+			end
+			if child:IsA("Model") or child:IsA("Folder") then
+				for _, sub in ipairs(child:GetChildren()) do
+					if sub:IsA("BasePart") then
+						return sub.Color
+					end
+				end
+			end
+		end
+	end
+
+	for _, child in ipairs(countryModel:GetChildren()) do
+		if child:IsA("BasePart") then
+			return child.Color
+		end
+	end
+
+	for _, desc in ipairs(countryModel:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			return desc.Color
+		end
+	end
+
+	return nil
+end
+
+local function scanCountryColors()
+	for _, countryModel in ipairs(EUROPE_MAP:GetChildren()) do
+		if countryModel:IsA("Model") then
+			local countryName = countryModel.Name
+			local color = getFirstBasePartColor(countryModel)
+			if color then
+				CountryColors[countryName] = color
+			end
+		end
+	end
+end
+
+-- Initialize and connect
+scanCountryColors()
+
+-- Task Scheduler Optimization Loop
+local function onHeartbeat(dt)
+	if not next(ActiveTransitions) then return end
+
+	-- Optimization: Calculate all new colors in a single pass
+	local updates = {}
+	local toRemove = {}
+	
+	for part, data in pairs(ActiveTransitions) do
+		data.elapsed += dt
+		local alpha = math.clamp(data.elapsed / TWEEN_TIME, 0, 1)
+		
+		-- Use quadratic out easing: 1 - (1 - x)^2
+		local easeAlpha = 1 - (1 - alpha) * (1 - alpha)
+		local newColor = data.startColor:Lerp(data.targetColor, easeAlpha)
+		
+		updates[part] = newColor
+		
+		if alpha >= 1 then
+			table.insert(toRemove, part)
+		end
+	end
+	
+	-- Apply property changes in a batch
+	for part, color in pairs(updates) do
+		if part.Parent then
+			part.Color = color
+		end
+	end
+	
+	for _, part in ipairs(toRemove) do
+		ActiveTransitions[part] = nil
+	end
+end
+
+RunService.Heartbeat:Connect(onHeartbeat)
+
+local function onTileCaptured(tilePartOrBatch, playerName, countryName)
+	if not tilePartOrBatch or not countryName then return end
+	
+	local targetColor = CountryColors[countryName]
+	if not targetColor then return end
+
+	local function registerPart(part)
+		if not part:IsA("BasePart") then return end
+		if part.Color == targetColor then return end
+		
+		ActiveTransitions[part] = {
+			startColor = part.Color,
+			targetColor = targetColor,
+			elapsed = 0
+		}
+	end
+
+	if typeof(tilePartOrBatch) == "table" then
+		for _, tilePart in ipairs(tilePartOrBatch) do
+			registerPart(tilePart)
+		end
+	else
+		registerPart(tilePartOrBatch)
+	end
+end
+
+TileCapturedEvent.OnClientEvent:Connect(onTileCaptured)
+
+print("[TileVisualEffects] Batched color transitions active.")
+
+
+--- src/playerscripts/TileClickHandler.client.lua ---
+-- TileClickHandler (LocalScript in StarterPlayerScripts)
+-- Detects when player clicks on map tiles and sends to server for NPC movement
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local DEBUG = false
+local Player = Players.LocalPlayer
+local Mouse = Player:GetMouse()
+
+-- Wait for RemoteEvent
+local NPCMoveToTileEvent = ReplicatedStorage:WaitForChild("NPCMoveToTileEvent", 10)
+
+-- Get reference to EuropeMap
+local EuropeMap = Workspace:WaitForChild("EuropeMap", 10)
+
+-- Helper to check if a part is a tile (inside EuropeMap country models)
+local function isTilePart(part)
+	if not part or not part:IsA("BasePart") then return false end
+
+	-- Parts directly under EuropeMap are not tiles
+	if part.Parent == EuropeMap then return false end
+
+	-- Walk up to check if this part is inside a country model
+	local current = part.Parent
+	while current and current ~= Workspace do
+		if current.Parent == EuropeMap then
+			-- Found a country model
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+-- Helper to check if we clicked on an NPC (not a tile)
+local function isNPCPart(part)
+	if not part then return false end
+
+	-- Walk up to find if this is part of an NPC model
+	local current = part.Parent
+	while current and current ~= Workspace do
+		if current:IsA("Model") then
+			-- Check if it has Humanoid (NPC indicator)
+			if current:FindFirstChildOfClass("Humanoid") then
+				return true
+			end
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+-- Handle mouse click
+Mouse.Button1Down:Connect(function()
+	local target = Mouse.Target
+
+	if not target then return end
+
+	-- Skip if we clicked on an NPC (handled by ClickDetector)
+	if isNPCPart(target) then
+		return
+	end
+
+	-- Check if we clicked on a tile
+	if isTilePart(target) then
+		-- Send tile click to server
+		NPCMoveToTileEvent:FireServer(target)
+	end
+end)
+
+if DEBUG then print("[TileClickHandler] Initialized - listening for tile clicks") end
+
+--- src/playerscripts/TileCursor.client.lua ---
+-- TileCursor LocalScript
+-- Combines:
+--  - LRU caching & eviction (from v5)
+--  - Strict disabling of Highlight/SelectionBox when not in use (from v12)
+--  - Name/size filters, safe clone of cursor, robust cleanup
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Player = Players.LocalPlayer
+local Mouse = Player:GetMouse()
+
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
+local DEBUG_HOVER = false
+local MAX_TILE_SIZE = 300
+local CACHE_MAX_SIZE = 500
+local CACHE_EVICT_COUNT = 250 -- how many oldest entries to evict when full
+local MAX_HIERARCHY_DEPTH = 20
+
+local IGNORE_NAMES = {
+	["ocean"] = true, ["water"] = true, ["sea"] = true,
+	["background"] = true, ["baseplate"] = true, ["base"] = true,
+	["hitbox"] = true, ["bounds"] = true, ["map"] = true,
+	["visuals"] = true, ["meshes"] = true, ["terrain"] = true,
+	["folder"] = true, ["countries"] = true, ["oceanfront"] = true
+}
+
+--------------------------------------------------------------------------------
+-- ASSETS
+--------------------------------------------------------------------------------
+local OriginalCursor = ReplicatedStorage:WaitForChild("TileCursor", 10)
+if not OriginalCursor then
+	warn("[TileCursor] CRITICAL: TileCursor not found in ReplicatedStorage")
+	return
+end
+
+-- Make a local clone so we can safely toggle/Destroy it without affecting other clients
+local Cursor = OriginalCursor:Clone()
+Cursor.Name = "LocalTileCursor"
+Cursor.Parent = Workspace
+
+-- Ensure cursor starts OFF (prevents highlight parent fallback)
+if Cursor:IsA("Highlight") then
+	Cursor.Enabled = false
+elseif Cursor:IsA("SelectionBox") then
+	Cursor.Visible = false
+end
+
+local EuropeMap = Workspace:WaitForChild("EuropeMap", 10)
+if not EuropeMap then
+	warn("[TileCursor] EuropeMap not found in Workspace")
+	-- keep script alive, but nothing to highlight
+end
+
+--------------------------------------------------------------------------------
+-- CACHE (LRU)
+--------------------------------------------------------------------------------
+-- countryModelCache[part] = { countryModel = Model or false, lastAccess = number }
+local countryModelCache = {}
+local cacheAccessOrder = {} -- array of parts, oldest at index 1
+
+local function touchCacheEntry(part)
+	-- remove existing occurrence
+	for i = #cacheAccessOrder, 1, -1 do
+		if cacheAccessOrder[i] == part then
+			table.remove(cacheAccessOrder, i)
+			break
+		end
+	end
+	table.insert(cacheAccessOrder, part) -- newest on the end
+end
+
+local function evictOldestEntries()
+	while #cacheAccessOrder > CACHE_MAX_SIZE do
+		-- remove CACHE_EVICT_COUNT or until under limit
+		local removed = 0
+		for i = 1, CACHE_EVICT_COUNT do
+			if #cacheAccessOrder == 0 then break end
+			local oldPart = table.remove(cacheAccessOrder, 1)
+			if oldPart then
+				countryModelCache[oldPart] = nil
+			end
+			removed = removed + 1
+		end
+		-- safety: if nothing removed, break to avoid infinite loop
+		if removed == 0 then break end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- UTIL
+--------------------------------------------------------------------------------
+local function isIgnored(name)
+	if not name then return false end
+	return IGNORE_NAMES[string.lower(name)] == true
+end
+
+local function validatePartCandidate(part)
+	if not part or not part:IsA("BasePart") then return false end
+	if isIgnored(part.Name) then return false end
+	-- size check: ignore huge parts that are likely background/baseplates
+	-- use absolute magnitudes of X and Z
+	if part.Size and (part.Size.X > MAX_TILE_SIZE or part.Size.Z > MAX_TILE_SIZE) then
+		return false
+	end
+	-- ignore fully transparent parts
+	if part.Transparency and part.Transparency >= 1 then
+		return false
+	end
+	return true
+end
+
+--------------------------------------------------------------------------------
+-- getCountryModel: walk up to find a model whose parent is EuropeMap
+-- Returns Model or nil. Uses cache (LRU).
+--------------------------------------------------------------------------------
+local function getCountryModel(part)
+	if not part or not validatePartCandidate(part) then
+		return nil
+	end
+
+	-- cache check
+	local cached = countryModelCache[part]
+	if cached ~= nil then
+		-- update LRU order
+		touchCacheEntry(part)
+		cached.lastAccess = tick()
+		return cached.countryModel or nil
+	end
+
+	-- if the part is directly a child of EuropeMap, treat as non-country tile
+	if part.Parent == EuropeMap then
+		countryModelCache[part] = { countryModel = false, lastAccess = tick() }
+		touchCacheEntry(part)
+		evictOldestEntries()
+		return nil
+	end
+
+	-- walk up
+	local current = part.Parent
+	local depth = 0
+	while current and current ~= EuropeMap and current ~= Workspace and depth < MAX_HIERARCHY_DEPTH do
+		-- if we found a direct child of EuropeMap
+		if current.Parent == EuropeMap then
+			-- validate name
+			if isIgnored(current.Name) then
+				countryModelCache[part] = { countryModel = false, lastAccess = tick() }
+				touchCacheEntry(part)
+				evictOldestEntries()
+				return nil
+			end
+			-- accept as country model
+			countryModelCache[part] = { countryModel = current, lastAccess = tick() }
+			touchCacheEntry(part)
+			evictOldestEntries()
+			return current
+		end
+		current = current.Parent
+		depth = depth + 1
+	end
+
+	-- nothing found — cache negative result
+	countryModelCache[part] = { countryModel = false, lastAccess = tick() }
+	touchCacheEntry(part)
+	evictOldestEntries()
+	return nil
+end
+
+--------------------------------------------------------------------------------
+-- Cache invalidation: remove entries when parts are removed from EuropeMap
+--------------------------------------------------------------------------------
+local descRemovingConn
+local function setupCacheInvalidation()
+	if not EuropeMap then return end
+	descRemovingConn = EuropeMap.DescendantRemoving:Connect(function(desc)
+		if desc and desc:IsA("BasePart") then
+			if countryModelCache[desc] ~= nil then
+				countryModelCache[desc] = nil
+			end
+			-- remove from access order
+			for i = #cacheAccessOrder, 1, -1 do
+				if cacheAccessOrder[i] == desc then
+					table.remove(cacheAccessOrder, i)
+					break
+				end
+			end
+		end
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- Visual control helpers (handles both Highlight and SelectionBox)
+--------------------------------------------------------------------------------
+local function disableCursorVisuals()
+	if not Cursor then return end
+	if Cursor:IsA("Highlight") then
+		-- Ensure parent highlight does not silently highlight parent when adornee is nil
+		Cursor.Adornee = nil
+		Cursor.Enabled = false
+	elseif Cursor:IsA("SelectionBox") then
+		Cursor.Adornee = nil
+		Cursor.Visible = false
+	else
+		-- fallback: try to nil adornee
+		pcall(function() Cursor.Adornee = nil end)
+	end
+end
+
+local function enableCursorVisuals(targetPart)
+	if not Cursor then return end
+	Cursor.Adornee = targetPart
+	if Cursor:IsA("Highlight") then
+		Cursor.Enabled = true
+	elseif Cursor:IsA("SelectionBox") then
+		Cursor.Visible = true
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Main render loop
+--------------------------------------------------------------------------------
+local renderConn
+local lastTarget = nil
+local lastResult = nil -- for debug printing reduction
+
+local function onRenderStepped()
+	local target = Mouse.Target
+
+	-- fast path: unchanged
+	if target == lastTarget then return end
+	lastTarget = target
+
+	if target and target:IsA("BasePart") then
+		local countryModel = getCountryModel(target)
+
+		if countryModel then
+			-- enable visuals on the exact hovered part (avoids whole-model highlight)
+			enableCursorVisuals(target)
+
+			if DEBUG_HOVER and lastResult ~= countryModel then
+				print("✅ HIT:", countryModel.Name, "part:", target.Name)
+				lastResult = countryModel
+			end
+		else
+			-- nothing relevant, turn off visuals
+			disableCursorVisuals()
+			if DEBUG_HOVER and lastResult ~= "void" then
+				-- optional debug: print("❌ IGNORED: " .. (target and target.Name or "nil"))
+				lastResult = "void"
+			end
+		end
+	else
+		-- sky / no target
+		disableCursorVisuals()
+		lastResult = "nil"
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Cleanup: disconnect everything & destroy the cloned cursor
+--------------------------------------------------------------------------------
+local function cleanup()
+	-- Disconnect render
+	if renderConn then
+		renderConn:Disconnect()
+		renderConn = nil
+	end
+	-- DescendantRemoving
+	if descRemovingConn then
+		descRemovingConn:Disconnect()
+		descRemovingConn = nil
+	end
+	-- Clear cache tables
+	countryModelCache = {}
+	cacheAccessOrder = {}
+
+	-- Destroy cursor clone safely
+	if Cursor and Cursor.Parent then
+		pcall(function() Cursor:Destroy() end)
+	end
+	Cursor = nil
+end
+
+--------------------------------------------------------------------------------
+-- Setup connections & start
+--------------------------------------------------------------------------------
+script.Destroying:Connect(cleanup)
+-- If the player is removed (server-side), also cleanup locally
+local playerRemConn
+playerRemConn = Players.PlayerRemoving:Connect(function(removedPlayer)
+	if removedPlayer == Player then
+		cleanup()
+		if playerRemConn then playerRemConn:Disconnect() end
+	end
+end)
+
+setupCacheInvalidation()
+renderConn = RunService.RenderStepped:Connect(onRenderStepped)
+
+if DEBUG_HOVER then print("[TileCursor] Initialized. DEBUG_HOVER =", DEBUG_HOVER) end
+
+--- src/client/BuyNPCGui.client.lua ---
+-- LocalScript inside BuyNPCGui
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local BuyNPCEvent = ReplicatedStorage:WaitForChild("BuyNPCEvent", 10)
+
+local player = game.Players.LocalPlayer
+local gui = script.Parent
+
+local mainFrame = gui:WaitForChild("MainFrame", 10)
+local attackerBtn = mainFrame:WaitForChild("BuyAttackerButton", 10)
+local defenderBtn = mainFrame:WaitForChild("BuyDefenderButton", 10)
+
+attackerBtn.MouseButton1Click:Connect(function()
+	BuyNPCEvent:FireServer("AttackerNPC")
+end)
+
+defenderBtn.MouseButton1Click:Connect(function()
+	BuyNPCEvent:FireServer("DefenderNPC")
+end)
+--- src/client/NotificationGui.client.lua ---
+-- LocalScript inside NotificationGui
+-- UPDATED: Added a Queueing System and TweenService Animations
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local GlobalNotificationEvent = ReplicatedStorage:WaitForChild("GlobalNotificationEvent", 10)
+
+local frame = script.Parent:WaitForChild("AlertFrame")
+local label = frame:WaitForChild("AlertText")
+
+-- Animation & Timing Configuration
+local DISPLAY_TIME = 4.0      -- How long the notification stays on screen
+local TWEEN_DURATION = 0.5    -- How long the slide in/out animation takes
+
+-- Capture the original layout position to use as the "on-screen" target
+local ON_SCREEN_POS = frame.Position
+-- Calculate an "off-screen" position (slides up by 15% of screen height)
+local OFF_SCREEN_POS = ON_SCREEN_POS - UDim2.new(0, 0, 0.15, 0)
+
+-- Set initial state
+frame.Position = OFF_SCREEN_POS
+frame.Visible = false
+
+-- Queue State
+local notificationQueue = {}
+local isPlaying = false
+
+-- Function to process the queue sequentially
+local function processQueue()
+	-- If a notification is already playing, or the queue is empty, do nothing
+	if isPlaying or #notificationQueue == 0 then return end
+	isPlaying = true
+
+	-- Grab the oldest notification from the front of the queue
+	local currentAlert = table.remove(notificationQueue, 1)
+
+	-- 1. Setup UI
+	label.Text = currentAlert.message
+	label.TextColor3 = currentAlert.color
+	frame.Position = OFF_SCREEN_POS
+	frame.Visible = true
+
+	-- 2. Slide In Animation (using 'Back' for a nice pop effect)
+	local tweenInInfo = TweenInfo.new(TWEEN_DURATION, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	local tweenIn = TweenService:Create(frame, tweenInInfo, {Position = ON_SCREEN_POS})
+	
+	-- Optional: Play a sound here!
+	-- local sound = script.Parent:FindFirstChild("AlertSound")
+	-- if sound then sound:Play() end
+	
+	tweenIn:Play()
+	tweenIn.Completed:Wait() -- Wait for slide-in to finish
+
+	-- 3. Hold on screen
+	task.wait(DISPLAY_TIME)
+
+	-- 4. Slide Out Animation
+	local tweenOutInfo = TweenInfo.new(TWEEN_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local tweenOut = TweenService:Create(frame, tweenOutInfo, {Position = OFF_SCREEN_POS})
+	
+	tweenOut:Play()
+	tweenOut.Completed:Wait() -- Wait for slide-out to finish
+
+	-- 5. Cleanup and check for more
+	frame.Visible = false
+	isPlaying = false
+
+	-- If there are more notifications waiting, process them immediately
+	if #notificationQueue > 0 then
+		task.defer(processQueue)
+	end
+end
+
+-- Listen for global events
+GlobalNotificationEvent.OnClientEvent:Connect(function(message, color)
+	-- Add to the queue
+	table.insert(notificationQueue, {
+		message = message,
+		color = color
+	})
+
+	-- Attempt to process the queue
+	processQueue()
+end)
+
+--- src/client/CountrySelectionScreen.client.lua ---
+-- LocalScript inside CountrySelectionScreen (Server-Authoritative)
+-- No longer reads replicated Country stat to decide visibility.
+--      The server's GetAvailableCountries response is the single source of truth:
+--        • table  → list of available countries (show selection screen)
+--        • false  → player already owns a country (hide screen)
+--        • nil    → server not ready yet (retry)
+local DEBUG = false
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+
+-- =============================================
+-- REMOTE REFERENCES (with nil guards)
+-- =============================================
+local SelectCountryEvent = ReplicatedStorage:WaitForChild("SelectCountryEvent", 15)
+local GetAvailableCountries = ReplicatedStorage:WaitForChild("GetAvailableCountries", 15)
+local CountryClaimedEvent = ReplicatedStorage:WaitForChild("CountryClaimedEvent", 15)
+local InitializationComplete = ReplicatedStorage:WaitForChild("InitializationComplete", 15)
+
+if not SelectCountryEvent or not GetAvailableCountries or not CountryClaimedEvent or not InitializationComplete then
+	warn("[CountrySelection] Missing RemoteEvents in ReplicatedStorage — aborting script")
+	return
+end
+
+-- =============================================
+-- UI REFERENCES (with nil guards for each step)
+-- =============================================
+local gui = player:WaitForChild("PlayerGui", 15)
+if not gui then
+	warn("[CountrySelection] PlayerGui not found — aborting script")
+	return
+end
+
+local countryScreen = gui:WaitForChild("CountrySelectionScreen", 15)
+if not countryScreen then
+	warn("[CountrySelection] CountrySelectionScreen ScreenGui not found — aborting script")
+	return
+end
+
+local CountryFrame = countryScreen:WaitForChild("CountryFrame", 10)
+if not CountryFrame then
+	warn("[CountrySelection] CountryFrame not found — aborting script")
+	return
+end
+
+local CountryList = CountryFrame:WaitForChild("CountryList", 10)
+if not CountryList then
+	warn("[CountrySelection] CountryList not found — aborting script")
+	return
+end
+
+local ButtonTemplate = CountryList:WaitForChild("CountryButtonTemplate", 10)
+if not ButtonTemplate then
+	warn("[CountrySelection] CountryButtonTemplate not found — aborting script")
+	return
+end
+
+-- Ensure the screen starts DISABLED so a failed fetch never leaves a black screen
+countryScreen.Enabled = false
+
+local buttonConnections = {}
+local isOpening = false -- Guard to prevent overlapping polling loops
+local retryNow  = false -- Set true by InitializationComplete to short-circuit the retry sleep
+
+-- =============================================
+-- BUILD COUNTRY LIST UI
+-- =============================================
+local function buildCountryList(countries)
+	for _, child in ipairs(CountryList:GetChildren()) do
+		if child:IsA("TextButton") and child ~= ButtonTemplate then
+			local conn = buttonConnections[child.Name]
+			if conn then conn:Disconnect() end
+			child:Destroy()
+		end
+	end
+
+	buttonConnections = {}
+
+	-- Sort a shallow copy so the server's original table is never mutated.
+	-- Case-insensitive so "Austria" always sorts before "Bosnia" regardless
+	-- of how the server capitalises country names.
+	local sorted = table.move(countries, 1, #countries, 1, {})
+	table.sort(sorted, function(a, b)
+		return string.lower(a) < string.lower(b)
+	end)
+
+	for i, countryName in ipairs(sorted) do
+		local btn = ButtonTemplate:Clone()
+		btn.Name = countryName
+		btn.Text = countryName
+		btn.Visible = true
+		btn.LayoutOrder = i
+		btn.Parent = CountryList
+
+		buttonConnections[countryName] = btn.MouseButton1Click:Connect(function()
+			for _, b in ipairs(CountryList:GetChildren()) do
+				if b:IsA("TextButton") then b.Active = false end
+			end
+			SelectCountryEvent:FireServer(countryName)
+		end)
+	end
+end
+
+-- =============================================
+-- CORE: SERVER-AUTHORITATIVE tryOpenMenu
+-- =============================================
+-- No client-side Country stat check.  The server tells us definitively
+-- whether the player needs to select a country.
+local function tryOpenMenu()
+	if isOpening then return end
+	isOpening = true
+
+	local success, err = pcall(function()
+		while true do
+			local ok, data = pcall(function()
+				return GetAvailableCountries:InvokeServer()
+			end)
+
+			if ok then
+				if data == false then
+					-- Server says the player already owns a country
+					countryScreen.Enabled = false
+					return
+				elseif type(data) == "table" and #data > 0 then
+					-- Countries available — show the selection screen
+					buildCountryList(data)
+					countryScreen.Enabled = true
+					return
+				end
+				-- nil or empty table → server not ready yet, fall through to retry
+			end
+
+			-- Wait before retrying; bail if the script's parent is being destroyed
+			-- (e.g., ScreenGui removed on death with ResetOnSpawn).
+			-- Short-polls in 0.1s ticks so InitializationComplete can wake us
+			-- immediately instead of waiting the full 2s safety interval.
+			if not countryScreen.Parent then return end
+			-- If InitializationComplete already fired while InvokeServer was in flight,
+			-- skip the sleep entirely so we don't waste up to 2 seconds consuming a
+			-- signal that arrived before we had a chance to check it.
+			if not retryNow then
+				local elapsed = 0
+				while elapsed < 2 and not retryNow do
+					task.wait(0.1)
+					elapsed += 0.1
+				end
+			end
+			retryNow = false -- consume the signal after the wait (or skip)
+		end
+	end)
+
+	if not success then
+		warn("[CountrySelection] Error in tryOpenMenu: " .. tostring(err))
+	end
+
+	isOpening = false
+end
+
+-- =============================================
+-- TRIGGER EVENTS
+-- =============================================
+
+-- 1. Try immediately on script load (deferred so event connections below are set up first)
+task.defer(tryOpenMenu)
+
+-- 2. Server Initialization Complete / Respawn notification
+--    The server fires this event:
+--      • Once for all players when initialization finishes (FireAllClients)
+--      • For each late joiner on PlayerAdded
+--      • For each respawn where the player doesn't own a country (CharacterAdded)
+InitializationComplete.OnClientEvent:Connect(function()
+	retryNow = true -- wake the retry loop immediately if it's sleeping
+	if not isOpening then
+		tryOpenMenu()
+	end
+end)
+
+-- 3. Country stat change listener (fallback)
+--    Catches the case where the server resets Country to "None" after death/reset
+--    and the replication arrives after the initial tryOpenMenu already ran.
+local leaderstats = player:WaitForChild("leaderstats", 10)
+if leaderstats then
+	local countryStat = leaderstats:WaitForChild("Country", 5)
+	if countryStat then
+		countryStat:GetPropertyChangedSignal("Value"):Connect(function()
+			local val = countryStat.Value
+			if (val == "" or val == "None" or val == "Defeated") and not isOpening then
+				tryOpenMenu()
+			end
+		end)
+	end
+end
+
+-- 4. Listen for other players claiming countries to auto-refresh the visible list
+CountryClaimedEvent.OnClientEvent:Connect(function(claimedCountry, claimingPlayerName)
+	if countryScreen.Enabled then
+		task.spawn(function()
+			local ok, result = pcall(function() return GetAvailableCountries:InvokeServer() end)
+			-- Guard: only refresh if we got a valid list (not false/nil)
+			if ok and type(result) == "table" and #result > 0 then
+				buildCountryList(result)
+			end
+		end)
+	end
+
+	-- If YOU claimed it, hide the screen and fire JoinSuccess
+	if claimingPlayerName == player.Name then
+		countryScreen.Enabled = false
+		local joinSuccess = ReplicatedStorage:FindFirstChild("JoinSuccess")
+		if joinSuccess then joinSuccess:Fire() end
+	end
+end)
+
+if DEBUG then print("[CountrySelectionScreen] Server-authoritative logic initialized.") end
