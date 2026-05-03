@@ -1066,7 +1066,7 @@ git commit -m "feat(retreat): integrate cleanup into unregister, transfer, spawn
 
 ## Verification Checklist
 
-After all tasks are complete, playtest each scenario in Roblox Studio:
+After all tasks are complete, tell the user to playtest each scenario in Roblox Studio but you have to explain it simply so the user understands:
 
 - [ ] **Basic retreat:** Place a Defender on a tile with adjacent friendly tiles. Attack it with enemy Attackers until health < 30%. Verify: NPC disengages, walks to an adjacent friendly tile (invulnerable during walk), arrives, shows skull, regenerates, skull disappears when health > 55%.
 - [ ] **Attacker retreat (defending):** Place a player-owned Attacker. Have an enemy attack it. Verify: Attacker with threats retreats when health drops below 30%.

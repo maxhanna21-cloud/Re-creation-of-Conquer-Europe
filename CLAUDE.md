@@ -126,8 +126,7 @@ All remotes live in `ReplicatedStorage`. The server creates them if missing; cli
 | `CountryClaimedEvent` | Server→All | Announces new country owner |
 | `InitializationComplete` | Server→All/Player | Server init done; unblocks client retry loops |
 | `NPCMoveToTileEvent` | Client→Server | Move player's NPC to clicked tile |
-| `BuyAttackerEvent` | Client→Server | Purchase attacker NPC |
-| `BuyDefenderEvent` | Client→Server | Purchase defender NPC |
+| `BuyNPCEvent` | Client→Server | Purchase NPC; payload is `"AttackerNPC"` or `"DefenderNPC"` |
 | `DeclareWarEvent` | Client→Server | Declare war on a country |
 | `SendRequestEvent` | Client→Server | Send alliance/NAP request |
 | `BreakAllianceEvent` | Client→Server | Break an alliance |
@@ -135,6 +134,9 @@ All remotes live in `ReplicatedStorage`. The server creates them if missing; cli
 | `DiplomacyResponse` | Client→Server | Accept/reject diplomacy offer |
 | `DiplomacyReminderEvent` | Server→Player | Popup: war started, NAP expired, insufficient manpower |
 | `GlobalNotificationEvent` | Server→All/Player | Toast notification |
+| `TileCapturedEvent` | Server→All | Tile ownership/color update; supports single tile or batched tile list |
+| `SelectionVisualEvent` | Server→Player | Toggle client-side NPC selection highlight |
+| `JoinSuccess` | Client-local BindableEvent | Signals client UI that the local country claim completed |
 
 ---
 
@@ -161,8 +163,8 @@ All remotes live in `ReplicatedStorage`. The server creates them if missing; cli
 
 ## Diagnostics & Debugging
 
-`src/server/Diagnostics.server.luau` — runtime debug tooling. Check here first when investigating adjacency or occupancy issues.
+`src/server/Diagnostics.server.lua` — runtime debug tooling. Check here first when investigating adjacency or occupancy issues.
 
-`src/server/Auto-Fix.server.luau` — startup self-healing for known data issues.
+`src/server/Auto-Fix.server.lua` — startup self-healing for known data issues.
 
 Long-running systems expose a `DEBUG_MODE` flag or runtime-toggleable attribute for logging. Toggle these before adding new print statements.
