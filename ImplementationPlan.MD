@@ -23,12 +23,6 @@
 
 ---
 
-## Pre-Flight: Verify Skull GUI Name
-
-Before starting implementation, open the `AttackerNPC` and `DefenderNPC` templates in ReplicatedStorage and note the exact name of the skull `BillboardGui`. The plan uses `FindFirstChild("SkullGui", true) or FindFirstChild("BillboardGui", true)` as a heuristic search — replace both occurrences (in `handleRetreatArrival` and `cleanupRetreatState`) with the actual GUI name to avoid accidentally toggling unrelated BillboardGuis (e.g., health bars).
-
----
-
 ## Task 1: Foundation — Constants, Data Structures, Helpers
 
 **Files:**
@@ -111,7 +105,6 @@ function Combat.cleanupRetreatState(npcModel)
 
 	-- Hide skull GUI and clear SkullActive
 	local skull = npcModel:FindFirstChild("SkullGui", true)
-		or npcModel:FindFirstChild("BillboardGui", true)
 	if skull and skull:IsA("BillboardGui") then
 		skull.Enabled = false
 	end
@@ -482,7 +475,6 @@ local function handleRetreatArrival(npcModel)
 
 	-- Show skull GUI and set SkullActive attribute
 	local skull = npcModel:FindFirstChild("SkullGui", true)
-		or npcModel:FindFirstChild("BillboardGui", true)
 	if skull and skull:IsA("BillboardGui") then
 		skull.Enabled = true
 	end
@@ -505,7 +497,6 @@ local function handleRetreatArrival(npcModel)
 
 			-- Hide skull GUI and clear SkullActive
 			local skullGui = npcModel:FindFirstChild("SkullGui", true)
-				or npcModel:FindFirstChild("BillboardGui", true)
 			if skullGui and skullGui:IsA("BillboardGui") then
 				skullGui.Enabled = false
 			end
@@ -589,7 +580,18 @@ function Combat.tryTriggerRetreat(npcModel)
 	if role == "Defender" then
 		if Combat.getAttackerCount(npcModel) <= 0 then return false end
 	elseif role == "Attacker" then
-		if Combat.getThreatCount(npcModel) <= 0 then return false end
+		if Combat.getThreatCount(npcModel) <= 0 then
+			-- Not being attacked, but at low health while attacking:
+			-- halt the attack to avoid fighting to death (clear targets, stop combat)
+			local targets = manualTargets[npcModel]
+			if targets and #targets > 0 then
+				Combat.clearAllManualTargets(npcModel)
+				if DEBUG then
+					print("[Combat] " .. npcModel.Name .. " halted attack at low health (no threats, disengaging)")
+				end
+			end
+			return false
+		end
 	else
 		return false
 	end
@@ -815,6 +817,42 @@ In `Combat.noteHit` (around line 824), insert after the `if targetNpc:GetAttribu
 
 Note: this intentionally does NOT block for `"Recovering"` or `SkullActive`. Recovering/SkullActive NPCs need `noteHit` to register threats so their combat loop can auto-retaliate (defend). The attack *initiation* block is handled by `addManualTarget` and the `getAllTargets` manual-target filter.
 
+- [ ] **Step 2b: Broaden Attacker threat tracking in Combat.noteHit for ALL attackers (not just AutoRetaliate)**
+
+In `Combat.noteHit` (around line 823), the existing code has Attacker threat tracking gated behind the `AutoRetaliate` check (line 856). Player-owned attackers never get threats registered, so they can never retreat. Fix: move the Attacker threat tracking ABOVE the `AutoRetaliate` guard.
+
+Find the block starting at line 855:
+
+```lua
+	-- Auto-retaliation threat tracking only for AutoRetaliate NPCs (country-owned)
+	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
+
+	if targetRole == "Defender" then
+		Combat.noteAttackerTargeting(attackerNpc, targetNpc)
+	elseif targetRole == "Attacker" then
+		Combat.noteTargetingAttacker(attackerNpc, targetNpc)
+	end
+```
+
+Replace with:
+
+```lua
+	-- Attacker threat tracking for ALL attackers (needed for retreat decisions).
+	-- This runs regardless of AutoRetaliate so player-owned attackers can retreat.
+	if targetRole == "Attacker" then
+		Combat.noteTargetingAttacker(attackerNpc, targetNpc)
+	end
+
+	-- Defender auto-retaliation tracking only for AutoRetaliate NPCs (country-owned)
+	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
+
+	if targetRole == "Defender" then
+		Combat.noteAttackerTargeting(attackerNpc, targetNpc)
+	end
+```
+
+This ensures `getThreatCount()` returns > 0 for player-owned attackers being hit, enabling retreat.
+
 - [ ] **Step 3: Guard Attacker getAllTargets callback — filter retreating targets + skip manual targets when SkullActive**
 
 In `Combat.registerNPC`, inside the Attacker `getAllTargets` callback (around line 602), there are two sections: **manual targets** and **threats**. Both need guards.
@@ -910,17 +948,34 @@ to:
 
 - [ ] **Step 6: Add damage-time guard in fireMultiLaser**
 
-In the `fireMultiLaser` function (around line 240), inside the `for _, targetHumanoid in ipairs(targetHumanoids) do` loop, insert a guard before `targetHumanoid:TakeDamage(damagePerTarget)` (before line 245). After `if targetHumanoid and targetHumanoid.Health > 0 then` and after `if targetRoot then`, add:
+In the `fireMultiLaser` function (around line 240), inside the `for _, targetHumanoid in ipairs(targetHumanoids) do` loop, the existing code reads:
 
 ```lua
+	for _, targetHumanoid in ipairs(targetHumanoids) do
+		if targetHumanoid and targetHumanoid.Health > 0 then
+			local targetRoot = getRootPart(targetHumanoid.Parent)
+			if targetRoot then
+				createLaserBeam(npcRoot.Position, targetRoot.Position, beamColor)
+				targetHumanoid:TakeDamage(damagePerTarget)
+```
+
+Insert the retreat guard **inside** the `if targetRoot then` block, before `createLaserBeam`. The result:
+
+```lua
+	for _, targetHumanoid in ipairs(targetHumanoids) do
+		if targetHumanoid and targetHumanoid.Health > 0 then
+			local targetRoot = getRootPart(targetHumanoid.Parent)
+			if targetRoot then
 				-- Damage-time guard: target may have begun retreating after target list was built
 				local targetNpcModel = targetHumanoid.Parent
 				if targetNpcModel and targetNpcModel:GetAttribute("RetreatState") == "Retreating" then
 					continue
 				end
+				createLaserBeam(npcRoot.Position, targetRoot.Position, beamColor)
+				targetHumanoid:TakeDamage(damagePerTarget)
 ```
 
-This goes right after the `if targetRoot then` check (around line 243) and before `createLaserBeam(...)` (line 244).
+The `continue` skips the rest of the `for` loop iteration, so the retreating target gets no beam and no damage.
 
 - [ ] **Step 7: Guard NPCTargetingHandler — block SkullActive/Retreating/Recovering attacker from initiating attacks**
 
@@ -1014,7 +1069,9 @@ git commit -m "feat(retreat): integrate cleanup into unregister, transfer, spawn
 After all tasks are complete, playtest each scenario in Roblox Studio:
 
 - [ ] **Basic retreat:** Place a Defender on a tile with adjacent friendly tiles. Attack it with enemy Attackers until health < 30%. Verify: NPC disengages, walks to an adjacent friendly tile (invulnerable during walk), arrives, shows skull, regenerates, skull disappears when health > 55%.
-- [ ] **Attacker retreat:** Place a player-owned Attacker. Have an enemy attack it. Verify: Attacker with threats retreats; Attacker with no threats (only initiating attacks) does NOT retreat even at low health.
+- [ ] **Attacker retreat (defending):** Place a player-owned Attacker. Have an enemy attack it. Verify: Attacker with threats retreats when health drops below 30%.
+- [ ] **Attacker halt (attacking):** Direct a player-owned Attacker to attack an enemy. Let it take damage until low health, but ensure no enemy is counter-attacking it (getThreatCount == 0). Verify: Attacker clears its manual targets and stops fighting, but does NOT retreat. It stays on its tile.
+- [ ] **Attacker mutual combat:** Direct a player-owned Attacker to attack an enemy Defender. The Defender fights back (threats registered). Attacker reaches low health. Verify: Attacker retreats (because it has threats > 0).
 - [ ] **Invulnerability:** While an NPC is walking to its retreat tile, attempt to attack it. Verify: attacks are filtered out, no damage is applied.
 - [ ] **Recovering defense:** After an NPC arrives and shows skull, attack it with another NPC. Verify: the Recovering NPC takes damage AND auto-retaliates (defends itself) but cannot be manually directed to attack new targets.
 - [ ] **Move during recovery:** Select a Recovering NPC and issue a move order. Verify: NPC moves, skull persists, NPC still CANNOT initiate attacks (SkullActive blocks manual targeting). NPC CAN still auto-retaliate if attacked. Skull disappears when health crosses threshold, then NPC is fully operational.

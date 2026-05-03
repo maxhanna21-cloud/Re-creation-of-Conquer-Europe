@@ -407,15 +407,14 @@ function Combat.transferOwnership(npcModel, newOwner)
 	local oldOwner = npcOwners[npcModel]
 	npcOwners[npcModel] = newOwner
 
-	-- Clear manual targets when ownership changes
+	-- Clear this NPC's manual targets (with reciprocal cleanup)
 	Combat.clearAllManualTargets(npcModel)
 
-	-- Clear from defender/attacker threat lists (this NPC's own lists)
+	-- Clear this NPC's own attacker/threat lists
 	defenderAttackers[npcModel] = nil
 	attackerThreats[npcModel] = nil
 
-	-- FIX: Also remove this NPC from OTHER NPCs' target/threat lists
-	-- This prevents combat bugs when ownership changes
+	-- Remove this NPC from ALL other NPCs' target/threat lists
 	for otherNPC, targets in pairs(manualTargets) do
 		for i = #targets, 1, -1 do
 			if targets[i] == npcModel then
@@ -423,7 +422,6 @@ function Combat.transferOwnership(npcModel, newOwner)
 			end
 		end
 	end
-
 	for defender, attackers in pairs(defenderAttackers) do
 		for i = #attackers, 1, -1 do
 			if attackers[i] == npcModel then
@@ -431,7 +429,6 @@ function Combat.transferOwnership(npcModel, newOwner)
 			end
 		end
 	end
-
 	for attacker, threats in pairs(attackerThreats) do
 		for i = #threats, 1, -1 do
 			if threats[i] == npcModel then
@@ -440,8 +437,10 @@ function Combat.transferOwnership(npcModel, newOwner)
 		end
 	end
 
-	-- Reset movement state after ownership change so the NPC cannot retain:
-	-- active movement monitor, stale reservation, retreat state, or stale IsMoving.
+	-- Clear combat state
+	npcInCombat[npcModel] = false
+
+	-- Reset movement state after ownership change
 	local moveSystem = getNPCMovementSystem()
 	if moveSystem and moveSystem.OnOwnerChanged then
 		moveSystem.OnOwnerChanged(npcModel)

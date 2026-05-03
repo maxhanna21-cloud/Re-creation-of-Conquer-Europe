@@ -1415,13 +1415,14 @@ local function monitorMovement(npcModel, isRetreat)
 		getDependencies()
 		local owner = Combat.getOwner(npcModel)
 		local role = Combat.getRole(npcModel)
+		local npcCountry = npcModel:GetAttribute("Country")
 		local targetTileKey = movement.targetTileKey
 		local originTileKey = movement.originTileKey
 		local originPosition = movement.originPosition
 		local targetTilePart = TileAdjacencyManager.getTileFromKey(targetTileKey)
 		local tileCountry = TileAdjacencyManager.getTileCountry(targetTilePart)
 		local tileEffectiveOwner = TileAdjacencyManager.getEffectiveOwner(targetTilePart)
-		local playerCountry = owner and TileManager.getPlayerCountry(owner)
+		local playerCountry = (owner and TileManager.getPlayerCountry(owner)) or npcCountry
 
 		-- Occupancy check — is another NPC already here?
 		-- targetTilePart is already available; resolve TileId directly (no key roundtrip).
@@ -1438,7 +1439,6 @@ local function monitorMovement(npcModel, isRetreat)
 		-- Release old tile, claim new tile.
 		-- releaseTile is a compatibility shim (resolves tileKey → tileId internally).
 		-- occupyResolvedTile uses targetTilePart directly — no key roundtrip.
-		local npcCountry = npcModel:GetAttribute("Country")
 		if originTileKey then
 			TileManager.releaseTile(npcCountry, originTileKey)
 		end
@@ -1463,7 +1463,7 @@ local function monitorMovement(npcModel, isRetreat)
 				and DiplomacyManager.areCountriesAtWar(playerCountry, tileEffectiveOwner)
 
 			if stillAtWar then
-				TileOwnershipManager.captureTile(targetTilePart, owner)
+				TileOwnershipManager.captureTile(targetTilePart, owner or npcCountry)
 				local actualCapital = TileManager.getCountryCapital(tileCountry)
 				if actualCapital and targetTilePart == actualCapital then
 					local currentOwner = ServerState.resolveCountryOwner(tileCountry)
@@ -2050,6 +2050,16 @@ end
 function NPCMovementSystem.OnOwnerChanged(npcModel)
 	if not npcModel then return end
 	movementStates[npcModel] = movementStates[npcModel] or {}
+
+	-- Don't abort a mid-flight movement. The mission was already authorized (war was
+	-- checked at move-start). The arrival handler re-derives ownership from the NPC's
+	-- Country attribute, so tile capture works even for country-owned NPCs.
+	local currentState = movementStates[npcModel].state
+	if currentState == "Moving" or currentState == "Retreating" then
+		if DEBUG then print("[NPCMovement] OnOwnerChanged: skipping abort for in-flight NPC", npcModel.Name) end
+		return
+	end
+
 	movementStates[npcModel].state = "Idle"
 	movementStates[npcModel].stuckSince = nil
 	movementStates[npcModel].moveAttempts = 0

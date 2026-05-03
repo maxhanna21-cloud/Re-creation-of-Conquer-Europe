@@ -4124,13 +4124,14 @@ local function monitorMovement(npcModel, isRetreat)
 		getDependencies()
 		local owner = Combat.getOwner(npcModel)
 		local role = Combat.getRole(npcModel)
+		local npcCountry = npcModel:GetAttribute("Country")
 		local targetTileKey = movement.targetTileKey
 		local originTileKey = movement.originTileKey
 		local originPosition = movement.originPosition
 		local targetTilePart = TileAdjacencyManager.getTileFromKey(targetTileKey)
 		local tileCountry = TileAdjacencyManager.getTileCountry(targetTilePart)
 		local tileEffectiveOwner = TileAdjacencyManager.getEffectiveOwner(targetTilePart)
-		local playerCountry = owner and TileManager.getPlayerCountry(owner)
+		local playerCountry = (owner and TileManager.getPlayerCountry(owner)) or npcCountry
 
 		-- Occupancy check — is another NPC already here?
 		-- targetTilePart is already available; resolve TileId directly (no key roundtrip).
@@ -4147,7 +4148,6 @@ local function monitorMovement(npcModel, isRetreat)
 		-- Release old tile, claim new tile.
 		-- releaseTile is a compatibility shim (resolves tileKey → tileId internally).
 		-- occupyResolvedTile uses targetTilePart directly — no key roundtrip.
-		local npcCountry = npcModel:GetAttribute("Country")
 		if originTileKey then
 			TileManager.releaseTile(npcCountry, originTileKey)
 		end
@@ -4172,7 +4172,7 @@ local function monitorMovement(npcModel, isRetreat)
 				and DiplomacyManager.areCountriesAtWar(playerCountry, tileEffectiveOwner)
 
 			if stillAtWar then
-				TileOwnershipManager.captureTile(targetTilePart, owner)
+				TileOwnershipManager.captureTile(targetTilePart, owner or npcCountry)
 				local actualCapital = TileManager.getCountryCapital(tileCountry)
 				if actualCapital and targetTilePart == actualCapital then
 					local currentOwner = ServerState.resolveCountryOwner(tileCountry)
@@ -4759,6 +4759,16 @@ end
 function NPCMovementSystem.OnOwnerChanged(npcModel)
 	if not npcModel then return end
 	movementStates[npcModel] = movementStates[npcModel] or {}
+
+	-- Don't abort a mid-flight movement. The mission was already authorized (war was
+	-- checked at move-start). The arrival handler re-derives ownership from the NPC's
+	-- Country attribute, so tile capture works even for country-owned NPCs.
+	local currentState = movementStates[npcModel].state
+	if currentState == "Moving" or currentState == "Retreating" then
+		if DEBUG then print("[NPCMovement] OnOwnerChanged: skipping abort for in-flight NPC", npcModel.Name) end
+		return
+	end
+
 	movementStates[npcModel].state = "Idle"
 	movementStates[npcModel].stuckSince = nil
 	movementStates[npcModel].moveAttempts = 0
@@ -5248,15 +5258,14 @@ function Combat.transferOwnership(npcModel, newOwner)
 	local oldOwner = npcOwners[npcModel]
 	npcOwners[npcModel] = newOwner
 
-	-- Clear manual targets when ownership changes
+	-- Clear this NPC's manual targets (with reciprocal cleanup)
 	Combat.clearAllManualTargets(npcModel)
 
-	-- Clear from defender/attacker threat lists (this NPC's own lists)
+	-- Clear this NPC's own attacker/threat lists
 	defenderAttackers[npcModel] = nil
 	attackerThreats[npcModel] = nil
 
-	-- FIX: Also remove this NPC from OTHER NPCs' target/threat lists
-	-- This prevents combat bugs when ownership changes
+	-- Remove this NPC from ALL other NPCs' target/threat lists
 	for otherNPC, targets in pairs(manualTargets) do
 		for i = #targets, 1, -1 do
 			if targets[i] == npcModel then
@@ -5264,7 +5273,6 @@ function Combat.transferOwnership(npcModel, newOwner)
 			end
 		end
 	end
-
 	for defender, attackers in pairs(defenderAttackers) do
 		for i = #attackers, 1, -1 do
 			if attackers[i] == npcModel then
@@ -5272,7 +5280,6 @@ function Combat.transferOwnership(npcModel, newOwner)
 			end
 		end
 	end
-
 	for attacker, threats in pairs(attackerThreats) do
 		for i = #threats, 1, -1 do
 			if threats[i] == npcModel then
@@ -5281,8 +5288,10 @@ function Combat.transferOwnership(npcModel, newOwner)
 		end
 	end
 
-	-- Reset movement state after ownership change so the NPC cannot retain:
-	-- active movement monitor, stale reservation, retreat state, or stale IsMoving.
+	-- Clear combat state
+	npcInCombat[npcModel] = false
+
+	-- Reset movement state after ownership change
 	local moveSystem = getNPCMovementSystem()
 	if moveSystem and moveSystem.OnOwnerChanged then
 		moveSystem.OnOwnerChanged(npcModel)
@@ -6086,17 +6095,25 @@ end
 ---------------------------------------------------
 
 -- Capture a tile (store by country, not player)
-function TileOwnershipManager.captureTile(tilePart, player)
+function TileOwnershipManager.captureTile(tilePart, playerOrCountry)
 	getDependencies()
 
-	if not tilePart or not player then return false end
+	if not tilePart or not playerOrCountry then return false end
+
+	local playerCountry, ownerLabel
+	if typeof(playerOrCountry) == "Instance" and playerOrCountry:IsA("Player") then
+		playerCountry = TileManager.getPlayerCountry(playerOrCountry)
+		ownerLabel = playerOrCountry.Name
+	else
+		playerCountry = playerOrCountry
+		ownerLabel = playerOrCountry
+	end
 
 	local geographicCountry = TileAdjacencyManager.getTileCountry(tilePart)
 	local effectiveOwner = TileAdjacencyManager.getEffectiveOwner(tilePart)
-	local playerCountry = TileManager.getPlayerCountry(player)
 
 	if not playerCountry then
-		warn("[TileOwnership] Player has no country")
+		warn("[TileOwnership] captureTile: no country resolved for " .. tostring(playerOrCountry))
 		return false
 	end
 
@@ -6126,7 +6143,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 		-- Fire event AFTER all state writes are complete
 		local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 		if TileCapturedEvent then
-			TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
+			TileCapturedEvent:FireAllClients(tilePart, ownerLabel, playerCountry)
 		end
 		return true
 	end
@@ -6162,7 +6179,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 	-- Fire event AFTER all state writes are complete
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 	if TileCapturedEvent then
-		TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
+		TileCapturedEvent:FireAllClients(tilePart, ownerLabel, playerCountry)
 	end
 
 	return true

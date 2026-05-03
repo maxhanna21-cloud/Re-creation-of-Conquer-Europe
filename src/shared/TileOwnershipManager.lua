@@ -310,17 +310,25 @@ end
 ---------------------------------------------------
 
 -- Capture a tile (store by country, not player)
-function TileOwnershipManager.captureTile(tilePart, player)
+function TileOwnershipManager.captureTile(tilePart, playerOrCountry)
 	getDependencies()
 
-	if not tilePart or not player then return false end
+	if not tilePart or not playerOrCountry then return false end
+
+	local playerCountry, ownerLabel
+	if typeof(playerOrCountry) == "Instance" and playerOrCountry:IsA("Player") then
+		playerCountry = TileManager.getPlayerCountry(playerOrCountry)
+		ownerLabel = playerOrCountry.Name
+	else
+		playerCountry = playerOrCountry
+		ownerLabel = playerOrCountry
+	end
 
 	local geographicCountry = TileAdjacencyManager.getTileCountry(tilePart)
 	local effectiveOwner = TileAdjacencyManager.getEffectiveOwner(tilePart)
-	local playerCountry = TileManager.getPlayerCountry(player)
 
 	if not playerCountry then
-		warn("[TileOwnership] Player has no country")
+		warn("[TileOwnership] captureTile: no country resolved for " .. tostring(playerOrCountry))
 		return false
 	end
 
@@ -350,7 +358,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 		-- Fire event AFTER all state writes are complete
 		local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 		if TileCapturedEvent then
-			TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
+			TileCapturedEvent:FireAllClients(tilePart, ownerLabel, playerCountry)
 		end
 		return true
 	end
@@ -386,7 +394,7 @@ function TileOwnershipManager.captureTile(tilePart, player)
 	-- Fire event AFTER all state writes are complete
 	local TileCapturedEvent = ReplicatedStorage:FindFirstChild("TileCapturedEvent")
 	if TileCapturedEvent then
-		TileCapturedEvent:FireAllClients(tilePart, player.Name, playerCountry)
+		TileCapturedEvent:FireAllClients(tilePart, ownerLabel, playerCountry)
 	end
 
 	return true

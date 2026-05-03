@@ -644,9 +644,9 @@ local NPC_TAG = "RegisteredNPC"
 -- =============================================
 -- CONFIG
 -- =============================================
--- Set to true to paint each NPC's body parts with their country's tile color.
+-- Set to true to outline each NPC with their country's tile color.
 -- Set to false to leave NPCs as the default template appearance.
-local NPC_COUNTRY_COLORS = true
+local NPC_COUNTRY_BORDER_COLORS = true
 
 local NPCSpawner = {}
 
@@ -658,14 +658,44 @@ local function setNPCCollisionGroup(npcModel)
 	end
 end
 
-local function setNPCBodyColor(npcModel, countryName)
+local function configureCountryHighlight(highlight, npcModel, countryColor)
+	highlight.Adornee = npcModel
+	highlight.Enabled = true
+	highlight.FillColor = countryColor
+	highlight.FillTransparency = 1
+	highlight.OutlineColor = countryColor
+	highlight.OutlineTransparency = 0
+end
+
+local function getOrCreateCountryHighlight(npcModel, name)
+	local highlight = npcModel:FindFirstChild(name)
+	if highlight and not highlight:IsA("Highlight") then
+		highlight:Destroy()
+		highlight = nil
+	end
+	if not highlight then
+		highlight = Instance.new("Highlight")
+		highlight.Name = name
+		highlight.Parent = npcModel
+	end
+	return highlight
+end
+
+local function setNPCBorderColor(npcModel, countryName)
 	local countryColor = TileOwnershipManager.getCountryColor(countryName)
 	if not countryColor then return end
-	for _, part in ipairs(npcModel:GetDescendants()) do
-		if part:IsA("BasePart") then
-			part.Color = countryColor
-		end
+
+	local legacyBorder = npcModel:FindFirstChild("NPCCountryBorder")
+	if legacyBorder then
+		legacyBorder:Destroy()
 	end
+	local legacyGlow = npcModel:FindFirstChild("NPCCountryBorderGlow")
+	if legacyGlow then
+		legacyGlow:Destroy()
+	end
+
+	local borderHighlight = getOrCreateCountryHighlight(npcModel, "NPCCountryBorder")
+	configureCountryHighlight(borderHighlight, npcModel, countryColor)
 end
 
 -- Spawns an NPC for a country.
@@ -680,8 +710,8 @@ function NPCSpawner.spawnNPC(countryName, npcType, spawnPos, tileKey, ownerPlaye
 
 	local npcClone = npcTemplate:Clone()
 	setNPCCollisionGroup(npcClone)
-	if NPC_COUNTRY_COLORS then
-		setNPCBodyColor(npcClone, countryName)
+	if NPC_COUNTRY_BORDER_COLORS then
+		setNPCBorderColor(npcClone, countryName)
 	end
 
 	local role = (npcType == "DefenderNPC") and "Defender" or "Attacker"
