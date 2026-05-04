@@ -7,6 +7,7 @@ local UnitManager = {}
 -- Key: Player object | Value: Table of Units 
 local PlayerUnits = {}
 local UnitIDCounter = 0
+local DEBUG_MODE = false
 
 -- Public API: Register a new unit
 function UnitManager.registerUnit(player, npcModel, unitType)
@@ -29,6 +30,9 @@ function UnitManager.registerUnit(player, npcModel, unitType)
 			UnitManager.deregisterUnit(player, npcModel)
 		end
 	end)
+	npcModel.Destroying:Once(function()
+		UnitManager.deregisterUnit(player, npcModel)
+	end)
 
 	return unitID
 end
@@ -42,13 +46,24 @@ function UnitManager.deregisterUnit(player, npcModel)
 			PlayerUnits[player] = nil 
 		end
 
-		print("DEBUG: Deregistered unit " .. tostring(npcModel.Name))
+		if DEBUG_MODE then print("DEBUG: Deregistered unit " .. tostring(npcModel.Name)) end
 	end
 end
 
 -- Public API: Gets all unit models and positions for a player
 function UnitManager.getPlayerUnits(player)
 	return PlayerUnits[player] or {}
+end
+
+-- Public API: Returns the number of units currently registered for a player
+function UnitManager.getUnitCount(player)
+	local count = 0
+	if PlayerUnits[player] then
+		for _ in pairs(PlayerUnits[player]) do
+			count += 1
+		end
+	end
+	return count
 end
 
 -- Public API: Updates a unit's stored position after it is moved
@@ -62,7 +77,7 @@ end
 function UnitManager.clearPlayerUnits(player)
 	if PlayerUnits[player] then
 		PlayerUnits[player] = nil
-		print("DEBUG: Cleared all units for player " .. player.Name)
+		if DEBUG_MODE then print("DEBUG: Cleared all units for player " .. player.Name) end
 	end
 end
 
