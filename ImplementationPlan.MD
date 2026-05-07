@@ -8,7 +8,11 @@
 
 **Tech Stack:** Roblox Luau, ModuleScripts under `src/shared/` and `src/server/`
 
+**Line number caveat:** All line numbers in this plan are approximate (±1–3 lines) based on the file state at time of writing. Agentic workers should locate insertion points by **anchor patterns** (function names, unique code strings, comments) rather than relying on exact line numbers. Each step includes the relevant anchor alongside the line number.
+
 **User Clarification:** Moving a Recovering NPC cancels the recovery state lock (RetreatState → "None") but the skull GUI persists until health crosses RECOVERY_THRESHOLD. While the skull is showing (`SkullActive` attribute = `true`), the NPC can **defend** (auto-retaliate when attacked) but **cannot initiate attacks** (no manual targeting). The `SkullActive` attribute tracks the skull independently from `RetreatState` so the attack block survives movement-cancels-recovery. The HealthChanged listener stays connected and clears both the skull and `SkullActive` when the threshold is reached.
+
+**Auto-retaliation vs retreat clarification:** For Defenders, auto-retaliation still follows the existing `AutoRetaliate` rule. Player-owned Defenders (`AutoRetaliate ~= true`) can retreat when attacked via `defenderRetreatThreats`, but they do **not** auto-retaliate — only country-owned Defenders (`AutoRetaliate == true`) both retreat and auto-retaliate. Player-owned Attackers can defend via `attackerThreats` (which is populated for all Attackers regardless of `AutoRetaliate`).
 
 ---
 
@@ -17,7 +21,7 @@
 | File | Changes |
 |------|---------|
 | `src/shared/NPCCombatSystem.lua` | Add constants, data tables, reservation helpers. Add `tryTriggerRetreat()`, `disengageForRetreat()`, `cleanupRetreatState()`. Wire `OnRetreatArrived` callback. Add combat loop skip guard + retreat trigger. Add attack guards and invulnerability filters. Add cleanup calls in `unregisterNPC` and `transferOwnership`. |
-| `src/shared/NPCMovementSystem.lua` | Add `startHealthRetreat()`. Modify `monitorMovement()` for health retreat arrival and stuck fallback. Add movement-cancels-recovery logic in `startMovement()`. |
+| `src/shared/NPCMovementSystem.lua` | Add `startHealthRetreat()`, `cancelHealthRetreat()`. Modify `monitorMovement()` for health retreat arrival and stuck fallback. Add movement-cancels-recovery logic in `startMovement()`. |
 | `src/server/NPCTargetingHandler.server.lua` | Add RetreatState guard in `handleSecondClick()` for the attacker. |
 | `src/server/NPCSpawner.lua` | Initialize `RetreatState = "None"` on spawn. Call `Combat.cleanupRetreatState()` in cleanup pipeline. |
 
@@ -28,6 +32,16 @@
 **Files:**
 - Modify: `src/shared/NPCCombatSystem.lua`
 - Modify: `src/server/NPCSpawner.lua`
+
+- [ ] **Step 0: Add forward declaration for handleRetreatArrival**
+
+Insert **before** the `getNPCMovementSystem` lazy loader (before `local NPCMovementSystem = nil`, around line 39). This MUST appear before the closure that references it, otherwise Luau resolves it as a global `nil`:
+
+```lua
+-- Forward declaration: body assigned in Task 4 Step 1.
+-- Must appear before getNPCMovementSystem() so the lazy-loader closure captures this local.
+local handleRetreatArrival
+```
 
 - [ ] **Step 1: Add TileManager lazy loader to NPCCombatSystem**
 
@@ -67,6 +81,7 @@ Insert after the `npcRuntime` table declaration (after line 80):
 local reservedRetreatTiles = {}   -- [tileId] = npcModel
 local npcReservedTile = {}        -- [npcModel] = tileId
 local recoveryConnections = {}    -- [npcModel] = RBXScriptConnection
+local defenderRetreatThreats = {} -- [defenderNpc] = { attackerNpc, ... } (retreat-only tracking)
 ```
 
 - [ ] **Step 5: Add centralized reservation helpers**
@@ -88,15 +103,66 @@ local function releaseRetreatReservation(npcModel)
 end
 ```
 
+- [ ] **Step 5b: Add defenderRetreatThreats helpers and reciprocal cleanup**
+
+Insert after the reservation helpers. These must exist before `tryTriggerRetreat` (Task 5) which calls `getDefenderRetreatThreatCount`:
+
+```lua
+function Combat.noteDefenderRetreatThreat(attackerNpc, defenderNpc)
+	if not defenderRetreatThreats[defenderNpc] then
+		defenderRetreatThreats[defenderNpc] = {}
+	end
+	for _, existing in ipairs(defenderRetreatThreats[defenderNpc]) do
+		if existing == attackerNpc then return end
+	end
+	table.insert(defenderRetreatThreats[defenderNpc], attackerNpc)
+end
+
+function Combat.getDefenderRetreatThreatCount(npcModel)
+	local threats = defenderRetreatThreats[npcModel]
+	if not threats then return 0 end
+	-- Prune dead/destroyed attackers before counting
+	for i = #threats, 1, -1 do
+		local threat = threats[i]
+		local humanoid = threat and threat:FindFirstChildOfClass("Humanoid")
+		if not threat or not threat.Parent or not humanoid or humanoid.Health <= 0 then
+			table.remove(threats, i)
+		end
+	end
+	if #threats == 0 then
+		defenderRetreatThreats[npcModel] = nil
+		return 0
+	end
+	return #threats
+end
+
+-- Reciprocal cleanup: remove an NPC from ALL defenders' retreat threat lists.
+-- Called when an attacker dies, retreats, transfers ownership, or is unregistered.
+local function removeNPCFromDefenderRetreatThreats(npcModel)
+	for defender, threats in pairs(defenderRetreatThreats) do
+		for i = #threats, 1, -1 do
+			if threats[i] == npcModel then
+				table.remove(threats, i)
+			end
+		end
+		if #threats == 0 then
+			defenderRetreatThreats[defender] = nil
+		end
+	end
+end
+```
+
 - [ ] **Step 6: Add cleanupRetreatState public function**
 
-Insert before `return Combat` (before line 932). This is the public API for external cleanup — idempotent, safe to call multiple times:
+Insert immediately before the final `return Combat` statement at the bottom of the file. This is the public API for external cleanup — idempotent, safe to call multiple times:
 
 ```lua
 function Combat.cleanupRetreatState(npcModel)
 	if not npcModel then return end
 
 	releaseRetreatReservation(npcModel)
+	defenderRetreatThreats[npcModel] = nil
+	removeNPCFromDefenderRetreatThreats(npcModel)
 
 	if recoveryConnections[npcModel] then
 		recoveryConnections[npcModel]:Disconnect()
@@ -147,43 +213,22 @@ Insert before `Combat.cleanupRetreatState` (before the function added in Task 1 
 function Combat.disengageForRetreat(npcModel)
 	if not npcModel then return end
 
-	-- 1. Clear this NPC's manual targets (with reciprocal cleanup)
+	-- 1. Clear this NPC's manual targets (with reciprocal cleanup).
+	-- clearAllManualTargets already removes the NPC from other NPCs'
+	-- defenderAttackers entries, so no separate loop is needed.
 	Combat.clearAllManualTargets(npcModel)
 
-	-- 2-3. Clear this NPC's own threat/attacker lists
+	-- 2. Clear this NPC's own threat/attacker lists + retreat threats
 	defenderAttackers[npcModel] = nil
 	attackerThreats[npcModel] = nil
+	defenderRetreatThreats[npcModel] = nil
+	removeNPCFromDefenderRetreatThreats(npcModel)
 
-	-- 3. Remove this NPC from ALL other NPCs' tracking lists
-	for otherNPC, targets in pairs(manualTargets) do
-		for i = #targets, 1, -1 do
-			if targets[i] == npcModel then
-				table.remove(targets, i)
-			end
-		end
-	end
-	for defender, attackers in pairs(defenderAttackers) do
-		for i = #attackers, 1, -1 do
-			if attackers[i] == npcModel then
-				table.remove(attackers, i)
-			end
-		end
-	end
-	for attacker, threats in pairs(attackerThreats) do
-		for i = #threats, 1, -1 do
-			if threats[i] == npcModel then
-				table.remove(threats, i)
-			end
-		end
-	end
-
-	-- 4. Clear combat state
+	-- 3. Clear combat state
 	npcInCombat[npcModel] = false
 
-	-- 5. Stop active beam/laser visuals
+	-- 4. Stop active beam/laser visuals
 	cleanupDebugParts(npcModel.Name)
-
-	-- 6. Health script stays disabled during retreat walk (re-enabled on arrival)
 
 	if DEBUG then
 		print("[Combat] " .. npcModel.Name .. " disengaged for retreat")
@@ -213,6 +258,19 @@ At the top of `NPCMovementSystem.lua`, after the `NPCMovementSystem = {}` declar
 -- Module-level callback set by NPCCombatSystem during initialization.
 -- Fired exactly once when a health retreat NPC arrives at its retreat tile.
 NPCMovementSystem.OnRetreatArrived = nil
+```
+
+- [ ] **Step 1b: Add health-retreat flag cleanup helper**
+
+Insert **immediately after** the movement-state table declarations (`local movementStates = {}`, `local activeMovements = {}`, `local reservedTiles = {}`). This helper must be declared after `movementStates` so it captures the local table, not a global:
+
+```lua
+local function clearHealthRetreatFlag(npcModel)
+	local stateData = movementStates[npcModel]
+	if stateData then
+		stateData.isHealthRetreat = nil
+	end
+end
 ```
 
 - [ ] **Step 2: Modify monitorMovement — health retreat arrival**
@@ -261,7 +319,10 @@ with:
 					end
 				end
 
+				-- Note: stopMovement() may re-enable the Health script since the NPC
+				-- is no longer in combat. This is fine — recovery begins immediately.
 				stopMovement(npcModel, "Idle")
+				clearHealthRetreatFlag(npcModel)
 
 				if NPCMovementSystem.OnRetreatArrived then
 					NPCMovementSystem.OnRetreatArrived(npcModel)
@@ -302,6 +363,7 @@ with:
 						teleportToSafeTile(npcModel)
 					end
 					stopMovement(npcModel, "Idle")
+					clearHealthRetreatFlag(npcModel)
 					if NPCMovementSystem.OnRetreatArrived then
 						NPCMovementSystem.OnRetreatArrived(npcModel)
 					end
@@ -423,11 +485,65 @@ function NPCMovementSystem.startHealthRetreat(npcModel, targetTilePart)
 end
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add cancelHealthRetreat function**
+
+Insert after `startHealthRetreat`. This is the explicit cancellation path called by `Combat.transferOwnership()` (via the lazy-loaded movement-system accessor) when ownership changes during an active health retreat. Without it, `OnOwnerChanged()` returns early for `"Retreating"` movement state, leaving the NPC walking with cleared gameplay state.
+
+```lua
+function NPCMovementSystem.cancelHealthRetreat(npcModel)
+	if not npcModel then return end
+	local stateData = movementStates[npcModel]
+	if not stateData or not stateData.isHealthRetreat then return end
+
+	-- Cancel in-flight movement
+	local movement = activeMovements[npcModel]
+	if movement then
+		if movement.targetTileKey then
+			releaseTileReservation(movement.targetTileKey, npcModel)
+		end
+		if movement.connection then
+			pcall(function() movement.connection:Disconnect() end)
+		end
+		activeMovements[npcModel] = nil
+	end
+
+	-- Clear movement-side health retreat state
+	clearHealthRetreatFlag(npcModel)
+	stateData.state = "Idle"
+
+	-- Snap back to origin if mid-walk and stop Humanoid's active MoveTo
+	local humanoid = getHumanoid(npcModel)
+	local root = getRootPart(npcModel)
+	if movement and movement.originPosition then
+		npcModel:PivotTo(CFrame.new(movement.originPosition))
+		root = getRootPart(npcModel)
+		if root then root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end
+	end
+	if humanoid then
+		local stopPos = root and root.Position or (movement and movement.originPosition)
+		if stopPos then
+			humanoid:MoveTo(stopPos)
+		end
+	end
+
+	-- Re-enable health script
+	setNPCHealthScriptEnabled(npcModel, true)
+
+	npcModel:SetAttribute("IsMoving", nil)
+
+	if DEBUG then
+		print("[NPCMovement] " .. npcModel.Name .. " health retreat cancelled (ownership transfer)")
+	end
+end
+```
+
+**Note on health-script function names:** `NPCMovementSystem` uses `setNPCHealthScriptEnabled` while `NPCCombatSystem` uses `setHealthScriptEnabled`. Both are `local` functions that toggle `npcModel:FindFirstChild("Health", true).Enabled`. This is intentional — each module owns its own helper. If one diverges (adds guards, side effects), consider refactoring to a single canonical path.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/shared/NPCMovementSystem.lua
-git commit -m "feat(retreat): add startHealthRetreat + health retreat monitor paths"
+git commit -m "feat(retreat): add startHealthRetreat, cancelHealthRetreat + health retreat monitor paths"
 ```
 
 ---
@@ -444,7 +560,7 @@ Insert before `Combat.cleanupRetreatState` in NPCCombatSystem.lua:
 ```lua
 -- Called by NPCMovementSystem when a health-retreating NPC arrives at (or falls back to) its destination.
 -- Transitions the NPC into Recovering state: enables regen, shows skull, attaches HealthChanged listener.
-local function handleRetreatArrival(npcModel)
+handleRetreatArrival = function(npcModel)
 	if not npcModel or not npcModel.Parent then
 		releaseRetreatReservation(npcModel)
 		return
@@ -567,9 +683,13 @@ function Combat.tryTriggerRetreat(npcModel)
 	local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
 	if not humanoid or humanoid.Health <= 0 then return false end
 
-	-- Precondition 2: not already retreating/recovering
+	-- Precondition 2: not already retreating/recovering (gameplay state)
 	local retreatState = npcModel:GetAttribute("RetreatState")
 	if retreatState ~= "None" then return false end
+
+	-- Precondition 2b: not retreating at movement level (desync guard)
+	local moveSystem = getNPCMovementSystem()
+	if moveSystem.isRetreating(npcModel) then return false end
 
 	-- Precondition 3: health below threshold
 	if humanoid.MaxHealth <= 0 then return false end
@@ -578,7 +698,7 @@ function Combat.tryTriggerRetreat(npcModel)
 	-- Precondition 4: being attacked (not merely initiating)
 	local role = npcRoles[npcModel]
 	if role == "Defender" then
-		if Combat.getAttackerCount(npcModel) <= 0 then return false end
+		if Combat.getDefenderRetreatThreatCount(npcModel) <= 0 then return false end
 	elseif role == "Attacker" then
 		if Combat.getThreatCount(npcModel) <= 0 then
 			-- Not being attacked, but at low health while attacking:
@@ -644,7 +764,11 @@ function Combat.tryTriggerRetreat(npcModel)
 		return false
 	end
 
-	-- Score candidates: distance from enemies on tiles adjacent to CURRENT tile
+	-- Score candidates: distance from enemies on tiles adjacent to CURRENT tile.
+	-- Note: this heuristic only considers enemies near the NPC's current position,
+	-- not enemies adjacent to each candidate tile. A candidate far from current-tile
+	-- enemies might be adjacent to unchecked enemies. Acceptable for V1 since the
+	-- NPC still retreats to a valid friendly tile; improve if playtesting reveals issues.
 	-- Find enemy NPCs on adjacent tiles
 	local enemyPositions = {}
 	for _, adjPart in ipairs(adjacentTiles) do
@@ -695,8 +819,7 @@ function Combat.tryTriggerRetreat(npcModel)
 		return a.tileId < b.tileId
 	end)
 
-	-- Exhaustive attempt: try each candidate best-first
-	local moveSystem = getNPCMovementSystem()
+	-- Exhaustive attempt: try each candidate best-first (reuses moveSystem from Precondition 2b)
 	for _, cand in ipairs(candidates) do
 		reserveRetreatTile(npcModel, cand.tileId)
 
@@ -837,21 +960,31 @@ Find the block starting at line 855:
 Replace with:
 
 ```lua
-	-- Attacker threat tracking for ALL attackers (needed for retreat decisions).
-	-- This runs regardless of AutoRetaliate so player-owned attackers can retreat.
+	-- Attacker threat tracking for ALL NPCs (needed for retreat decisions).
+	-- Runs regardless of AutoRetaliate so player-owned Attackers can retreat.
 	if targetRole == "Attacker" then
 		Combat.noteTargetingAttacker(attackerNpc, targetNpc)
 	end
 
-	-- Defender auto-retaliation tracking only for AutoRetaliate NPCs (country-owned)
+	-- Defender retreat-threat tracking for ALL Defenders (separate from auto-retaliation).
+	-- Uses defenderRetreatThreats table so player-owned Defenders can retreat
+	-- WITHOUT accidentally populating defenderAttackers (which drives auto-retaliation).
+	if targetRole == "Defender" then
+		Combat.noteDefenderRetreatThreat(attackerNpc, targetNpc)
+	end
+
+	-- Auto-retaliation only for AutoRetaliate NPCs (country-owned)
 	if targetNpc:GetAttribute("AutoRetaliate") ~= true then return end
 
+	-- Auto-retaliation target tracking (only reaches here for AutoRetaliate NPCs)
 	if targetRole == "Defender" then
 		Combat.noteAttackerTargeting(attackerNpc, targetNpc)
 	end
 ```
 
-This ensures `getThreatCount()` returns > 0 for player-owned attackers being hit, enabling retreat.
+**Important:** This separates retreat-threat tracking from auto-retaliation tracking. `defenderRetreatThreats` is populated for ALL Defenders (enabling retreat), while `defenderAttackers` is only populated for `AutoRetaliate` NPCs (enabling auto-retaliation). Without this separation, player-owned Defenders would accidentally auto-retaliate via the combat loop reading `defenderAttackers`.
+
+The helper functions (`noteDefenderRetreatThreat`, `getDefenderRetreatThreatCount`, `removeNPCFromDefenderRetreatThreats`) and the `defenderRetreatThreats` table were already added in Task 1 Steps 4 and 5b. The `tryTriggerRetreat` Defender precondition (Task 5) already uses `getDefenderRetreatThreatCount`. Reciprocal cleanup is already wired into `disengageForRetreat` and `cleanupRetreatState`.
 
 - [ ] **Step 3: Guard Attacker getAllTargets callback — filter retreating targets + skip manual targets when SkullActive**
 
@@ -894,18 +1027,7 @@ In the same Attacker callback, inside the threats loop (around line 653), apply 
 						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
 ```
 
-to include a retreating check inside the success branch:
-
-```lua
-						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
-							if getNPCMovementSystem().isRetreating(threat) then
-								table.remove(threats, i)
-							elseif not alreadyTargeted then
-```
-
-And close the new `else` with `end` before the existing `end`.
-
-The full updated block:
+Replace with the full updated block (includes the retreating check and the `alreadyTargeted` dedup logic together):
 
 ```lua
 						if threatHumanoid and threatHumanoid.Health > 0 and canFight and isAdjacent then
@@ -1020,12 +1142,24 @@ In `Combat.unregisterNPC` (around line 720), insert `Combat.cleanupRetreatState(
 
 - [ ] **Step 2: Add cleanupRetreatState call to Combat.transferOwnership**
 
-In `Combat.transferOwnership` (around line 404), insert cleanup after clearing manual targets and threat lists (after the removal loops, before the `moveSystem.OnOwnerChanged` call around line 445):
+In `Combat.transferOwnership` (around line 404, anchor: `function Combat.transferOwnership`), insert cleanup after clearing manual targets and threat lists (after the removal loops, before the `moveSystem.OnOwnerChanged` call around line 445):
 
 ```lua
+	-- Cancel active health retreat movement before clearing gameplay state.
+	-- OnOwnerChanged() returns early for "Retreating" movement state, so without
+	-- this explicit cancellation the NPC continues walking with cleared gameplay state.
+	-- NOTE: reuse the existing `moveSystem` local if transferOwnership already declares one
+	-- (it typically does for the moveSystem.OnOwnerChanged call below). If not, add this:
+	local moveSystem = getNPCMovementSystem()
+	if moveSystem.cancelHealthRetreat then
+		moveSystem.cancelHealthRetreat(npcModel)
+	end
+
 	-- Clear retreat state on ownership transfer
 	Combat.cleanupRetreatState(npcModel)
 ```
+
+**Note:** The existing `transferOwnership` function likely already declares `local moveSystem = getNPCMovementSystem()` for the `moveSystem.OnOwnerChanged(npcModel)` call further down. If so, remove the duplicate declaration above and reuse the existing one — just insert the `cancelHealthRetreat` call using the already-declared variable.
 
 - [ ] **Step 3: Route NPCSpawner cleanup through cleanupRetreatState**
 
@@ -1049,11 +1183,19 @@ In `src/shared/NPCMovementSystem.lua`, in `NPCMovementSystem.startMovement` (aro
 
 - [ ] **Step 5: Clear retreat state data in NPCMovementSystem.OnOwnerChanged**
 
-In `NPCMovementSystem.OnOwnerChanged` (around line 2050), add after the state reset (after line 2055):
+In `NPCMovementSystem.OnOwnerChanged` (around line 2050, anchor: `function NPCMovementSystem.OnOwnerChanged`), add a health-retreat cancellation block **before** the generic early return for `"Moving"` or `"Retreating"` movement state (around line 2058). Simply clearing the flag is insufficient — the active movement would continue with cleared gameplay state, causing desync on arrival. Instead, call the full cancellation path and return early:
 
 ```lua
-	movementStates[npcModel].isHealthRetreat = nil
+	-- Health retreats must be fully cancelled before the generic Retreating early return.
+	-- Otherwise the NPC continues walking with gameplay retreat state already cleared by
+	-- Combat.transferOwnership(), and arrival code finds RetreatState ~= "Retreating".
+	if movementStates[npcModel] and movementStates[npcModel].isHealthRetreat then
+		NPCMovementSystem.cancelHealthRetreat(npcModel)
+		return
+	end
 ```
+
+Insert this block immediately before the `if movementStates[npc].state == "Moving" or movementStates[npc].state == "Retreating" then return end` guard. The `return` ensures this path doesn't fall through to the generic handler — the health retreat is fully cancelled (movement stopped, state reset, NPC snapped back).
 
 - [ ] **Step 6: Commit**
 
@@ -1070,16 +1212,18 @@ After all tasks are complete, tell the user to playtest each scenario in Roblox 
 
 - [ ] **Basic retreat:** Place a Defender on a tile with adjacent friendly tiles. Attack it with enemy Attackers until health < 30%. Verify: NPC disengages, walks to an adjacent friendly tile (invulnerable during walk), arrives, shows skull, regenerates, skull disappears when health > 55%.
 - [ ] **Attacker retreat (defending):** Place a player-owned Attacker. Have an enemy attack it. Verify: Attacker with threats retreats when health drops below 30%.
-- [ ] **Attacker halt (attacking):** Direct a player-owned Attacker to attack an enemy. Let it take damage until low health, but ensure no enemy is counter-attacking it (getThreatCount == 0). Verify: Attacker clears its manual targets and stops fighting, but does NOT retreat. It stays on its tile.
+- [ ] **Attacker halt (attacking):** Direct a player-owned Attacker to attack an enemy. Let it take damage until low health, but ensure no enemy is counter-attacking it (getThreatCount == 0). Verify: Attacker clears its manual targets and stops fighting, but does NOT retreat. It stays on its tile. *(Note: this "halt" behavior is emergent — `tryTriggerRetreat` returns `false` because `getThreatCount == 0`, the manual target clear in the Attacker-no-threats branch fires, the combat loop finds no targets, and the NPC idles. There is no explicit "halt" code path.)*
 - [ ] **Attacker mutual combat:** Direct a player-owned Attacker to attack an enemy Defender. The Defender fights back (threats registered). Attacker reaches low health. Verify: Attacker retreats (because it has threats > 0).
 - [ ] **Invulnerability:** While an NPC is walking to its retreat tile, attempt to attack it. Verify: attacks are filtered out, no damage is applied.
-- [ ] **Recovering defense:** After an NPC arrives and shows skull, attack it with another NPC. Verify: the Recovering NPC takes damage AND auto-retaliates (defends itself) but cannot be manually directed to attack new targets.
+- [ ] **Recovering defense:** After an NPC arrives and shows skull, attack it with another NPC. Use a player-owned Attacker or a country-owned Defender (`AutoRetaliate == true`) as the recovering NPC. Verify: the Recovering NPC takes damage AND auto-retaliates defensively, but cannot be manually directed to attack new targets. (Player-owned Defenders do not auto-retaliate — see auto-retaliation clarification above.)
 - [ ] **Move during recovery:** Select a Recovering NPC and issue a move order. Verify: NPC moves, skull persists, NPC still CANNOT initiate attacks (SkullActive blocks manual targeting). NPC CAN still auto-retaliate if attacked. Skull disappears when health crosses threshold, then NPC is fully operational.
 - [ ] **No retreat tiles (trapped = death):** Surround an NPC so all adjacent friendly tiles are occupied or non-friendly. Verify: retreat fails and NPC is killed instantly (health set to 0). Normal death cleanup runs.
 - [ ] **Simultaneous retreat:** Have two NPCs on adjacent tiles both take damage. Verify: reservation system prevents them from retreating to the same tile.
 - [ ] **Death during recovery:** Kill a Recovering NPC. Verify: normal death cleanup runs, skull hidden, reservation released, listener disconnected.
 - [ ] **Ownership transfer:** Transfer a Recovering NPC's country. Verify: retreat state cleared, skull hidden, NPC becomes fully operational under new owner.
 - [ ] **Skull attack block:** While an NPC has the skull (SkullActive), try to manually target an enemy via second-click. Verify: targeting is rejected. Then have an enemy attack the skull NPC. Verify: the skull NPC auto-retaliates (fires back defensively).
+- [ ] **Player-owned Defender retreat:** Place a player-owned Defender. Have an enemy attack it until health < 30%. Verify: Defender retreats when attacked. Also verify it does NOT auto-retaliate (no `AutoRetaliate` attribute) — it should only retreat, not fight back. Country-owned Defenders (AutoRetaliate = true) should both retreat AND auto-retaliate.
+- [ ] **Ownership transfer during active retreat:** Trigger an NPC health retreat, then transfer ownership (e.g., player leaves) while the NPC is still walking mid-transit. Verify: health retreat movement is cancelled, NPC snaps back to origin, retreat state is cleared, skull does NOT appear, no arrival callback fires later, and tile occupancy remains consistent (NPC stays on its original tile).
 - [ ] **NPC destruction:** Destroy a Retreating NPC mid-transit. Verify: no errors, reservation released, callback does not fire.
 
 ---
